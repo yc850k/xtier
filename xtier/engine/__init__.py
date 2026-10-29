@@ -32,6 +32,9 @@ def engine() -> C.CDLL:
         if hasattr(lib, 'xtier_set_swiglu'):   # builds before 2026-10-24 have the plain SiLU only
             lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
             lib.xtier_set_swiglu.restype = _I
+        if hasattr(lib, 'xtier_create5'):   # the GSQ experts (a GGUF checkpoint's IQ-quantized rows)
+            lib.xtier_create5.argtypes = [_I, _I, _I, _I, C.c_float] + [_P] * 4 + [C.c_float, C.c_float]
+            lib.xtier_create5.restype = _P
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -84,7 +87,7 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, gsq_types=None):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -92,6 +95,17 @@ class CpuPlan:
         self.swiglu_limit, self.scale_format = float(swiglu_limit), scale_format
         self.slots = self.experts if resident is None else len(resident)   # resident: the experts of slots 0..
         self.dynamic = None   # cold experts: the RAM slots experts can leave (cold.attach)
+        if gsq_types is not None:
+            # The GSQ experts: the gate, the up and the down rows of every expert, one tensor each, and the type per
+            # expert (the ggml type ids).
+            if not hasattr(self.lib, 'xtier_create5'):
+                raise RuntimeError('xtier: this engine build has no GSQ experts; rebuild it (tools/build_engine.sh)')
+            self.plan = self.lib.xtier_create5(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
+                                               weight_pointers[0], weight_pointers[1], weight_pointers[2],
+                                               gsq_types, float(swiglu_alpha), float(swiglu_beta))
+            if not self.plan:
+                raise RuntimeError(self.lib.xtier_last_error().decode())
+            return
         if resident is None:
             self.plan = self.lib.xtier_create3(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
                                                SCALE_FORMATS[scale_format], *weight_pointers)

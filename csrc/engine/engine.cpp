@@ -9,6 +9,7 @@
 // Kernels: AVX512 BF16 (+VBMI) when compiled for it, else AVX2/FMA (Zen2 and other hosts
 // without AVX512). CMake builds this file once per ISA (XTIER_IMPL_PREFIX set, one library each)
 // and src/dispatch.cpp loads one at run time; a plain single build keeps the xtier_* names.
+#include "gsq.h"
 #include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
@@ -145,6 +146,12 @@ alignas(64) constexpr auto flut=[] {
     return t;
 }();
 #if XTIER_AVX512
+// 16 BF16 values -> FP32 (the GSQ path: the decoded IQ weights are FP32, so the inputs are widened).
+inline void bf16x16_f32(const uint16_t *p,__m512 &out) {
+    __m256i v=_mm256_loadu_si256((const __m256i*)p);
+    __m512i w=_mm512_cvtepu16_epi32(v);
+    out=_mm512_castsi512_ps(_mm512_slli_epi32(w,16));
+}
 inline void unpack_f32(const uint8_t *p,const uint8_t *s,__m512 &lo,__m512 &hi, const std::array<float,16>* table=flut.data(), bool mx=false) {
     // Byte i holds weights 2i (low nibble) and 2i+1 (high nibble). Duplicate each byte into
     // two lanes, shift odd lanes by 4; vpermps reads only the low 4 index bits.
@@ -550,7 +557,7 @@ struct PlanBase {
     virtual void unpin(int slot)=0;
     virtual void cold_stats(double *out)=0;
 };
-template<bool MX> class Plan: public PlanBase {
+template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     static constexpr int scale_format=MX?1:0,scale_shift=MX?5:4;
     const std::array<uint16_t,16>* bf_table=lut.data();
 #if XTIER_AVX512
@@ -599,6 +606,16 @@ template<bool MX> class Plan: public PlanBase {
     std::vector<float> globals13,globals2;
     int phase=0,m=0,groups_n=0;
     const uint8_t *source13,*source2,*scale13,*scale2;
+    // GSQ: the IQ-quantized experts of a GGUF checkpoint (llama.cpp's IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS). The weights
+    // stay in the mapped checkpoint file: the engine reads the rows where they are (the type says how), so the
+    // NUMA shards of the FP4 path are not used (the plan's shard() returns nothing to fill).
+    const uint8_t *gsq_gate=nullptr,*gsq_up=nullptr,*gsq_down=nullptr;
+    const uint8_t *gsq_types=nullptr;          // the type id per expert
+    std::vector<size_t> gsq_gate_row,gsq_up_row,gsq_down_row;    // the bytes of one row
+    std::vector<size_t> gsq_gate_off,gsq_up_off,gsq_down_off;    // where an expert's tensor starts
+    size_t gsq_gate_bytes=0,gsq_up_bytes=0,gsq_down_bytes=0;
+    // The bytes of one IQ block of an expert (the type says how many).
+    size_t gsq_block_bytes(int e) const { return xtier::gsq_row_bytes(gsq_types[e], 256); }
     const uint16_t *input=nullptr;
     float *output=nullptr,*mid=nullptr;
     // Decode (m<=DECODE_M) intermediate, per plan: a buffer shared across layers would
@@ -639,6 +656,7 @@ template<bool MX> class Plan: public PlanBase {
     }
 
     void initialize_shard(int node) {
+        if constexpr(GSQ)return;   // the IQ experts stay where they are (the mapped checkpoint file)
         const size_t H=hidden,I=inter,IN=I/nodes,HN=H/nodes;auto &s=shards[node];
         for(size_t slot=0;slot<size_t(slots);slot++) {
             const size_t e=size_t(expert_of[slot]),gi=slot*IN,di=slot*HN;
@@ -656,7 +674,79 @@ template<bool MX> class Plan: public PlanBase {
     int group_expert(int g) const {return groups[g].expert;}
 #if XTIER_AVX512
     // HC/IC: compile-time H and I for specialised shapes, 0 = runtime values.
+    // GSQ: the IQ-quantized experts (llama.cpp's IQ types), decoded to FP32 per 256-value block.
+    template<int R,int MT,int HC,int IC> void gate_core_gsq(int node,int g,int begin,int end,int t0) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
+        float *__restrict const out_mid=mid;const float limit=swiglu_limit;
+        const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
+        const auto &group=groups[g];const int e=group.expert;
+        const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
+        const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e],block=gsq_block_bytes(e);
+        static thread_local std::vector<float> buffer;
+        if(buffer.size()<size_t(MT)*H)buffer.resize(size_t(MT)*H);
+        for(int t=0;t<MT;t++) {
+            const uint16_t *src=input+size_t(group.token[t0+t])*H;float *dst=buffer.data()+size_t(t)*H;
+            for(int c=0;c<H;c+=16){__m512 v;bf16x16_f32(src+c,v);_mm512_storeu_ps(dst+c,v);}
+        }
+        const float *xf=buffer.data();
+        float gw[256],uw[256];
+        for(int r=begin;r<end;r+=R) {
+            __m512 ag[R][MT],au[R][MT];
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++){ag[j][t]=_mm512_setzero_ps();au[j][t]=_mm512_setzero_ps();}
+            for(int c=0;c<H;c+=256) {
+                for(int j=0;j<R;j++) {
+                    const size_t row=size_t(node*IN+r+j);
+                    xtier::gsq_dequant_row(gsq_types[e],gsrc+row*grow+size_t(c/256)*block,gw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],usrc+row*urow+size_t(c/256)*block,uw,256);
+                    for(int t=0;t<MT;t++) {
+                        const float *xp=xf+size_t(t)*H+c;
+                        for(int k=0;k<16;k++) {
+                            ag[j][t]=_mm512_fmadd_ps(_mm512_loadu_ps(gw+16*k),_mm512_loadu_ps(xp+16*k),ag[j][t]);
+                            au[j][t]=_mm512_fmadd_ps(_mm512_loadu_ps(uw+16*k),_mm512_loadu_ps(xp+16*k),au[j][t]);
+                        }
+                    }
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                float gate=_mm512_reduce_add_ps(ag[j][t]);
+                float up=_mm512_reduce_add_ps(au[j][t]);
+                if(limit>0.f) {
+                    up=std::min(std::max(up,-limit),limit);
+                    gate=std::min(gate,limit);
+                }
+                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                out_mid[(size_t(group.row)+t0+t)*I+node*IN+r+j]=value;
+            }
+        }
+    }
+    template<int R,int MT,int HC,int IC> void down_core_gsq(int node,int g,int begin,int end,float *__restrict out,int t0) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
+        const auto &group=groups[g];const int e=group.expert;
+        const uint8_t *dsrc=gsq_down+gsq_down_off[e];
+        const size_t drow=gsq_down_row[e],block=gsq_block_bytes(e);
+        float route[MT];int token[MT];const float *rows[MT];
+        for(int t=0;t<MT;t++){route[t]=group.route[t0+t];token[t]=group.token[t0+t];rows[t]=mid+(size_t(group.row)+t0+t)*I;}
+
+        float w[256];
+        for(int r=begin;r<end;r+=R) {
+            __m512 acc[R][MT];
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++)acc[j][t]=_mm512_setzero_ps();
+            const size_t row=size_t(node*HN+r);
+            for(int c=0;c<I;c+=256) {
+                xtier::gsq_dequant_row(gsq_types[e],dsrc+row*drow+size_t(c/256)*block,w,256);
+                for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                    const float *xp=rows[t]+c;   // the intermediate (FP32)
+                    for(int k=0;k<16;k++)acc[j][t]=_mm512_fmadd_ps(_mm512_loadu_ps(w+16*k),_mm512_loadu_ps(xp+16*k),acc[j][t]);
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                float val=_mm512_reduce_add_ps(acc[j][t]);
+                out[size_t(token[t])*H+node*HN+r+j]+=val*route[t];
+            }
+        }
+    }
     template<int M,int HC,int IC> void gate_rows(int node,int g,int begin,int end) {
+        if constexpr(GSQ){gate_core_gsq<1,M,HC,IC>(node,g,begin,end,0);return;}
         const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
         // Locals: stores into the intermediate must not force reloads of float members.
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;
@@ -723,6 +813,7 @@ template<bool MX> class Plan: public PlanBase {
     }
 
     template<int M,int HC,int IC> void down_rows(int node,int g,int begin,int end,float *destination=nullptr) {
+        if constexpr(GSQ){down_core_gsq<1,M,HC,IC>(node,g,begin,end,destination?destination:output,0);return;}
         if(down_bf16){down_rows_bf16<M,HC,IC>(node,g,begin,end,destination);return;}
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
         const auto &s=shards[node];const auto &group=groups[g];int e=group.expert;const size_t slot=size_t(group.slot);
@@ -832,8 +923,86 @@ template<bool MX> class Plan: public PlanBase {
             }
         }
     }
+    // GSQ: the IQ-quantized experts (llama.cpp's IQ types). A row of H values is a run of 256-value blocks; a block
+    // is decoded to FP32 (the values carry 4 significant bits, so the products are exact), the inputs are the FP32
+    // activations (the BF16 ones widened) and the sums run in FP32.
+    template<int R,int MT,int S,int HC,int IC> void gate_core_gsq(int node,int g,int begin,int end,int t0) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
+        float *__restrict const out_mid=mid;const float limit=swiglu_limit;const bool round=down_bf16;
+        const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
+        const auto &group=groups[g];const int e=group.expert;
+        const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
+        const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e],block=gsq_block_bytes(e);
+        // FP32 inputs once per call (thread-local), as in the FP4 path.
+        static thread_local std::vector<float> buffer;
+        if(buffer.size()<size_t(MT)*H)buffer.resize(size_t(MT)*H);
+        for(int t=0;t<MT;t++) {
+            const uint16_t *src=input+size_t(group.token[t0+t])*H;float *dst=buffer.data()+size_t(t)*H;
+            for(int c=0;c<H;c+=16){__m256 lo,hi;bf16x16(src+c,lo,hi);_mm256_storeu_ps(dst+c,lo);_mm256_storeu_ps(dst+c+8,hi);}
+        }
+        const float *xf=buffer.data();
+        float gw[256],uw[256];
+        for(int r=begin;r<end;r+=R) {
+            __m256 ag[R*MT*S],au[R*MT*S];
+            for(int q=0;q<R*MT*S;q++){ag[q]=_mm256_setzero_ps();au[q]=_mm256_setzero_ps();}
+            for(int c=0;c<H;c+=256) {
+                for(int j=0;j<R;j++) {
+                    const size_t row=size_t(node*IN+r+j);
+                    xtier::gsq_dequant_row(gsq_types[e],gsrc+row*grow+size_t(c/256)*block,gw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],usrc+row*urow+size_t(c/256)*block,uw,256);
+                    for(int t=0;t<MT;t++) {
+                        const float *xp=xf+size_t(t)*H+c;
+                        __m256 *ga=ag+(j*MT+t)*S;
+                        for(int k=0;k<32;k++)ga[k&1*(S-1)]=_mm256_fmadd_ps(_mm256_loadu_ps(gw+8*k),_mm256_loadu_ps(xp+8*k),ga[k&1*(S-1)]);
+                        __m256 *ua=au+(j*MT+t)*S;
+                        for(int k=0;k<32;k++)ua[k&1*(S-1)]=_mm256_fmadd_ps(_mm256_loadu_ps(uw+8*k),_mm256_loadu_ps(xp+8*k),ua[k&1*(S-1)]);
+                    }
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                const __m256 *ga=ag+(j*MT+t)*S,*ua=au+(j*MT+t)*S;
+                float gate=hsum(S==2?_mm256_add_ps(ga[0],ga[1]):ga[0]);
+                float up=hsum(S==2?_mm256_add_ps(ua[0],ua[1]):ua[0]);
+                if(limit>0.f) {
+                    up=std::min(std::max(up,-limit),limit);
+                    gate=std::min(gate,limit);
+                }
+                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                out_mid[(size_t(group.row)+t0+t)*I+node*IN+r+j]=round?round_bf16(value):value;
+            }
+        }
+    }
+    template<int R,int MT,int S,int HC,int IC> void down_core_gsq(int node,int g,int begin,int end,float *__restrict out,int t0) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
+        const auto &group=groups[g];const int e=group.expert;
+        const uint8_t *dsrc=gsq_down+gsq_down_off[e];
+        const size_t drow=gsq_down_row[e],block=gsq_block_bytes(e);
+        float route[MT];int token[MT];const float *rows[MT];
+        for(int t=0;t<MT;t++){route[t]=group.route[t0+t];token[t]=group.token[t0+t];rows[t]=mid+(size_t(group.row)+t0+t)*I;}
+
+        float w[256];
+        for(int r=begin;r<end;r+=R) {
+            __m256 acc[R*MT*2];
+            for(int q=0;q<R*MT*2;q++)acc[q]=_mm256_setzero_ps();
+            const size_t row=size_t(node*HN+r);
+            for(int c=0;c<I;c+=256) {
+                xtier::gsq_dequant_row(gsq_types[e],dsrc+row*drow+size_t(c/256)*block,w,256);
+                for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                    const float *xp=rows[t]+c;   // the intermediate (FP32)
+                    __m256 *a=acc+(j*MT+t)*2;
+                    for(int k=0;k<32;k++)a[k&1]=_mm256_fmadd_ps(_mm256_loadu_ps(w+8*k),_mm256_loadu_ps(xp+8*k),a[k&1]);
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
+                const __m256 *a=acc+(j*MT+t)*2;
+                float val=hsum(_mm256_add_ps(a[0],a[1]));
+                out[size_t(token[t])*H+node*HN+r+j]+=val*route[t];
+            }
+        }
+    }
     template<int M,int HC,int IC> void gate_rows(int node,int g,int begin,int end) {
-        if constexpr(M==1)gate_core<2,1,2,HC,IC>(node,g,begin,end,0);
+        if constexpr(GSQ)gate_core_gsq<1,M,1,HC,IC>(node,g,begin,end,0);
+        else if constexpr(M==1)gate_core<2,1,2,HC,IC>(node,g,begin,end,0);
         else if constexpr(M<=4)gate_core<1,M,1,HC,IC>(node,g,begin,end,0);
         else {gate_core<1,4,1,HC,IC>(node,g,begin,end,0);gate_core<1,M-4,1,HC,IC>(node,g,begin,end,4);}
     }
@@ -866,7 +1035,8 @@ template<bool MX> class Plan: public PlanBase {
     // Rows per iteration divide the four-row split boundaries, as in the AVX512 kernel.
     template<int M,int HC,int IC> void down_rows(int node,int g,int begin,int end,float *destination=nullptr) {
         float *out=destination?destination:output;
-        if constexpr(M==1)down_core<4,1,2,HC,IC>(node,g,begin,end,out,0);
+        if constexpr(GSQ)down_core_gsq<1,M,1,HC,IC>(node,g,begin,end,out,0);
+        else if constexpr(M==1)down_core<4,1,2,HC,IC>(node,g,begin,end,out,0);
         else if constexpr(M<=3)down_core<4,M,1,HC,IC>(node,g,begin,end,out,0);
         else if constexpr(M==4)down_core<2,4,1,HC,IC>(node,g,begin,end,out,0);
         else down_core<1,M,1,HC,IC>(node,g,begin,end,out,0);
@@ -1061,6 +1231,51 @@ template<bool MX> class Plan: public PlanBase {
     }
 
 public:
+    // GSQ: the experts are the IQ-quantized tensors of a GGUF checkpoint (the gate, the up and the down rows of every
+    // expert, one tensor each, the type per expert). The engine reads them where they are.
+    Plan(int h,int i,int e,int n,float limit,const uint8_t *gate,const uint8_t *up,const uint8_t *down,
+         const uint8_t *types,float swiglu_alpha_in=1.f,float swiglu_beta_in=0.f)
+        :hidden(h),inter(i),experts(e),swiglu_limit(limit),pool(get_executor(n)),groups(MAX_ROUTES) {
+        swiglu_alpha=swiglu_alpha_in;swiglu_beta=swiglu_beta_in;
+        globals13.assign(e*2,1.f);globals2.assign(e,1.f);
+        gsq_gate=gate;gsq_up=up;gsq_down=down;gsq_types=types;
+        if(e<10||e>MAX_EXPERTS)throw std::runtime_error("E=10..512");
+        slots=e;slot_of.assign(e,-1);expert_of.assign(e,-1);
+        for(int j=0;j<e;j++){slot_of[j]=j;expert_of[j]=j;}
+        if(h<64||h>32768||h%64||i<64||i>32768||i%64)throw std::runtime_error("hidden and intermediate must be multiples of 64");
+        nodes=pool->node_count();
+        if(i%(16*nodes)||h%(16*nodes))
+            throw std::runtime_error("hidden "+std::to_string(h)+" / intermediate "+std::to_string(i)+" cannot be split over "+
+                                     std::to_string(nodes)+" worker nodes (need multiples of "+std::to_string(16*nodes)+")");
+        shards.resize(nodes);
+        if(!std::isfinite(limit)||limit<0)throw std::runtime_error("Invalid SwiGLU limit");
+        const size_t E=e,H=h,I=i;
+        // The rows of every expert: the type says how many bytes a row of H (gate, up) or I (down) values takes.
+        gsq_gate_row.resize(e);gsq_up_row.resize(e);gsq_down_row.resize(e);
+        gsq_gate_off.resize(e);gsq_up_off.resize(e);gsq_down_off.resize(e);
+        size_t gate_bytes=0,up_bytes=0,down_bytes=0;
+        for(int j=0;j<e;j++) {
+            const int type=types[j];
+            const size_t gr=xtier::gsq_row_bytes(type,h),ur=xtier::gsq_row_bytes(type,h),dr=xtier::gsq_row_bytes(type,i);
+            if(!gr||!ur||!dr)throw std::runtime_error("Unsupported expert type "+std::to_string(type)+" for expert "+std::to_string(j));
+            gsq_gate_row[j]=gr;gsq_up_row[j]=ur;gsq_down_row[j]=dr;
+            gsq_gate_off[j]=gate_bytes;gsq_up_off[j]=up_bytes;gsq_down_off[j]=down_bytes;
+            gate_bytes+=gr*size_t(i);up_bytes+=ur*size_t(i);down_bytes+=dr*size_t(h);
+        }
+        gsq_gate_bytes=gate_bytes;gsq_up_bytes=up_bytes;gsq_down_bytes=down_bytes;
+        if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
+        if(dynamic<0||dynamic>2)throw std::runtime_error("XTIER_DYNAMIC must be 0, 1 or 2");
+        if(const char *v=std::getenv("XTIER_GATE_GRAIN"))gate_grain=std::stoi(v);
+        if(const char *v=std::getenv("XTIER_DOWN_GRAIN"))down_grain=std::stoi(v);
+        if(gate_grain<2||gate_grain%2||down_grain<4||down_grain%4)
+            throw std::runtime_error("XTIER_GATE_GRAIN must be even, XTIER_DOWN_GRAIN a multiple of 4");
+        size_t decode_bytes=(size_t(DECODE_M)*MAX_K*I*sizeof(float)+63)/64*64;
+        decode_mid.reset(static_cast<float*>(std::aligned_alloc(64,decode_bytes)));
+        if(!decode_mid)throw std::bad_alloc();
+        std::memset(decode_mid.get(),0,decode_bytes);
+        std::lock_guard<std::mutex> lock(pool->call_lock);dispatch(0);
+    }
+
     Plan(int h,int i,int e,int n,float limit,const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,
          const uint8_t *s2,const float *g13,const float *g2,int format=0,int slot_count=0,const int32_t *resident=nullptr)
         :hidden(h),inter(i),experts(e),swiglu_limit(limit),pool(get_executor(n)),globals13(g13,g13+e*2),
@@ -1397,6 +1612,16 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
         if(scale_format==1)return new Handle{std::make_shared<Plan<true>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,1)};
         if(scale_format!=0)throw std::runtime_error("Unknown scale format");
         return new Handle{std::make_shared<Plan<false>>(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2,0)};
+    }catch(const std::exception &e){last_error=e.what();return nullptr;}
+}
+// The GSQ experts: the IQ-quantized gate, up and down rows of every expert of a GGUF checkpoint (llama.cpp's IQ
+// types), one tensor each, and the type per expert (the ggml type ids). The engine reads them where they are.
+void *XTIER_API(xtier_create5)(int hidden,int inter,int experts,int threads,float swiglu_limit,
+                    const uint8_t *gate,const uint8_t *up,const uint8_t *down,const uint8_t *types,
+                    float swiglu_alpha,float swiglu_beta) {
+    try {
+        if(!gate||!up||!down||!types)throw std::runtime_error("Invalid GSQ arguments");
+        return new Handle{std::make_shared<Plan<false,true>>(hidden,inter,experts,threads,swiglu_limit,gate,up,down,types,swiglu_alpha,swiglu_beta)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
 void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int threads,float swiglu_limit,int scale_format,

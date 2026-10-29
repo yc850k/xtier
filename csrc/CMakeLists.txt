@@ -17,7 +17,7 @@ set(XTIER_AVX2_FLAGS "-march=x86-64-v3;-mtune=znver2" CACHE STRING "AVX2 kernel 
 set(XTIER_AVX512_DOWN_R4 "1" CACHE STRING "Down microkernel rows of the AVX512 build: 1, 2 or 4")
 foreach(isa avx512 avx2)
   string(TOUPPER ${isa} ISA)
-  add_library(xtier_engine_${isa} SHARED engine/engine.cpp)
+  add_library(xtier_engine_${isa} SHARED engine/engine.cpp engine/gsq.cpp)
   target_include_directories(xtier_engine_${isa} PRIVATE include)
   target_compile_definitions(xtier_engine_${isa} PRIVATE XTIER_PREFILL_MICRO_TOKENS=${XTIER_PREFILL_MICRO_TOKENS} XTIER_IMPL_PREFIX=${isa}_)
   if(isa STREQUAL "avx512")
