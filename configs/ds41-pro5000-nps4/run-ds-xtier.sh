@@ -10,7 +10,9 @@ P=/data/fast/workspaces/ds41-1017
 export CUDA_HOME=$D/env/lib/python3.12/site-packages/nvidia/cu13
 export PATH=$CUDA_HOME/bin:$PATH PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-export FLASHINFER_CUDA_ARCH_LIST=12.0 TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=12.0
+# FlashInfer and TileLang compile for this device (12.0 on the RTX PRO 5000, 7.5 on a Turing card)
+ARCH=${XTIER_CUDA_ARCH:-$($D/env/bin/python -c 'import torch;c=torch.cuda.get_device_capability();print(f"{c[0]}.{c[1]}")' 2>/dev/null || echo 12.0)}
+export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH} TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=${TVM_FFI_CUDA_ARCH_LIST:-$ARCH}
 export SGLANG_DSV41_REASONING_EFFORT=${SGLANG_DSV41_REASONING_EFFORT:-max}
 export XTIER=${XTIER:-1} XTIER_THREADS=${XTIER_THREADS:-112} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 export XTIER_PROBE_DISPATCH_CPU=${XTIER_PROBE_DISPATCH_CPU:-95}

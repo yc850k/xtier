@@ -14,14 +14,16 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier import arch
 from xtier.backend.prefill import _reduce
-from xtier.cache.pool import _halves, _tile_k
+from xtier.cache.pool import _halves, _tile_k, _tl_dtype, k_cap
 
 
 @triton.jit
 def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13, MID, K: tl.constexpr, H: tl.constexpr,
                    I: tl.constexpr, LIMIT, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr,
-                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+                   ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, HW: tl.constexpr = True,
+                   DT: tl.constexpr = tl.bfloat16):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
     s = tl.load(TILE_S + tile).to(tl.int64)   # slot of the tile's expert (expert e for a fully cached layer)
@@ -34,10 +36,10 @@ def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13
     accu = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, H, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        gl, gh = _halves(Q13, S13, s, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
-        ul, uh = _halves(Q13, S13, s, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX)
+        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(DT if MX else tl.float16)
+        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(DT if MX else tl.float16)
+        gl, gh = _halves(Q13, S13, s, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX, HW, DT)
+        ul, uh = _halves(Q13, S13, s, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // G), H // G, BN, BK, MX, HW, DT)
         accg = tl.dot(xe, tl.trans(gl), accg)
         accg = tl.dot(xo, tl.trans(gh), accg)
         accu = tl.dot(xe, tl.trans(ul), accu)
@@ -51,12 +53,13 @@ def _gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q13, S13, G13
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + r[:, None].to(tl.int64) * I + n[None, :], val.to(tl.bfloat16), mask=rm[:, None])
+    tl.store(MID + r[:, None].to(tl.int64) * I + n[None, :], val.to(DT), mask=rm[:, None])
 
 
 @triton.jit
 def _down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q2, S2, G2, ROUTES, H: tl.constexpr, I: tl.constexpr,
-                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr):
+                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr, HW: tl.constexpr = True,
+                DT: tl.constexpr = tl.bfloat16):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
     s = tl.load(TILE_S + tile).to(tl.int64)   # slot of the tile's expert (expert e for a fully cached layer)
@@ -68,9 +71,9 @@ def _down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, Q2, S2, G2, RO
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        wl, wh = _halves(Q2, S2, s, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX)
+        ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(DT if MX else tl.float16)
+        ao = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :] + 1, mask=rm[:, None], other=0.0).to(DT if MX else tl.float16)
+        wl, wh = _halves(Q2, S2, s, h, k0, H * (I // 2), I // 2, H * (I // G), I // G, BN, BK, MX, HW, DT)
         acc = tl.dot(ae, tl.trans(wl), acc)
         acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
@@ -86,8 +89,9 @@ def resident_prefill(prefill, arena, x, ids, weights):
     arena: the layer's slots [w13, w2, s13, s2], slot e = expert e."""
     H, I, E = prefill.hidden, prefill.inter, prefill.experts
     g13, g2 = prefill._globals()
+    hw, tl_dt = arch.has_fp4_convert(), _tl_dtype(x.dtype)
     fixed_bm = _env_int('XTIER_CACHE_PREFILL_TILE_M', 0)
-    bkh, bki = _tile_k(H), _tile_k(I)
+    bkh, bki = _tile_k(H, k_cap()), _tile_k(I, k_cap())
     block = _env_int('XTIER_GPU_PREFILL_CHUNK', 8192)
     m, k = ids.shape
     out = torch.empty_like(x)
@@ -118,15 +122,15 @@ def resident_prefill(prefill, arena, x, ids, weights):
                 tiles.append((e, offset + q, offset + c))
             offset += c
         meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-        mid = torch.empty((size * k, I), dtype=torch.bfloat16, device=x.device)
+        mid = torch.empty((size * k, I), dtype=x.dtype, device=x.device)
         routes = torch.empty((size * k, H), dtype=torch.float32, device=x.device)
         nt = len(tiles)
-        _gate_up_tiles[(nt, I // gbn)](x[start:start + size], order, meta[0], meta[0], meta[1], meta[2], arena[0], arena[2], g13,
+        _gate_up_tiles[(nt, I // gbn)](x[start:start+size], order, meta[0], meta[0], meta[1], meta[2], arena[0], arena[2], g13,
                                        mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
-                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta, HW=hw, DT=tl_dt,
                                        num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[0], meta[1], meta[2], arena[1], arena[3], g2, routes, H, I, bm,
-                                    dbn, bki, MX=prefill.mxfp4, num_warps=dw, num_stages=ds)
+                                    dbn, bki, MX=prefill.mxfp4, HW=hw, DT=tl_dt, num_warps=dw, num_stages=ds)
         # M of _reduce is unused by the kernel body: a fixed value keeps one compiled variant for every length
         _reduce[(size, triton.cdiv(H, 256))](routes, weights[start:start + size], out[start:start + size], 1, k,
                                              256, H)
@@ -143,6 +147,8 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     H, I, S = pool.H, pool.I, pool.S
     prefill = pool.prefill
     g13, g2 = prefill._globals()
+    hw, tl_dt = arch.has_fp4_convert(), _tl_dtype(x.dtype)
+    bkh, bki = _tile_k(H, k_cap()), _tile_k(I, k_cap())
     m, k = ids.shape
     slot = pool.table[ids.long()]                       # [m, k]: slot of each route, -1 = on the CPU
     on_gpu = slot >= 0
@@ -186,15 +192,16 @@ def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
     if tiles:
         meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-        mid = torch.empty((max(offset, 1), I), dtype=torch.bfloat16, device=x.device)
+        mid = torch.empty((max(offset, 1), I), dtype=x.dtype, device=x.device)
         routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)   # CPU routes stay 0 for the sum
         nt = len(tiles)
         _gate_up_tiles[(nt, I // gbn)](x, order, meta[0], meta[1], meta[2], meta[3], pool.arena[0], pool.arena[2], g13,
-                                       mid, k, H, I, prefill.swiglu_limit, bm, gbn, _tile_k(H), MX=prefill.mxfp4,
-                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta,
+                                       mid, k, H, I, prefill.swiglu_limit, bm, gbn, bkh, MX=prefill.mxfp4,
+                                       ALPHA=prefill.swiglu_alpha, BETA=prefill.swiglu_beta, HW=hw, DT=tl_dt,
                                        num_warps=gw, num_stages=gs)
         _down_tiles[(nt, H // dbn)](mid, order, meta[0], meta[1], meta[2], meta[3], pool.arena[1], pool.arena[3], g2,
-                                    routes, H, I, bm, dbn, _tile_k(I), MX=prefill.mxfp4, num_warps=dw, num_stages=2)
+                                    routes, H, I, bm, dbn, bki, MX=prefill.mxfp4, HW=hw, DT=tl_dt,
+                                    num_warps=dw, num_stages=2)
         _reduce[(m, triton.cdiv(H, 256))](routes, torch.where(on_gpu, weights, 0.0), out_g, 1, k, 256, H)
     worker.join()
     if errors:

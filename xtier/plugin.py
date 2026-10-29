@@ -44,8 +44,9 @@ def install() -> None:
     names = packs.install(HookRegistry, HookType)
     fixes = platform.install(HookRegistry, HookType)
     _installed.append(True)
-    logger.info('xtier %s: MoE backend hooks, packs %s and host fixes %s registered (pid %d)', __version__, names,
-                fixes, os.getpid())
+    from xtier import arch
+    logger.info('xtier %s: MoE backend hooks, packs %s and host fixes %s registered on %s (pid %d)', __version__,
+                names, fixes, arch.describe(), os.getpid())
 
 
 def install_serving() -> None:

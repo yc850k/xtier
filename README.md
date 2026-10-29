@@ -18,6 +18,7 @@ XTier 是官方 SGLang 的插件（跟 main 分支），做 CPU/GPU 分层 MoE �
 - **不改 SGLang 源码**：只用官方插件框架的钩子（接在官方 KTransformers 混合推理的入口上），加载后自检是否接管成功。
 - **与模型无关**：混合推理包在官方 `FusedMoE` 的量化方法外面，用标准 MoE 层的模型装上就能跑（NVFP4、MXFP4 专家）。
 - **加速包可选**：某个模型独有的修正和内核放在 `xtier/packs/` 下。
+- **按卡适配**：GPU 内核跟显卡的能力走（Turing sm_75 上是 FP16，因为它没有 BF16 张量核；FP8/TMA/FP4 的功能按等级关闭），见 [docs/sm75.md](docs/sm75.md)。
 
 ## 结构
 
@@ -34,6 +35,7 @@ xtier/
 │              speculative（通用投机解码：EAGLE 的热词表配无损拒绝采样、草稿温度、按置信度截断验证；DSpark 按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
 ├── console/   启动台：一个网页选模型、调启动参数、启动 / 停止，跟踪加载阶段与 decode 遥测（只用标准库）
+├── arch.py    显卡的算力等级与由此关掉的功能（BF16/FP8/TMA/FP4；见 [docs/sm75.md](docs/sm75.md)）
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
@@ -196,8 +198,17 @@ decode 约慢 10%），主要受限于硬盘速度。
 - 约为正常配置的 25%，瓶颈在读盘：prefill 每个 8K 分块都要把约 70% 的专家从 4 块盘重读一遍，decode 每步约 100 个缺失。详见
   [报告](docs/reports/2026-10-27-ds41-minimal.md)。
 
+## Turing（sm_75）
+
+分支 `feat/sm75` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：内核的点积按卡的能力取操作数（Turing 没有 BF16
+张量核，模型以 FP16 跑；TF32 也没有，下投影用 16 位点积），热专家缓存的 FP4 解码用软件实现（没有
+`cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB 共享内存缩小。CPU 引擎不变。
+详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
+
 ## 版本更新
 
+- 2026-10-29：Turing（sm_75）适配，分支 `feat/sm75`：GPU 内核按显卡能力取 dtype 与内核（FP16 点积、软件 FP4 解码），
+  加速包的 FP8/TMA/FP4 功能按等级关闭，新增 2× RTX 2080 Ti 的配置。详见[文档](docs/sm75.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
 - 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好
@@ -206,8 +217,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   prefill 约 1,160、decode 约 30 tok/s。详见[文档](docs/reports/2026-10-27-ds41-minimal.md)。
 - 2026-10-26（晚）：冷专家卸载到硬盘（可选，`XTIER_COLD=1`），四个模型都能用；DeepSeek 卸载 30% 时 decode 每步 +44%。
   详见[文档](docs/reports/2026-10-26-cold-experts.md)。
-- 2026-10-26：弹性热专家槽（DeepSeek 每步 −4.3%、GLM −1.5%）；GLM 常备槽 60 → 58；启动台报在线前先预热；MiniMax-M3.1-Flash
-  暂停开发。详见[文档](docs/reports/2026-10-26-elastic-cache.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 

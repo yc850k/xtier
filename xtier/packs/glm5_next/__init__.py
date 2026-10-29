@@ -57,10 +57,11 @@ def _nextn_model_init(original, self, config, quant_config=None, *args, **kwargs
 
 
 def install(registry, hook_type):
+    from xtier.packs import supported
     registry.register(EXCLUDED, _is_layer_excluded, hook_type.AROUND)
     registry.register(SPARSE_MLA, _validate_sparse_mla, hook_type.AROUND)
     registry.register(NEXTN_MODEL, _nextn_model_init, hook_type.AROUND)
-    if os.environ.get('XTIER_FP8_WEIGHTS') == '1':
+    if os.environ.get('XTIER_FP8_WEIGHTS') == '1' and supported((8, 9), 'the FP8 weights (glm5_next)'):
         from xtier.packs.glm5_next import fp8_weights
         method = 'sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod'
         registry.register(f'{method}.apply', fp8_weights.apply, hook_type.AROUND)

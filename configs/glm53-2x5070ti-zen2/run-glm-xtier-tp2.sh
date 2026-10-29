@@ -19,8 +19,11 @@ cuda=$D/env/lib/python3.12/site-packages/nvidia/cu13
 export CUDA_HOME=$cuda PATH=$cuda/bin:$PATH LD_LIBRARY_PATH=$cuda/lib:${LD_LIBRARY_PATH:-} PYTHONUNBUFFERED=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo   # the wired NICs have no address on that host
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True FLASHINFER_CUDA_ARCH_LIST=12.0
-export TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=12.0 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# FlashInfer and TileLang compile for this device (12.0 on the RTX 5070 Ti, 7.5 on a Turing card)
+ARCH=${XTIER_CUDA_ARCH:-$($D/env/bin/python -c 'import torch;c=torch.cuda.get_device_capability();print(f"{c[0]}.{c[1]}")' 2>/dev/null || echo 12.0)}
+export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH}
+export TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=${TVM_FFI_CUDA_ARCH_LIST:-$ARCH} SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 # XTier per rank: 44 expert workers (4 nodes x 11 of 12 cores), the dispatcher and the other threads on the rank's
 # remaining CPUs; the kernels pick AVX2 by themselves (XTIER_ISA=avx2 to be explicit)
 export XTIER=1 XTIER_TP_NODES=${XTIER_TP_NODES:-auto} XTIER_THREADS=${XTIER_THREADS:-44} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}

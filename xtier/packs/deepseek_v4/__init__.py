@@ -296,13 +296,16 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 
 
 def install(registry, hook_type):
+    from xtier.packs import supported
     from xtier.packs.deepseek_v4 import paged_indexer, wo_a
 
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
-    wo_a.install(registry, hook_type)
+    if supported((8, 0), 'the wo_a FP8 einsum (deepseek_v4)'):   # BF16 dot products
+        wo_a.install(registry, hook_type)
     paged_indexer.install(registry, hook_type)
-    if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
+    if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0' and supported((8, 9), 'the W8A8 FP8 configs '
+                                                                      '(deepseek_v4)'):
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
@@ -311,7 +314,8 @@ def install(registry, hook_type):
         if os.environ.get('XTIER_ENGRAM_PREFETCH', '1') != '0':
             registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
             registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
-    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0':
+    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and supported((8, 9), 'the FP8 draft head '
+                                                                          '(deepseek_v4)'):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
 

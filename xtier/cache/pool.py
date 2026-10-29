@@ -36,6 +36,10 @@ experts (their RAM slots change during a forward). The cache log's hit counts th
 Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
 a zero GPU part.
+
+On a GPU without the FP4 conversion instruction (below sm_100: Turing, sm_75) the E2M1 values are decoded in
+software (the same values, the same rounding) and the dot products take the model's activation dtype: FP16 where
+the GPU has no BF16 tensor cores.
 """
 import ctypes as C
 import json
@@ -48,6 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier import arch
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
@@ -60,13 +65,33 @@ BLOCK = 1024
 CONFIG = dict(gbn=32, dbn=64, bk=256, gw=4, gs=2, dw=4, ds=2)
 
 
-def _tile_k(n):
+def _tl_dtype(dtype):
+    """The Triton dtype of a 16-bit float dtype: the kernels' dot operands."""
+    return tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
+
+
+def _tile_k(n, cap=256):
     """K-tile of a GEMM whose reduction dimension is n: the largest of 256 / 128 / 64 that divides it
-    (GLM-5.3 4096 / 2048: 256; Qwen3.8 2560 / 640: 256 / 128; DeepSeek V4.1 5120 / 2304: 256 / 256)."""
+    (GLM-5.3 4096 / 2048: 256; Qwen3.8 2560 / 640: 256 / 128; DeepSeek V4.1 5120 / 2304: 256 / 256).
+    `cap` limits it: a card with less shared memory than the one the tiles were tuned on takes smaller tiles."""
     for bk in (256, 128, 64):
-        if n % bk == 0:
+        if bk <= cap and n % bk == 0:
             return bk
     return 0
+
+
+def _tiles():
+    """The decode tiles: the shared memory per SM decides how deep the pipeline can be (Turing: 64 KiB, a quarter of
+    the Blackwell card the tiles were tuned on)."""
+    cfg = dict(CONFIG)
+    if arch.shared_memory_kb() <= 64:
+        cfg['bk'] = 128
+    return cfg
+
+
+def k_cap():
+    """The largest K-tile the card's shared memory allows (256 on the Blackwell cards, 128 on Turing)."""
+    return _tiles()['bk']
 
 
 _shared = {}
@@ -137,22 +162,39 @@ def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
 
 
 @triton.jit
-def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False):
+def _e2m1_f16(code):
+    """E2M1 nibble (sign in bit 3) -> FP16: the software form of Blackwell's cvt.rn.f16x2.e2m1x2 (the E2M1 values
+    are exactly representable in FP16, so both paths give the same numbers)."""
+    m = code & 7
+    v = tl.where(m < 4, m.to(tl.float32) * 0.5, tl.where(m == 4, 2.0, tl.where(m == 5, 3.0, tl.where(m == 6, 4.0, 6.0))))
+    return (v * tl.where((code & 8) != 0, -1.0, 1.0)).to(tl.float16)
+
+
+@triton.jit
+def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
+            HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     """Two FP16 tiles [BN, BK/2] of a pool slot: columns k0+2j (low nibbles) and k0+2j+1 (high nibbles).
-    QE/QR: slot and row strides of the packed weights; SE/SR: of the linear E4M3 block scales."""
+    QE/QR: slot and row strides of the packed weights; SE/SR: of the linear E4M3 block scales.
+    HW: the GPU has the FP4 conversion instruction (sm_100 and newer); below it the E2M1 values are decoded in
+    software. DT: the dtype of the MXFP4 operands (the activation dtype)."""
     pb = tl.load(Q + slot * QE + rows[:, None] * QR + (k0 // 2 + tl.arange(0, BK // 2))[None, :]).to(tl.uint32)
-    r = tl.inline_asm_elementwise(
-        asm="{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
-        constraints="=r,r", args=[pb], dtype=tl.uint32, is_pure=True, pack=1)
-    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
-    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    if HW:
+        r = tl.inline_asm_elementwise(
+            asm="{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
+            constraints="=r,r", args=[pb], dtype=tl.uint32, is_pure=True, pack=1)
+        lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+        hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    else:
+        b = pb.to(tl.int32)
+        lo = _e2m1_f16(b & 15)
+        hi = _e2m1_f16(b >> 4)
     GROUP: tl.constexpr = 32 if MX else 16
     c = k0 // GROUP + tl.arange(0, BK // GROUP)
     sb = tl.load(S + slot * SE + rows[:, None] * SR + c[None, :])
     sc = (tl.where(sb == 0, 2.0 ** -127, (sb.to(tl.uint32) << 23).to(tl.float32, bitcast=True)) if MX else sb.to(tl.float8e4nv, bitcast=True).to(tl.float32).to(tl.float16))
     sc = tl.reshape(tl.broadcast_to(sc[:, :, None], (BN, BK // GROUP, GROUP // 2)), (BN, BK // 2))
     if MX:
-        return (lo.to(tl.float32) * sc).to(tl.bfloat16), (hi.to(tl.float32) * sc).to(tl.bfloat16)
+        return (lo.to(tl.float32) * sc).to(DT), (hi.to(tl.float32) * sc).to(DT)
     else:
         return lo * sc, hi * sc
 
@@ -160,7 +202,8 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 @triton.jit
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False):
+             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
+             HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -177,10 +220,10 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
     accu = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, H, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
-        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX)
+        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
+        xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
+        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW, DT)
+        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW, DT)
         accg = tl.dot(xe, tl.trans(gl), accg)
         accg = tl.dot(xo, tl.trans(gh), accg)
         accu = tl.dot(xe, tl.trans(ul), accu)
@@ -194,12 +237,13 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
         val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
     else:
         val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(tl.bfloat16), mask=tok[:, None] < M)
+    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(DT), mask=tok[:, None] < M)
 
 
 @triton.jit
 def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False, STAGED: tl.constexpr = False):
+          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False, STAGED: tl.constexpr = False,
+          HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -215,9 +259,9 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, I, BK):
         ke = k0 + 2 * tl.arange(0, BK // 2)
-        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(tl.bfloat16 if MX else tl.float16)
-        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX)
+        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
+        ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
+        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX, HW, DT)
         acc = tl.dot(ae, tl.trans(wl), acc)
         acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
@@ -299,19 +343,19 @@ def _miss_copy(SRC, DST, PIECES, MISS_E, NP, CHUNK: tl.constexpr, B: tl.constexp
         tl.store(dst + o, tl.load(src + o, o < n), o < n)
 
 
-def _scratch(H, I, dev):
+def _scratch(H, I, dtype, dev):
     """Buffers shared by every cached layer (calls run one after another on the decode stream)."""
-    key = (H, I)
+    key = (H, I, dtype)
     if key not in _shared:
         _shared[key] = dict(
-            mid=torch.empty((MAX_ROUTES, MAX_M, I), dtype=torch.bfloat16, device=dev),
+            mid=torch.empty((MAX_ROUTES, MAX_M, I), dtype=dtype, device=dev),
             part=torch.empty((MAX_ROUTES, MAX_M, H), dtype=torch.float32, device=dev),
             gout=torch.empty((8, H), dtype=torch.float32, device=dev),
             rslot=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_list=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             slot_exp=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             # staging of the GPU-only path (full residency): written by _pack, never read
-            sx=torch.empty((8, H), dtype=torch.int16, device=dev),
+            sx=torch.empty((8, H), dtype=torch.bfloat16, device=dev),
             sids=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             sroute=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
             sorig=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),
@@ -410,16 +454,20 @@ class LayerPool:
     """The cache of one XTier MoE layer: S slots in the engine's shard layout and its residency table row."""
     layers = []
 
-    def __init__(self, prefill, slots, plan, mailbox, layer_id):
+    def __init__(self, prefill, slots, plan, mailbox, layer_id, dtype=None):
         self.prefill, self.S, self.plan, self.mailbox = prefill, int(slots), plan, mailbox
         self.layer_id = layer_id
+        # The dtype of the activations: the GPU kernels' dot operands (BF16 where the GPU has BF16 tensor cores,
+        # FP16 below them).
+        self.dtype = dtype if dtype is not None else prefill.dtype
         H, I, E = prefill.hidden, prefill.inter, prefill.experts
         self.H, self.I, self.E, self.limit = H, I, E, float(prefill.swiglu_limit)
         self.alpha, self.beta = prefill.swiglu_alpha, prefill.swiglu_beta
         self.full = self.S >= E
         self.S = min(self.S, E)
-        self.bk_h, self.bk_i = _tile_k(H), _tile_k(I)   # gate/up reduce over H, down over I
-        if not self.bk_h or not self.bk_i or I % CONFIG['gbn'] or H % CONFIG['dbn']:
+        self.cfg = _tiles()                             # the decode tiles (the shared memory decides the depth)
+        self.bk_h, self.bk_i = _tile_k(H, self.cfg['bk']), _tile_k(I, self.cfg['bk'])   # gate/up over H, down over I
+        if not self.bk_h or not self.bk_i or I % self.cfg['gbn'] or H % self.cfg['dbn']:
             raise ValueError(f'xtier cache: unsupported shape H={H} I={I}')
         dev = torch.device('cuda', torch.cuda.current_device())
         # same per-expert shapes as the prefill staging slots: w13, w2, s13, s2 (bytes, unchanged)
@@ -460,7 +508,7 @@ class LayerPool:
         self.rank = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
         self.filled = False
-        self.scratch = _scratch(H, I, dev)
+        self.scratch = _scratch(H, I, self.dtype, dev)
         self.globals = None
         self.miss = None   # XTIER_DECODE_MISS_GPU: _miss_layer at the fill (the staging slots now)
         _miss_stage(self)
@@ -501,16 +549,20 @@ class LayerPool:
         if self.globals is None:
             self.globals = self.prefill._globals()
         g13, g2 = self.globals
-        H, I, cfg, sc = self.H, self.I, CONFIG, self.scratch
+        H, I, cfg, sc = self.H, self.I, self.cfg, self.scratch
         nk = m * k
-        xb = Pointer(x, torch.bfloat16)
+        dt = self.dtype
+        tl_dt = _tl_dtype(dt)
+        hw = arch.has_fp4_convert()
+        xb = Pointer(x, dt)
         _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
                                         sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
-                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta,
+                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, HW=hw, DT=tl_dt,
                                         num_warps=cfg['gw'], num_stages=cfg['gs'])
         _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                      sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
-                                     MX=self.prefill.mxfp4, num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                     MX=self.prefill.mxfp4, HW=hw, DT=tl_dt,
+                                     num_warps=cfg['dw'], num_stages=cfg['ds'])
         if self.miss is not None:   # the missed experts _miss_select gave the GPU: into the staging slots, then as above
             mi, cap, stage = self.miss, _miss['cap'], self.miss['stage']
             _miss_copy[(cap * mi['n'], triton.cdiv(mi['words'], MISS_CHUNK))](
@@ -518,11 +570,11 @@ class LayerPool:
                 MISS_CHUNK, 1024)
             _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13, sc['mid'], m, H, I,
                                              self.limit, MAX_M, cfg['gbn'], self.bk_h, MX=self.prefill.mxfp4,
-                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, num_warps=cfg['gw'],
-                                             num_stages=cfg['gs'])
+                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, HW=hw, DT=tl_dt,
+                                             num_warps=cfg['gw'], num_stages=cfg['gs'])
             _down[(cap, H // cfg['dbn'])](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2, sc['part'], m, H,
                                           I, MAX_M, cfg['dbn'], self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
-                                          num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                          HW=hw, DT=tl_dt, num_warps=cfg['dw'], num_stages=cfg['ds'])
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout,
                                             H, k, MAX_M, 1024)
 
@@ -541,14 +593,16 @@ class LayerPool:
             _commit[(1,)](Pointer(_glob['ring'], torch.int32), Pointer(_glob['seqs'], torch.int32), _glob['state'],
                           _glob['table'], _glob['owner'], self.E, RING)
         _pack[(triton.cdiv(m * H, BLOCK),)](
-            Pointer(x, torch.int16), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
-            Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.int16), Pointer(sids, torch.int32),
+            Pointer(x, self.dtype), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
+            Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.bfloat16), Pointer(sids, torch.int32),
             Pointer(sroute, torch.int32), Pointer(sorig, torch.int32), self.used, self.rank, sc['rslot'],
             sc['slot_list'], sc['slot_exp'], self.owner, m * H, nk, k, self.S, bool(act),
             triton.next_power_of_2(S), BLOCK)
 
-    def decode(self, stream, m, k, x, ids, routing, out, act=0):
+    def decode(self, stream, m, k, x, ids, routing, out, act=0, dtype=None):
         """One decode call of up to 8 tokens on the current stream (device addresses; out: FP32 [m, H])."""
+        if dtype is not None and dtype != self.dtype:
+            raise TypeError(f'xtier cache: the activations are {dtype}, this layer was built for {self.dtype}')
         sc = self.scratch
         if self.full:   # every expert on the GPU: no CPU part
             self._route(m, k, x, ids, routing, act, (sc['sx'].data_ptr(), sc['sids'].data_ptr(),

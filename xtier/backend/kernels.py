@@ -42,12 +42,13 @@ def _unpack(SOUT, OUT, N: tl.constexpr, B: tl.constexpr):
     tl.store(OUT + i, tl.load(SOUT + i, i < N, cache_modifier='.cv'), i < N)
 
 
-def pack(slot, m, k, x, ids, routing, H, act=0):
-    """x: BF16 [m, H], ids: int32 [m, k], routing: float32 [m, k], act: int32 [m] token flags or 0 (device addresses)
-    -> the slot's inputs."""
+def pack(slot, m, k, x, ids, routing, H, act=0, dtype=torch.bfloat16):
+    """x: the activations [m, H] in `dtype` (BF16, or FP16 where the GPU has no BF16 tensor cores), ids: int32 [m, k],
+    routing: float32 [m, k], act: int32 [m] token flags or 0 (device addresses) -> the slot's inputs. The engine reads
+    BF16: the store into the slot converts."""
     sx, sids, sroute = slot[:3]
-    _pack[(triton.cdiv(m * H, BLOCK),)](Pointer(x, torch.int16), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
-                                        Pointer(act or ids, torch.int32), Pointer(sx, torch.int16),
+    _pack[(triton.cdiv(m * H, BLOCK),)](Pointer(x, dtype), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
+                                        Pointer(act or ids, torch.int32), Pointer(sx, torch.bfloat16),
                                         Pointer(sids, torch.int32), Pointer(sroute, torch.int32), m * H, m * k, k,
                                         bool(act), BLOCK)
 

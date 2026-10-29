@@ -166,7 +166,10 @@ def _forward_extend(original, self, q, k, v, layer, forward_batch, *args, **kwar
 
 
 def install(registry, hook_type):
+    from xtier.packs import supported
     if not m31_branch():
+        return
+    if not supported((10, 0), 'the MiniMax M3.1 pack'):   # the M3.1 kernels (tcgen05, MegaMoE, FMHA) are SM100 only
         return
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(f'{MOE_SCHEME}.__init__', _moe_scheme_init, hook_type.AROUND)
@@ -190,7 +193,10 @@ def install(registry, hook_type):
 
 def install_serving(registry, hook_type):
     """Hooks of the process that resolves the server arguments and serves the API."""
+    from xtier.packs import supported
     if not m31_branch():
+        return False
+    if not supported((10, 0), 'the MiniMax M3.1 pack'):
         return False
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(INVOKE_OVERRIDE, _invoke_override, hook_type.AROUND)

@@ -35,7 +35,7 @@ import time
 import torch
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
-from xtier import config, platform
+from xtier import arch, config, platform
 from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
 from xtier.engine import CpuPlan, Mailbox, placement
@@ -44,6 +44,18 @@ logger = logging.getLogger(__name__)
 SLOT_TOKENS = 8      # tokens per mailbox slot (engine DECODE_M)
 MAX_TOP_K = 10
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
+
+
+def _activation_dtype(dtype):
+    """The dtype of the activations: BF16 or FP16. BF16 needs a GPU with BF16 tensor cores (sm_80 and newer); below
+    that (Turing, sm_75) the model has to run in FP16. The CPU engine keeps its BF16 contract either way: the
+    activations are converted when they are staged for it."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
+    if dtype == torch.bfloat16 and not arch.has_bf16():
+        raise TypeError(f'xtier: this GPU ({arch.describe()}) has no BF16 tensor cores: run the model with '
+                        '--dtype float16')
+    return dtype
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,9 +96,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
             ('router weight on input', rc.apply_router_weight_on_input),
             ('fused shared experts', layer.num_fused_shared_experts > 0),
             ('expert parallel MoE', layer.moe_ep_size > 1),
-            ('params dtype', params_dtype != torch.bfloat16)) if bad]
+            ('params dtype', params_dtype not in (torch.bfloat16, torch.float16))) if bad]
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
+        self.dtype = _activation_dtype(params_dtype)
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
         self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
         # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
@@ -232,7 +245,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
-                               swiglu_beta=self.swiglu_beta)
+                               swiglu_beta=self.swiglu_beta, dtype=self.dtype)
         self.prefill.order = self.cfg.layer_id   # the cross-layer prefetch links layers in this order
         self.prefill.cold = prefill_cold
         del inputs, pointers
@@ -241,7 +254,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         slots = self.experts if self.cfg.cache_slots < 0 else self.cfg.cache_slots
         if slots > 0:   # allocated now, so the KV cache is sized after it
             from xtier.cache.pool import LayerPool
-            self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id)
+            self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id, dtype=self.dtype)
             if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
         self.plan.pool = self.pool   # read by the prefill (residency of the FP4 path)
@@ -282,8 +295,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         m = x.shape[0]
         if m == 0:
             return StandardCombineInput(hidden_states=x.new_zeros(x.shape))
-        if x.dtype != torch.bfloat16:
-            raise TypeError(f'xtier: BF16 activations required, got {x.dtype}')
+        _activation_dtype(x.dtype)
         if not XTierMoEMethod._localized:
             XTierMoEMethod._localize_all()
         ids = topk.topk_ids if topk.topk_ids.dtype == torch.int32 else topk.topk_ids.to(torch.int32)
@@ -325,7 +337,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             else:
                 out = torch.empty_like(x)
                 self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k,
-                                 torch.cuda.current_stream().cuda_stream)
+                                 torch.cuda.current_stream().cuda_stream, dtype=x.dtype)
                 self.calls['gpu_prefill'] += 1
         else:
             self._cache_start()
@@ -356,10 +368,10 @@ class XTierMoEMethod(FusedMoEMethodBase):
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
             act = active.data_ptr() + start * 4 if active is not None else 0
             if self.pool is not None:
-                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act)
+                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act, x.dtype)
                 continue
             slot = self.mailbox.slot(stream, n, k)
-            kernels.pack(slot, n, k, xs, ids_s, ws, H, act)
+            kernels.pack(slot, n, k, xs, ids_s, ws, H, act, dtype=x.dtype)
             self.mailbox.notify(stream, n, k)
             kernels.unpack(slot, n, out.data_ptr() + start * H * 4, H)
         return out[:m]
@@ -408,7 +420,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         stream = torch.cuda.current_stream().cuda_stream
         if g >= E:
             out = torch.empty_like(x)
-            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream,
+                             dtype=x.dtype)
             return out
         table = None
         cold = self.prefill.cold
@@ -421,7 +434,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             lo = max(0, hi - (E - g) // CH * CH)
             if lo >= hi:
                 out = torch.empty_like(x)
-                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream,
+                                 dtype=x.dtype)
                 return out
             table = self.plan.slot_table()   # before the CPU part runs (slot_table refuses during a forward)
             slot = torch.tensor(table, dtype=torch.int64, device=ids.device)[ids.clamp(min=0).long()]
@@ -455,7 +469,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         t0 = time.perf_counter()
         try:
             self.prefill.run(x.data_ptr(), out_g.data_ptr(), ids_g.data_ptr(), w_g.data_ptr(), m, k, stream,
-                             output_dtype=torch.float32, cold_table=table)
+                             output_dtype=torch.float32, cold_table=table, dtype=x.dtype)
             gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
         finally:
             worker.join()

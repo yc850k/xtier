@@ -1,19 +1,42 @@
 """Grouped GPU prefill of a MoE layer whose experts live in host memory (the CPU engine's NUMA shards).
 Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_prefill.py: names changed only.
 
-Compressed weights and FP8 block scales are unchanged. Gate/up use exact BF16
+Compressed weights and FP8 block scales are unchanged. Gate/up use exact 16-bit
 operands with FP32 accumulation; activation, down and route reduction stay FP32.
+The operands are BF16 where the GPU has BF16 tensor cores (sm_80 and newer) and
+FP16 below them (Turing, sm_75: no BF16 at all), so the dot products follow the
+model's activation dtype (DT).
 Calls are synchronous, serialized, and release temporary device weights before
 returning to attention. Retaining the workspace is an explicit experimental opt-in.
 """
 import ctypes as C
 import gc
+import logging
 import os
 import threading
 import weakref
 import torch
 import triton as tr
 import triton.language as tl
+
+from xtier import arch
+
+logger = logging.getLogger(__name__)
+_fp4_warned = False
+
+
+def _tl_dtype(dtype):
+    """The Triton dtype of a 16-bit float dtype: the kernels' dot operands."""
+    return tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
+
+
+def _down_precision():
+    """The down projection's precision: TF32 where the GPU has TF32 tensor cores (sm_80 and newer), the 16-bit dot
+    product below them (Turing has no TF32). XTIER_DOWN_PRECISION overrides it."""
+    value = os.environ.get('XTIER_DOWN_PRECISION', '').strip()
+    if value:
+        return value
+    return 'tf32x3' if arch.has_tf32() else '16bit'
 
 
 class Pointer:
@@ -59,7 +82,7 @@ def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr
 def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
           K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, UNPACKED: tl.constexpr,
           HID: tl.constexpr, INT: tl.constexpr, LIMIT: tl.constexpr, MX: tl.constexpr = False,
-          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0):
+          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.bfloat16):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -72,13 +95,13 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
     up = tl.zeros((BM, BN), tl.float32)
     for base in range(0, HID, BK):
         c = base + kk
-        x = tl.load(X + (route // K)[:, None] * HID + c[None, :], (r < end)[:, None], 0)
+        x = tl.load(X + (route // K)[:, None] * HID + c[None, :], (r < end)[:, None], 0).to(DT)
         if UNPACKED:
-            w0 = tl.load(W + ew*(2*INT)*HID + n[None,:]*HID + c[:,None])
-            w1 = tl.load(W + ew*(2*INT)*HID + (n+INT)[None,:]*HID + c[:,None])
+            w0 = tl.load(W + ew*(2*INT)*HID + n[None,:]*HID + c[:,None]).to(DT)
+            w1 = tl.load(W + ew*(2*INT)*HID + (n+INT)[None,:]*HID + c[:,None]).to(DT)
         else:
-            w0 = _weight(W, S, ew, n[None, :], c[:, None], 2*INT, HID, MX).to(tl.bfloat16)
-            w1 = _weight(W, S, ew, (n + INT)[None, :], c[:, None], 2*INT, HID, MX).to(tl.bfloat16)
+            w0 = _weight(W, S, ew, n[None, :], c[:, None], 2*INT, HID, MX).to(DT)
+            w1 = _weight(W, S, ew, (n + INT)[None, :], c[:, None], 2*INT, HID, MX).to(DT)
         gate = tl.dot(x, w0, gate)
         up = tl.dot(x, w1, up)
     gate *= tl.load(G + e * 2)
@@ -97,7 +120,8 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
 @tr.jit
 def _down(MID, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, ROUTE_OUT, E0, R0,
           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, PRECISION: tl.constexpr, UNPACKED: tl.constexpr,
-          HID: tl.constexpr, INT: tl.constexpr, BY_ROW: tl.constexpr = False, MX: tl.constexpr = False):
+          HID: tl.constexpr, INT: tl.constexpr, BY_ROW: tl.constexpr = False, MX: tl.constexpr = False,
+          DT: tl.constexpr = tl.bfloat16):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -114,14 +138,14 @@ def _down(MID, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, ROUTE_OUT, E0, R0,
             w = tl.load(W + ew*HID*INT + n[None,:]*INT + c[:,None]).to(tl.float32)
         else:
             w = _weight(W, S, ew, n[None, :], c[:, None], HID, INT, MX)
-        if PRECISION == 'bf16':
-            acc = tl.dot(x.to(tl.bfloat16), w.to(tl.bfloat16), acc)
+        if PRECISION == '16bit' or PRECISION == 'bf16':
+            acc = tl.dot(x.to(DT), w.to(DT), acc)
         elif PRECISION == 'split-bf16':
-            hi = x.to(tl.bfloat16)
+            hi = x.to(DT)
             rem = x - hi.to(tl.float32)
-            lo = rem.to(tl.bfloat16)
-            tail = (rem - lo.to(tl.float32)).to(tl.bfloat16)
-            wb = w.to(tl.bfloat16)
+            lo = rem.to(DT)
+            tail = (rem - lo.to(tl.float32)).to(DT)
+            wb = w.to(DT)
             acc = tl.dot(tail, wb, acc)
             acc = tl.dot(lo, wb, acc)
             acc = tl.dot(hi, wb, acc)
@@ -234,6 +258,8 @@ class _DeviceArray:
 def _device_tensor(address, shape, dtype):
     if dtype == torch.bfloat16:
         return torch.as_tensor(_DeviceArray(address, shape, '<i2'), device='cuda').view(torch.bfloat16)
+    if dtype == torch.float16:
+        return torch.as_tensor(_DeviceArray(address, shape, '<i2'), device='cuda').view(torch.float16)
     typestr = {torch.int32: '<i4', torch.float32: '<f4'}[dtype]
     return torch.as_tensor(_DeviceArray(address, shape, typestr), device='cuda')
 
@@ -251,11 +277,19 @@ _cudart = None
 def _runtime():
     global _cudart
     if _cudart is None:
-        lib = C.CDLL('libcudart.so.13')
+        lib = None
+        for name in ('libcudart.so.13', 'libcudart.so.12', 'libcudart.so.11.0', 'libcudart.so'):
+            try:
+                lib = C.CDLL(name)
+                break
+            except OSError:
+                continue
+        if lib is None:
+            raise RuntimeError('xtier: no CUDA runtime library found (libcudart.so.13 / .12 / .11)')
         lib.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
         lib.cudaHostUnregister.argtypes = [C.c_void_p]
         lib.cudaHostGetDevicePointer.argtypes = [C.POINTER(C.c_void_p), C.c_void_p, C.c_uint]
-        lib.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
+        lib.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_size_t,
                                           C.c_size_t, C.c_size_t, C.c_int, C.c_void_p]
         _cudart = lib
     return _cudart
@@ -287,8 +321,11 @@ class Prefill:
     """
 
     def __init__(self, experts, pointers, native=None, hidden=2560, inter=640, swiglu_limit=0.0, swiglu_alpha=1.0,
-                 swiglu_beta=0.0):
+                 swiglu_beta=0.0, dtype=None):
         self.mxfp4 = getattr(native, 'scale_format', 'nvfp4') == 'mxfp4'
+        # The dtype of the activations (the model's): the GPU kernels' dot operands. BF16 where the GPU has BF16
+        # tensor cores (sm_80 and newer), FP16 below them (Turing, sm_75: no BF16 at all).
+        self.dtype = dtype if dtype is not None else arch.dtype()
         if self.mxfp4 and os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
             raise ValueError('MXFP4 requires native scale shards')
         self.scale_group = 32 if self.mxfp4 else 16
@@ -335,7 +372,7 @@ class Prefill:
         self.down_tile128 = os.environ.get('XTIER_EXPERIMENTAL_PREFILL_TILE128') == '1'
         if self.down_tile128 and os.environ.get('XTIER_PREFILL_UNPACK') != '1':
             raise ValueError('Experimental down tile requires validated unpacked BF16 weights')
-        if self.down_tile128 and os.environ.get('XTIER_DOWN_PRECISION','tf32x3') != 'tf32x3':
+        if self.down_tile128 and _down_precision() != 'tf32x3':
             raise ValueError('Experimental down tile requires the original tf32x3 precision')
         shapes = [(experts, 2 * I, H // 2), (experts, H, I // 2),
                   (experts, 2 * I, H // self.scale_group), (experts, H, I // self.scale_group), (experts, 2), (experts,)]
@@ -442,8 +479,10 @@ class Prefill:
                     _check(cudart.cudaMemcpy2DAsync(dst, total * width, address + s0 * rows * width, rows * width,
                                                     rows * width, s1 - s0, 1, stream), 'cudaMemcpy2DAsync')
 
-    def run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16, cold_table=None):
+    def run(self, x, out, ids, routing, m, k, stream, output_dtype=None, cold_table=None, dtype=None):
         global _last_plan
+        dtype = dtype or self.dtype
+        output_dtype = output_dtype or dtype
         if self.learned_ring:
             previous = _last_plan() if _last_plan is not None else None
             # Forward links only (layer order): no prefetch from the last layer back to
@@ -460,7 +499,7 @@ class Prefill:
                 vids = torch.where(ids_t >= 0, self.cold.vmap[ids_t.clamp(min=0).long()].int(), ids_t)
             self._cold_ids = vids   # alive until the next call (the allocator reuses it in stream order)
             ids = vids.data_ptr()
-        retired = self._run(x, out, ids, routing, m, k, stream, output_dtype)
+        retired = self._run(x, out, ids, routing, m, k, stream, output_dtype, dtype)
         if retired:
             self.workspace_releases += 1
             # A first Triton specialization can leave cyclic compilation frames
@@ -470,8 +509,11 @@ class Prefill:
                 gc.collect()
                 self.workspace_gc_collections += 1
 
-    def _run(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
+    def _run(self, x, out, ids, routing, m, k, stream, output_dtype=None, in_dtype=None):
         global _slots, _unpacked, _pending, _copy_stream
+        dt = in_dtype if in_dtype is not None else self.dtype
+        tl_dt = _tl_dtype(dt)
+        output_dtype = output_dtype if output_dtype is not None else dt
         if m < 1 or not 1 <= k <= 10:
             raise ValueError('Invalid prefill shape')
         H, I, E, CH = self.hidden, self.inter, self.experts, self.chunk
@@ -479,11 +521,11 @@ class Prefill:
         n_slots = 1 if n_chunks == 1 else 2
         unpacked = os.environ.get('XTIER_PREFILL_UNPACK', '0') == '1'
         if os.environ.get('XTIER_PREFILL_FP4') == '1' and self._fp4_ready(output_dtype):
-            return self._run_fp4(x, out, ids, routing, m, k, stream)
+            return self._run_fp4(x, out, ids, routing, m, k, stream, output_dtype, dt)
         if (os.environ.get('XTIER_PREFILL_OVERLAP') == '1' and unpacked and n_chunks > 1
-                and self.route_accum and not self.down_tile128 and output_dtype == torch.bfloat16):
+                and self.route_accum and not self.down_tile128 and output_dtype != torch.float32):
             # (hybrid CPU/GPU calls pass FP32 output and use few chunks: keep the chunk-skipping path)
-            return self._run_overlap(x, out, ids, routing, m, k, stream, output_dtype)
+            return self._run_overlap(x, out, ids, routing, m, k, stream, output_dtype, dt)
         with _lock, torch.cuda.stream(torch.cuda.ExternalStream(stream)):
             compute = torch.cuda.current_stream()
             events=[]
@@ -567,9 +609,9 @@ class Prefill:
                         upload(nxt, nslot)
                 if unpacked:
                     shape = (CH, 2 * I, H)
-                    if _unpacked is None or tuple(_unpacked[0].shape) != shape:
-                        _unpacked = [torch.empty(shape, dtype=torch.bfloat16, device='cuda'),
-                                     torch.empty((CH, H, I), dtype=torch.bfloat16, device='cuda')]
+                    if _unpacked is None or tuple(_unpacked[0].shape) != shape or _unpacked[0].dtype != dt:
+                        _unpacked = [torch.empty(shape, dtype=dt, device='cuda'),
+                                     torch.empty((CH, H, I), dtype=dt, device='cuda')]
                     count = min(E, (j + 1) * CH) - j * CH
                     _unpack_all[(count, 2 * I * H // 1024)](w[0], w[2], _unpacked[0], 2 * I, H, 1024, MX=self.mxfp4)
                     _unpack_all[(count, H * I // 1024)](w[1], w[3], _unpacked[1], H, I, 1024, MX=self.mxfp4)
@@ -624,28 +666,29 @@ class Prefill:
                     t0, t1, r0, rows = spans[j]
                     w13, w2, s13, s2, slot = acquire(j, active)
                     e0 = j * CH
-                    _gate[(t1 - t0, I // gbn)](Pointer(x+start*H*2, torch.bfloat16), w13, s13, g13,
+                    _gate[(t1 - t0, I // gbn)](Pointer(x+start*H*2, dt), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, e0, r0,
                                              k, tm, gbn, gbk, unpacked, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, **gate_opts)
                     stamp('gate')
                     if self.down_tile128:
                         _down[(t1 - t0, H // 128)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                                    meta[2, t0:t1], routes, e0, r0,
-                                                   32, 128, 32, os.environ.get('XTIER_DOWN_PRECISION','tf32x3'),
-                                                   unpacked, H, I, accum, MX=self.mxfp4, num_warps=8, num_stages=3)
+                                                   32, 128, 32, _down_precision(),
+                                                   unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt,
+                                                   num_warps=8, num_stages=3)
                     else:
                         _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                                   meta[2, t0:t1], routes, e0, r0,
-                                                  tm, dbn, dbk, os.environ.get('XTIER_DOWN_PRECISION','tf32x3'),
-                                                  unpacked, H, I, accum, MX=self.mxfp4, **down_opts)
+                                                  tm, dbn, dbk, _down_precision(),
+                                                  unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt, **down_opts)
                     if not unpacked:
                         free = torch.cuda.Event(); free.record(compute); freed[slot] = free
                     stamp('down')
                     if accum:
                         _accum[(rows, tr.cdiv(H, 256))](routes, order, inv, weights_ptr, acc, r0, rows, k, 256, H)
                         stamp('accum')
-                dst = Pointer(out+start*H*(2 if output_dtype==torch.bfloat16 else 4), output_dtype)
+                dst = Pointer(out+start*H*output_dtype.itemsize, output_dtype)
                 if accum:
                     _emit[(size, tr.cdiv(H, 256))](acc, dst, 256, H)
                 else:
@@ -693,14 +736,22 @@ class Prefill:
 
     def _fp4_ready(self, output_dtype):
         """XTIER_PREFILL_FP4 applies to MXFP4 layers split into several equal expert chunks whose
-        global scales are all 1 (CUTLASS takes one fc1 global per expert); BF16 output only."""
+        global scales are all 1 (CUTLASS takes one fc1 global per expert); 16-bit output only, and the
+        SM120 MXFP4 tensor cores (below them the packed weights go through the software decode instead)."""
         ok = getattr(self, '_fp4_ok', None)
         if ok is None:
             g13, g2 = self.weights[-2], self.weights[-1]
             ok = (self.mxfp4 and self.experts % self.chunk == 0 and self.experts // self.chunk > 1
                   and bool((g13 == 1).all()) and bool((g2 == 1).all()))
             self._fp4_ok = ok
-        return ok and output_dtype == torch.bfloat16
+        if ok and not arch.has_blackwell_mxfp4_moe():
+            global _fp4_warned
+            if not _fp4_warned:
+                _fp4_warned = True
+                logger.warning('xtier: XTIER_PREFILL_FP4 is off on %s: the MXFP4 fused MoE needs the SM120 tensor '
+                                'cores; the packed weights are unpacked in software instead', arch.describe())
+            return False
+        return ok and output_dtype in (torch.bfloat16, torch.float16)
 
     def _upload_chunk_fp4(self, slot, e0, e1, stream):
         """Upload in the CUTLASS layout: [up; gate] rows, then the UE8M0 scales interleaved in place.
@@ -740,7 +791,7 @@ class Prefill:
             for t in (1, 3):
                 slot[t][i].copy_(a[t][r], non_blocking=True)
 
-    def _run_fp4(self, x, out, ids, routing, m, k, stream):
+    def _run_fp4(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16, in_dtype=None):
         """XTIER_PREFILL_FP4=1 (MXFP4 layers): the experts on the SM120 FP4 tensor cores through
         FlashInfer's CUTLASS fused MoE (MXFP4 weights x MXFP8 activations, block-32 UE8M0, the
         official reference's activation precision), as sglang's DSv4 path runs GPU-resident experts.
@@ -830,7 +881,7 @@ class Prefill:
                 if slot not in used:
                     refill(slot)
 
-            x_t = _device_tensor(x, (m, H), torch.bfloat16)
+            x_t = _device_tensor(x, (m, H), in_dtype if in_dtype is not None else self.dtype)
             ids_t = _device_tensor(ids, (m, k), torch.int32)
             w_t = _device_tensor(routing, (m, k), torch.float32)
             ids64 = ids_t.long()
@@ -901,7 +952,7 @@ class Prefill:
                     acc.index_add_(0, rows, part.float())
                 ev = torch.cuda.Event(); ev.record(compute); freed[slot] = ev
                 refill(slot)
-            _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, torch.bfloat16), 256, H)
+            _emit[(m, tr.cdiv(H, 256))](acc, Pointer(out, output_dtype), 256, H)
             if cross:
                 cross.sort(key=lambda t: t[0])
                 _pending = (_Fp4Prefetch(target), cross[0][1], cross[0][2], cross[1:])
@@ -922,7 +973,7 @@ class Prefill:
                     _slots = None
                 return tuple(retired)
 
-    def _run_overlap(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16):
+    def _run_overlap(self, x, out, ids, routing, m, k, stream, output_dtype=torch.bfloat16, in_dtype=None):
         """XTIER_PREFILL_OVERLAP=1 (unpacked weights, several expert chunks, route accumulation).
 
         Same kernels, tiles and FP32 accumulation order as _run, so outputs are bitwise identical;
@@ -941,6 +992,8 @@ class Prefill:
         """
         global _slots, _unpacked, _pending, _copy_stream, _unpack_stream, _unpacked2
         import numpy as np
+        dt = in_dtype if in_dtype is not None else self.dtype
+        tl_dt = _tl_dtype(dt)
         H, I, E, CH = self.hidden, self.inter, self.experts, self.chunk
         n_chunks = (E + CH - 1) // CH
         n_slots = min(n_chunks, max(2, int(os.environ.get('XTIER_PREFILL_PREFETCH_CHUNKS', '2'))))
@@ -980,9 +1033,9 @@ class Prefill:
             else:
                 self.prefetch_uploads += 1
             shape13, shape2 = (CH, 2 * I, H), (CH, H, I)
-            if _unpacked2 is None or tuple(_unpacked2[0][0].shape) != shape13:
-                _unpacked2 = [[torch.empty(shape13, dtype=torch.bfloat16, device='cuda'),
-                               torch.empty(shape2, dtype=torch.bfloat16, device='cuda')] for _ in range(2)]
+            if _unpacked2 is None or tuple(_unpacked2[0][0].shape) != shape13 or _unpacked2[0][0].dtype != dt:
+                _unpacked2 = [[torch.empty(shape13, dtype=dt, device='cuda'),
+                               torch.empty(shape2, dtype=dt, device='cuda')] for _ in range(2)]
             g13, g2 = self._call_globals()
             slot_free = [None] * n_slots   # event on the unpack stream: slot contents consumed
             buf_free = [None, None]    # event on the compute stream: BF16 buffer no longer read
@@ -1043,7 +1096,7 @@ class Prefill:
                 v = os.environ.get(name)
                 return {} if not v else dict(zip(('num_warps', 'num_stages'), map(int, v.split(','))))
             gate_opts, down_opts = launch_opts('XTIER_GATE_LAUNCH'), launch_opts('XTIER_DOWN_LAUNCH')
-            precision = os.environ.get('XTIER_DOWN_PRECISION', 'tf32x3')
+            precision = _down_precision()
 
             size = m
             di = torch.empty(size * k, dtype=torch.int32, device='cuda')
@@ -1085,13 +1138,14 @@ class Prefill:
                 if rows:
                     w13, w2 = _unpacked2[b]
                     s13, s2 = _slots[0][2], _slots[0][3]  # not read with unpacked weights
-                    _gate[(t1 - t0, I // gbn)](Pointer(x, torch.bfloat16), w13, s13, g13,
+                    _gate[(t1 - t0, I // gbn)](Pointer(x, dt), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, j * CH, r0,
                                              k, tm, gbn, gbk, True, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, **gate_opts)
                     _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                               meta[2, t0:t1], routes, j * CH, r0,
-                                              tm, dbn, dbk, precision, True, H, I, True, MX=self.mxfp4, **down_opts)
+                                              tm, dbn, dbk, precision, True, H, I, True, MX=self.mxfp4, DT=tl_dt,
+                                              **down_opts)
                 ev = torch.cuda.Event(); ev.record(compute); buf_free[b] = ev
                 if rows:
                     _accum[(rows, tr.cdiv(H, 256))](routes, order, inv, weights_ptr, acc, r0, rows, k, 256, H)
