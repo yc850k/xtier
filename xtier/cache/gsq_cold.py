@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 ROLES = ('w1', 'w3', 'w2')     # the gate, the up, the down (the pack's names)
 
-_store = None                  # (the store, the pack's file index -> the store's index)
+_stores = {}                  # the pack's path -> (the store, the pack's file index -> the store's index)
 _store_lock = threading.Lock()
 
 
@@ -40,9 +40,8 @@ def ranking(pack, layer_id, experts):
 
 def _store_for(pack):
     """The store: the checkpoint's own files, opened read-only (the experts' shards only)."""
-    global _store
     with _store_lock:
-        if _store is None:
+        if pack.path not in _stores:
             used = {int(entry[1]) for name, entry in pack.tensors.items() if '.ffn.experts.' in name}
             paths, index = [], {}
             for i in sorted(used):
@@ -54,10 +53,10 @@ def _store_for(pack):
             if not paths:
                 raise RuntimeError('xtier cold: the pack has no expert files')
             threads = int(os.environ.get('XTIER_COLD_THREADS', 8))
-            _store = (ColdStore(paths, threads=threads, writable=False), index)
+            _stores[pack.path] = (ColdStore(paths, threads=threads, writable=False), index)
             logger.info('xtier cold: the store: %d checkpoint files on %s (read-only, O_DIRECT)',
                         len(paths), paths[0].parent)
-        return _store
+        return _stores[pack.path]
 
 
 def attach(plan, pack, layer_id, gpu_slots=0):

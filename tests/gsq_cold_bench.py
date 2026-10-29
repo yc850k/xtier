@@ -88,11 +88,11 @@ for layer in layers:
     gsq_cold.attach(plan, pack, layer)
     load = time.perf_counter() - t0
     before = plan.cold_stats()
-    stats_before = gsq_cold._store[0].stats()
+    stats_before = gsq_cold._store_for(pack)[0].stats()
     t_pool = run(plan, routes)
     after = plan.cold_stats()
     misses = after[1] - before[1]
-    stats = gsq_cold._store[0].stats()
+    stats = gsq_cold._store_for(pack)[0].stats()
     read = stats[0] - stats_before[0]
     waited = stats[3] - stats_before[3]   # the seconds the store spent reading
     mb = read / 1e6
