@@ -34,11 +34,12 @@ def check(ok, what):
 E, H, I, K, M = 10, 256, 256, 1, 8        # the engine's minimum is 10 experts; H and I: multiples of 256
 THREADS = 4
 CACHED = 4                                # the GPU cache's slots (the pack's usage profile is empty: the order)
-BLOCK = {16: 66, 29: 56}
-ROW = {16: H // 256 * 66, 29: H // 256 * 56}
-ROW_DOWN = {16: I // 256 * 66, 29: I // 256 * 56}
+BLOCK = {16: 66, 17: 74, 19: 50, 29: 56}     # the bytes of one block, per type (csrc/engine/gsq.h)
+ROW = {t: H // 256 * b for t, b in BLOCK.items()}
+ROW_DOWN = {t: I // 256 * b for t, b in BLOCK.items()}
 types = np.array([29, 17, 16, 19, 29, 17, 16, 19, 29, 16], dtype=np.uint8)         # the gate and the up
 types_down = np.array([16, 19, 29, 17, 16, 19, 29, 17, 16, 19], dtype=np.uint8)     # the down
+NAMES = {16: 'IQ2_XXS', 17: 'IQ2_XS', 19: 'IQ1_S', 29: 'IQ1_M'}
 TOL = 5e-3
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -50,24 +51,24 @@ with tempfile.TemporaryDirectory() as tmp:
     size = sum(ROW.get(int(types[e]), 0) * I for e in range(E)) * 2 + \
         sum(ROW_DOWN.get(int(types_down[e]), 0) * H for e in range(E))
     raw = bytearray(np.random.default_rng(7).integers(0, 256, size, dtype=np.uint8).tobytes())
-    d16 = np.frombuffer(np.float16(1.0).tobytes(), dtype=np.uint8)
-    iq1m = np.frombuffer(np.uint16([0x0000, 0x0000, 0xC000, 0x3000]).tobytes(), dtype=np.uint8)
+    # the scale fields of the blocks: a finite fp16 (random bytes would give NaNs). The scale is 2^-8, so the weights
+    # are O(1) and the dots stay in the FP16 range.
+    d16 = np.frombuffer(np.float16(2 ** -8).tobytes(), dtype=np.uint8)
+    iq1m = np.frombuffer(np.uint16([0x0000, 0x0000, 0xC000, 0x1000]).tobytes(), dtype=np.uint8)
     offsets = {}
     at = 0
     for role in ('w1', 'w3', 'w2'):
         for e in range(E):
             t = int(types_down[e]) if role == 'w2' else int(types[e])
             rows = H if role == 'w2' else I
-            row_bytes = ROW_DOWN.get(t, ROW.get(t, 0)) if role == 'w2' else ROW.get(t, 0)
-            block = BLOCK.get(t, 0)
-            if not block:   # the types the engine cannot read (17, 19) are not in this file's blocks
-                block = 56
+            row_bytes = ROW_DOWN[t] if role == 'w2' else ROW[t]
+            block = BLOCK[t]
             for i in range(rows * (row_bytes // block)):
                 off = at + i * block
-                if t == 16:
-                    raw[off:off + 2] = d16.tobytes()
-                else:
+                if t == 29:   # IQ1_M: the scales at 48 (the block's d comes from their high nibbles)
                     raw[off + 48:off + 56] = iq1m.tobytes()
+                else:        # the fp16 d at the start of every block
+                    raw[off:off + 2] = d16.tobytes()
             offsets[(role, e)] = at
             at += row_bytes * rows
     (model / 'model.gguf').write_bytes(bytes(raw))
@@ -78,14 +79,14 @@ with tempfile.TemporaryDirectory() as tmp:
     for e in range(E):
         for role, rows, cols in (('w1', I, H), ('w3', I, H), ('w2', H, I)):
             t = int(types_down[e]) if role == 'w2' else int(types[e])
-            row_bytes = ROW_DOWN.get(t, ROW.get(t, 0)) if role == 'w2' else ROW.get(t, 0)
-            lines.append(f't layers.0.ffn.experts.{e}.{role}.weight {"IQ2_XXS" if t == 16 else "IQ1_M"} 0 '
+            row_bytes = ROW_DOWN[t] if role == 'w2' else ROW[t]
+            lines.append(f't layers.0.ffn.experts.{e}.{role}.weight {NAMES[t]} 0 '
                          f'{offsets[(role, e)]} {row_bytes * rows} {rows} {cols}')
     (pack_dir / 'tensors.txt').write_text('\n'.join(lines) + '\n')
     os.environ['XTIER_GSQ_PACK'] = str(pack_dir)
     os.environ['XTIER_CACHE_SLOTS'] = str(CACHED)
     os.environ['XTIER_COLD'] = '1'
-    os.environ['XTIER_COLD_FRACTION'] = '0.5'      # half of the experts stay on the drive
+    os.environ['XTIER_COLD_FRACTION'] = '0.6'      # 6 of the 10 experts stay on the drive (4 in RAM)
 
     from xtier.backend.method import LayerConfig, XTierMoEMethod   # noqa: E402
 
@@ -128,7 +129,9 @@ with tempfile.TemporaryDirectory() as tmp:
     # the layer's output: the GPU computes the cached experts, the engine the rest
     rng = np.random.default_rng(20261029)
     x = rng.integers(-256, 256, (M, H)).astype(np.float32) / 256.0
-    ids = np.array([[e] for e in range(M)], dtype=np.int32)
+    # the routes: the GPU's experts (0..3) and one on the drive (8): the engine's slots hold 4 experts, so a call
+    # must not name more distinct experts than that (the FP4 path's rule)
+    ids = np.array([[e % 4 if e < 4 else 8] for e in range(M)], dtype=np.int32)
     rw = (0.5 + 0.5 * rng.random((M, K))).astype(np.float32)
     x16 = (C.c_uint16 * (M * H))(*(x.view(np.uint32) >> 16).astype(np.uint16).reshape(-1).tolist())
     ids32 = (C.c_int32 * (M * K))(*ids.reshape(-1).tolist())
@@ -174,6 +177,31 @@ with tempfile.TemporaryDirectory() as tmp:
           f'the prefill through apply() (the CPU engine does it all, {got.shape[0]} tokens)')
     check(method.calls['decode'] > 0 and method.calls['cpu_prefill'] > 0,
           f'the calls were counted ({method.calls})')
+
+    # a prefill that routes to more experts than the RAM slots hold: the engine runs it in passes (each expert read
+    # from the drive once), and the result is the engine's own
+    def run_many(m, k):
+        """m tokens, k experts each: every expert of the layer is routed to (a prefill: the engine runs it in
+        passes, each expert read from the drive once)."""
+        xd = torch.from_numpy(np.repeat(x[:1], m, axis=0)).to(torch.float16).cuda()
+        ids_t = torch.from_numpy(np.tile(np.arange(E, dtype=np.int32), (m, 1))[:, :k].copy()).int().cuda()
+        rw_t = torch.from_numpy(np.full((m, k), 1.0 / k, dtype=np.float32)).cuda()
+        out = method.apply(layer, DispatchOutput(xd, ids_t, rw_t))
+        return out.hidden_states.float().cpu().numpy()
+
+    plan = method.plan
+    K2 = 6
+    ids_all = np.tile(np.arange(E, dtype=np.int32), (128, 1))[:, :K2].copy()
+    x16b = (C.c_uint16 * (128 * H))(*(np.repeat(x[:1], 128, axis=0).view(np.uint32) >> 16).astype(np.uint16)
+                                        .reshape(-1).tolist())
+    ids_c = (C.c_int32 * (128 * K2))(*ids_all.reshape(-1).tolist())
+    rw_c = (C.c_float * (128 * K2))(*np.full(128 * K2, 1.0 / K2, dtype=np.float32).tolist())
+    out = (C.c_float * (128 * H))()
+    rc = plan.forward(128, K2, C.addressof(x16b), C.addressof(ids_c), C.addressof(rw_c), C.addressof(out))
+    ref_all = np.frombuffer(out, dtype=np.float32).reshape(128, H).copy()
+    got = run_many(128, 6)
+    err = float(np.linalg.norm(got - ref_all) / max(np.linalg.norm(ref_all), 1e-30))
+    check(rc >= 0 and err < TOL, f'the prefill over every expert against the engine (relative L2 {err:.2e})')
 
 print('GSQ-METHOD-CHECK', 'PASS' if not bad else f'FAIL ({len(bad)})')
 sys.exit(1 if bad else 0)
