@@ -551,6 +551,10 @@ struct PlanBase {
     virtual int place(int expert,int slot)=0;
     virtual int slot_table(int32_t *table)=0;
     virtual int slot_pieces(int slot,int node,void **pointers,size_t *bytes) const=0;
+    // The GSQ slots: one expert's three tensors (the gate, the up and the down) as the checkpoint has them. The
+    // pointers are the three regions of the slot, the bytes the distance between two slots' regions (the region's
+    // size is the largest of the layer's experts, the offsets are whole blocks).
+    virtual int gsq_slot_pieces(int slot,void **pointers,size_t *bytes) const=0;
     virtual int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
                             float half_life)=0;
     // The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files).
@@ -1800,6 +1804,16 @@ public:
         for(int j=0;j<6;j++){pointers[j]=base[j]+S*sizes[j];bytes[j]=sizes[j];}
         return 0;
     }
+    // The GSQ slot's three regions (the gate, the up and the down) and the distance between two slots' regions.
+    int gsq_slot_pieces(int slot,void **pointers,size_t *bytes) const override {
+        if constexpr(!GSQ)return -1;
+        if(slot<0||slot>=int(gsq_slot.size()))return -1;
+        for(int r=0;r<3;r++) {
+            pointers[r]=gsq_slot[size_t(slot)].get()+gsq_slot_reg[r];
+            bytes[r]=(r<2?gsq_slot_reg[r+1]:gsq_slot_bytes)-gsq_slot_reg[r];   // to the next slot's region
+        }
+        return 0;
+    }
     void shard(int node,void **pointers,size_t *bytes) const {
         const size_t E=slots,H=hidden,I=inter,IN=I/nodes,HN=H/nodes;const auto &s=shards[node];
         const Bytes *all[6]={&s.gate,&s.up,&s.sg,&s.su,&s.down,&s.sd};
@@ -1911,6 +1925,12 @@ int XTIER_API(xtier_gsq_cold_attach)(void *plan,void *store,void *io,const int32
                                                              resident,count,scores,half_life);
     if(rc)last_error="Invalid GSQ cold attach (an expert not in the store, or a forward in progress)";
     return rc;
+}
+// The GSQ slot's three regions (the gate, the up and the down) and the distance between two slots' regions: where
+// the GPU cache's copies of an expert come from (the cold pool's swaps).
+int XTIER_API(xtier_gsq_slot_pieces)(void *plan,int slot,void **pointers,size_t *bytes) {
+    if(!plan){last_error="Null plan";return -1;}
+    return static_cast<Handle*>(plan)->plan->gsq_slot_pieces(slot,pointers,bytes);
 }
 int XTIER_API(xtier_slot_pin)(void *plan,int expert) {return plan?static_cast<Handle*>(plan)->plan->pin(expert):-1;}
 void XTIER_API(xtier_slot_unpin)(void *plan,int slot) {if(plan)static_cast<Handle*>(plan)->plan->unpin(slot);}

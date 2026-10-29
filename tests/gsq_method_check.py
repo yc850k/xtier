@@ -178,6 +178,42 @@ with tempfile.TemporaryDirectory() as tmp:
     check(method.calls['decode'] > 0 and method.calls['cpu_prefill'] > 0,
           f'the calls were counted ({method.calls})')
 
+    # the adaptive residency: the GPU cache's set follows the routes. The expert below is in the engine's RAM (the
+    # cold pool's resident set) and not in the VRAM: after a few windows of routes to it, the policy swaps it in.
+    from xtier.cache import gsq_pool
+    from xtier.cache.pool import _glob
+    _glob['captured'] = True   # the policy starts once the decode graphs exist (this test captures none)
+    gsq_pool.maybe_start()
+
+    def run_to(expert, m):
+        """m tokens, all routed to one expert."""
+        xd = torch.from_numpy(np.repeat(x[:1], m, axis=0)).to(torch.float16).cuda()
+        ids_t = torch.full((m, 1), expert, dtype=torch.int32).cuda()
+        rw_t = torch.full((m, 1), 1.0, dtype=torch.float32).cuda()
+        out = method.apply(layer, DispatchOutput(xd, ids_t, rw_t))
+        return out.hidden_states.float().cpu().numpy()
+
+    target = 4      # in the engine's RAM (the cold pool's resident set), not in the GPU cache
+    check(method.pool.table[target].item() < 0, 'the expert is not in the GPU cache yet')
+    for _ in range(32):
+        run_to(target, 4)
+    check(method.pool.table[target].item() >= 0,
+          f'the expert was swapped into the GPU cache (slot {method.pool.table[target].item()})')
+    got = run_to(target, 4)
+    # the engine's own output for the same routes
+    n_ref = 4
+    ids_ref = (C.c_int32 * n_ref)(*([target] * n_ref))
+    rw_ref = (C.c_float * n_ref)(*([1.0] * n_ref))
+    out_ref = (C.c_float * (n_ref * H))()
+    # the same activations the GPU's call used (the first token, four times)
+    x_ref = (C.c_uint16 * (n_ref * H))(*(np.repeat(x[:1], n_ref, axis=0).view(np.uint32) >> 16).astype(np.uint16)
+                                       .reshape(-1).tolist())
+    rc = method.plan.forward(n_ref, 1, C.addressof(x_ref), C.addressof(ids_ref), C.addressof(rw_ref),
+                             C.addressof(out_ref))
+    want = np.frombuffer(out_ref, dtype=np.float32).reshape(n_ref, H).copy()
+    err = float(np.linalg.norm(got - want) / max(np.linalg.norm(want), 1e-30))
+    check(rc >= 0 and err < TOL, f'the swapped expert computes the same as the engine (relative L2 {err:.2e})')
+
     # a prefill that routes to more experts than the RAM slots hold: the engine runs it in passes (each expert read
     # from the drive once), and the result is the engine's own
     def run_many(m, k):

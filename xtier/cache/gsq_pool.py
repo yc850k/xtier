@@ -24,6 +24,8 @@ GPU's part of a call costs about one expert's decode.
 """
 
 import ctypes as C
+import logging
+import os
 
 import torch
 import triton
@@ -32,7 +34,11 @@ from xtier import arch
 from xtier.backend.gsq_gpu import down, gate_up, tables
 from xtier.backend.kernels import Pointer
 from xtier.backend.prefill import _check, _runtime
-from xtier.cache.pool import BLOCK, MAX_M, _combine, _pack, _scratch, _tl_dtype, _unpack
+from xtier.engine import _P
+from xtier.cache.pool import (BLOCK, MAX_LAYERS, MAX_M, RING, _commit, _combine, _glob, _pack, _scratch,
+                          _tl_dtype, _unpack)
+
+logger = logging.getLogger(__name__)
 
 ROLES = ('w1', 'w3', 'w2')     # the gate, the up, the down (the pack's names)
 IQ_TYPES = (16, 17, 19, 29)   # the IQ formats the engine and the GPU decode (csrc/engine/gsq.h)
@@ -97,8 +103,25 @@ class GsqPool:
         self.offsets = offsets                       # the host copy (the uploads)
         self.offs = torch.tensor(offsets, dtype=torch.int32, device=dev)
         self.sizes = sizes                           # the bytes of every expert's three tensors
-        self.table = torch.full((self.E,), -1, dtype=torch.int32, device=dev)   # expert -> slot
-        self.owner = torch.zeros((self.S,), dtype=torch.int32, device=dev)      # slot -> expert
+        # The residency tables are rows of the global ones (the FP4 pool's): the adaptive policy's swaps are applied
+        # to them by the commit kernel (the ring's commands name the row).
+        if not _glob:
+            _glob['table'] = torch.full((MAX_LAYERS, self.E), -1, dtype=torch.int32, device=dev)   # expert -> slot
+            _glob['owner'] = torch.zeros((MAX_LAYERS, self.E), dtype=torch.int32, device=dev)      # slot -> expert
+            _glob['state'] = torch.zeros(2, dtype=torch.int32, device=dev)   # commands evicted / published
+            _glob['E'], _glob['rows'] = self.E, 0
+            ptr = (C.c_void_p * 2)()   # the mapped command ring must exist before the decode graphs are captured
+            if self.mailbox.lib.xtier_mailbox_pool_ring(C.cast(ptr, C.c_void_p)) < 0:
+                raise RuntimeError(self.mailbox.error())
+            _glob['ring'], _glob['seqs'] = ptr[0], ptr[1]
+        if _glob['E'] != self.E:
+            raise ValueError('xtier cache: every partly cached layer needs the same expert count')
+        self.index = _glob['rows']
+        if self.index >= MAX_LAYERS:
+            raise ValueError('xtier cache: too many layers')
+        _glob['rows'] += 1
+        self.table = _glob['table'][self.index]     # expert -> slot
+        self.owner = _glob['owner'][self.index]     # slot -> expert
         self.used = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
         self.rank = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
@@ -132,7 +155,7 @@ class GsqPool:
                     _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
                                                  C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
         table = torch.full((self.E,), -1, dtype=torch.int32)
-        owner = torch.zeros((self.S,), dtype=torch.int32)
+        owner = torch.zeros((self.E,), dtype=torch.int32)   # the global row: slot -> expert (E entries)
         for j, e in enumerate(experts):
             table[e] = j
             owner[j] = e
@@ -148,6 +171,13 @@ class GsqPool:
         sx, sids, sroute, sorig = staging
         sc = self.scratch
         nk = m * k
+        if torch.cuda.is_current_stream_capturing():
+            _glob['captured'] = True   # the adaptive policy starts only after the decode graphs exist
+        if self.index == 0 and _glob.get('adapt'):
+            # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
+            # kernel acknowledged its eviction): apply the posted swaps
+            _commit[(1,)](Pointer(_glob['ring'], torch.int32), Pointer(_glob['seqs'], torch.int32), _glob['state'],
+                          _glob['table'], _glob['owner'], self.E, RING)
         _pack[(triton.cdiv(m * self.H, BLOCK),)](
             Pointer(x, self.dtype), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
             Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.bfloat16), Pointer(sids, torch.int32),
@@ -199,7 +229,8 @@ class GsqPool:
 
 
 def fill_all():
-    """Fill the GSQ pools' slots with the hot experts (the pack's usage profile's ranking)."""
+    """Fill the GSQ pools' slots with the hot experts (the pack's usage profile's ranking) and let the adaptive
+    policy follow the routes (the swaps copy the experts from the engine's RAM slots)."""
     todo = [p for p in GsqPool.layers if not p.filled]
     if not todo:
         return 0
@@ -207,4 +238,39 @@ def fill_all():
     n = 0
     for pool in todo:
         n += pool.fill(pool.pack.ranking(pool.layer_id), stream)
+    partial = [p for p in todo if not p.full]
+    if partial and _glob.get('prepared'):
+        logger.warning('xtier cache: %d GSQ layers added after the adaptive policy started keep their initial '
+                       'residency', len(partial))
+        partial = []
+    if partial:
+        _glob['prepared'] = True
+    if os.environ.get('XTIER_CACHE_ADAPT', '1') != '0' and partial:
+        every, budget = int(os.environ.get('XTIER_CACHE_EVERY', '4')), int(os.environ.get('XTIER_CACHE_SWAPS', '16'))
+        decay = float(os.environ.get('XTIER_CACHE_DECAY', '0.7'))
+        gain = float(os.environ.get('XTIER_CACHE_MIN_GAIN', '1.5'))
+        lib = partial[0].mailbox.lib
+        for pool in partial:
+            offsets = (C.c_int32 * (pool.E * 3))(*[o for e in range(pool.E) for o in pool.offsets[e]])
+            sizes = (C.c_size_t * (pool.E * 3))(*[s for e in range(pool.E) for s in pool.sizes[e]])
+            resident = (C.c_int32 * pool.S)(*pool.resident)
+            if lib.xtier_mailbox_pool_attach_gsq(pool.mailbox.bridge, pool.index, pool.S, pool.S, pool.E,
+                                                 C.c_void_p(pool.arena.data_ptr()), C.c_size_t(pool.slot_bytes),
+                                                 offsets, sizes, resident) < 0:
+                raise RuntimeError(pool.mailbox.error())
+        _glob['adapt'] = (lib, every, budget, decay, gain)
     return n
+
+
+def maybe_start():
+    """At any MoE call outside capture: start the adaptive policy once the decode graphs have been captured, so its
+    copies never overlap a capture."""
+    a = _glob.get('adapt')
+    if not a or _glob.get('started') or not _glob.get('captured') or torch.cuda.is_current_stream_capturing():
+        return
+    lib, every, budget, decay, gain = a
+    if lib.xtier_mailbox_pool_start(every, budget, C.c_float(decay), C.c_float(gain)) < 0:
+        raise RuntimeError(lib.xtier_mailbox_error().decode())
+    _glob['started'] = True
+    logger.info('xtier cache: the GSQ pools\' adaptive residency started: every %d windows, up to %d swaps per '
+                'window, decay %s, min gain %s', every, budget, decay, gain)

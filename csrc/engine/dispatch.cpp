@@ -28,6 +28,7 @@ struct Impl {
     int (*place)(void*,int,int);
     int (*slot_table)(void*,int32_t*);
     int (*slot_pieces)(void*,int,int,void**,size_t*);
+    int (*gsq_slot_pieces)(void*,int,void**,size_t*);
     int (*cold_attach)(void*,void*,void*,const int32_t*,const long long*,const float*,float);
     int (*cold_attach_gsq)(void*,void*,void*,const int32_t*,const long long*,const int32_t*,int,const float*,float);
     int (*slot_pin)(void*,int);
@@ -84,7 +85,7 @@ const Impl *load(const char *isa) {
             bind(h,p,"xtier_nodes",m.nodes)&&bind(h,p,"xtier_worker_cpus",m.worker_cpus)&&
             bind(h,p,"xtier_create5",m.create5)&&bind(h,p,"xtier_gsq_decode",m.gsq_decode)&&
         bind(h,p,"xtier_create4",m.create4)&&bind(h,p,"xtier_place",m.place)&&
-            bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&
+            bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&bind(h,p,"xtier_gsq_slot_pieces",m.gsq_slot_pieces)&&
             bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_gsq_cold_attach",m.cold_attach_gsq)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
             bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats);
     if(!ok)return nullptr;
@@ -168,6 +169,9 @@ int xtier_place(void *plan,int expert,int slot){auto p=impl();return p?p->place(
 int xtier_slot_table(void *plan,int32_t *table){auto p=impl();return p?p->slot_table(plan,table):-1;}
 int xtier_slot_pieces(void *plan,int slot,int node,void **pointers,size_t *bytes) {
     auto p=impl();return p?p->slot_pieces(plan,slot,node,pointers,bytes):-1;
+}
+int xtier_gsq_slot_pieces(void *plan,int slot,void **pointers,size_t *bytes) {
+    auto p=impl();return p?p->gsq_slot_pieces(plan,slot,pointers,bytes):-1;
 }
 int xtier_set_swiglu(void *plan,float alpha,float beta){auto p=impl();return p?p->set_swiglu(plan,alpha,beta):-1;}
 int xtier_shape(void *plan,int *out){auto p=impl();return p?p->shape(plan,out):-1;}

@@ -588,6 +588,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         speculative decoding and short prompts every call before the first graph replay is a decode-sized one)."""
         from xtier.cache import pool
         pool.maybe_start()
+        from xtier.cache import gsq_pool
+        gsq_pool.maybe_start()
 
     _timing = {}
 

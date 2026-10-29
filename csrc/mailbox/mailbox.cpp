@@ -161,6 +161,15 @@ struct PoolLayer {
     char *arena[4]{};                 // device: w13, w2, s13, s2 slots (xtier shard layout)
     int nodes=0;                      // xtier worker nodes (each holds 1/nodes of every expert's rows)
     const char *shard[16][6]{};       // host (pinned): per worker node, gate, up, gate scales, up scales, down, down scales
+    // The GSQ path: the arena holds the experts' IQ bytes (one slot per expert: the gate, the up and the down as the
+    // checkpoint has them). The engine's RAM slots hold the same bytes, so a swap copies three ranges.
+    bool gsq=false;                       // the layer's experts are the GSQ ones (the IQ blocks)
+    char *gsq_arena=nullptr;             // device: the slots
+    size_t gsq_stride=0;                  // the bytes of a slot
+    const char *gsq_src[3]{};             // host: the engine's RAM slots, per role (the region's base)
+    size_t gsq_src_stride[3]{};           // the distance between two slots' regions
+    std::vector<int32_t> gsq_off;        // per expert and role: the tensor's offset in its slot
+    std::vector<size_t> gsq_size;        // per expert and role: the tensor's bytes
     std::vector<int> resident;        // slot -> expert (-1 empty), as decided (copies may be in flight)
     std::vector<int> slot_of;         // expert -> slot, as decided
     std::vector<uint32_t> busy;       // slot -> seq of its in-flight copy (0 = none)
@@ -232,7 +241,15 @@ public:
         if(any){warm_left.store(warm_rounds,std::memory_order_relaxed);prompts++;}
     }
     // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts)
-    void upload(PoolLayer &L,int ram,int slot) {
+    void upload(PoolLayer &L,int ram,int slot,int expert) {
+        if(L.gsq) {   // the GSQ path: the expert's three tensors (the gate, the up and the down) as the checkpoint has them
+            for(int r=0;r<3;r++) {
+                char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
+                const char *src=L.gsq_src[r]+size_t(ram)*L.gsq_src_stride[r];
+                check(cudaMemcpyAsync(dst,src,L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,copy));
+            }
+            return;
+        }
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
         // (arena, first row, rows per node, total rows, bytes per row) of each shard tensor, as prefill._shard_layout
         const size_t lay[6][5]={{0,0,IN,2*I,H/2},{0,I,IN,2*I,H/2},{2,0,IN,2*I,H/L.group},{2,I,IN,2*I,H/L.group},
@@ -274,7 +291,7 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         for(auto &c:todo) {
-            upload(*c.L,c.ram,c.slot);
+            upload(*c.L,c.ram,c.slot,c.in);
             driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy),dev_seqs+32*4,c.seq,0));
         }
     }
@@ -701,6 +718,37 @@ int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int active,int ex
             L->group=group;
             for(int j=0;j<6;j++)L->shard[node][j]=static_cast<const char*>(ptr[j]);
         }
+        L->resident.assign(resident,resident+slots);L->slot_of.assign(experts,-1);L->busy.assign(slots,0);
+        L->usage.assign(experts,0.f);
+        for(int s=0;s<slots;s++)if(L->resident[s]>=0&&L->resident[s]<experts)L->slot_of[L->resident[s]]=s;
+        auto &m=pool_manager();std::lock_guard<std::mutex> lock(m.mu);m.ensure_ring();
+        if(m.layers.size()<=size_t(layer))m.layers.resize(layer+1);
+        m.layers[layer]=std::move(L);b->pool_layer=layer;
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
+// The GSQ path: the layer's experts are the IQ blocks of a GGUF checkpoint. The arena holds one expert per slot (the
+// gate, the up and the down as the checkpoint has them); the engine's RAM slots hold the same bytes, so a swap copies
+// three ranges. offsets and sizes are per expert and role ([e*3+role]).
+int xtier_mailbox_pool_attach_gsq(void *bridge,int layer,int slots,int active,int experts,void *arena,size_t stride,
+                                   const int32_t *offsets,const size_t *sizes,const int32_t *resident) {
+    try {
+        if(!bridge||layer<0||layer>4095||slots<1||active<1||active>slots||experts<1||!arena||!offsets||!sizes
+           ||!resident)
+            throw std::runtime_error("Invalid GSQ pool attach");
+        auto*b=static_cast<Bridge*>(bridge);
+        auto L=std::make_unique<PoolLayer>();
+        int shape[4];if(xtier_shape(b->plan,shape)<0)throw std::runtime_error(xtier_last_error());
+        if(shape[2]!=experts)throw std::runtime_error("GSQ pool attach: expert count mismatch");
+        L->bridge=b;L->layer=layer;L->S=slots;L->E=experts;L->H=shape[0];L->I=shape[1];
+        L->active.store(active);L->base=active;L->elastic=active<slots;
+        L->gsq=true;L->gsq_arena=static_cast<char*>(arena);L->gsq_stride=stride;
+        L->gsq_off.assign(offsets,offsets+size_t(experts)*3);
+        L->gsq_size.assign(sizes,sizes+size_t(experts)*3);
+        // the engine's RAM slots: the three regions (the gate, the up and the down) and the distance between slots
+        void *ptr[3];size_t bytes[3];
+        if(xtier_gsq_slot_pieces(b->plan,0,ptr,bytes)<0)throw std::runtime_error(xtier_last_error());
+        for(int r=0;r<3;r++){L->gsq_src[r]=static_cast<const char*>(ptr[r]);L->gsq_src_stride[r]=bytes[r];}
         L->resident.assign(resident,resident+slots);L->slot_of.assign(experts,-1);L->busy.assign(slots,0);
         L->usage.assign(experts,0.f);
         for(int s=0;s<slots;s++)if(L->resident[s]>=0&&L->resident[s]<experts)L->slot_of[L->resident[s]]=s;

@@ -339,6 +339,7 @@ def mailbox_lib() -> C.CDLL:
             'slot': ([_P, _P, _I, _I, _P], _I), 'notify': ([_P, _P, _I, _I], _I), 'slot2': ([_P, _P, _I, _I, _P], _I),
             'signal': ([_P, _P, _I, _I, _I], _I), 'pool_enable': ([_P, _I], _I), 'pool_stats': ([_P, _P], _I),
             'pool_ring': ([_P], _I), 'pool_attach': ([_P, _I, _I, _I, _I, _P, _P], _I),
+            'pool_attach_gsq': ([_P, _I, _I, _I, _I, _P, C.c_size_t, _P, _P, _P], _I),
             'pool_pause': ([_I], _I), 'pool_quiesce': ([_I], _I), 'pool_shrink': ([_I], _I), 'pool_resume': ([], _I),
             'pool_grow': ([_I], _I), 'pool_active': ([], _I), 'vmm_reserve': ([C.c_size_t, _P, _P], _I),
             'vmm_map': ([_P, C.c_size_t, C.c_size_t], _I), 'vmm_unmap': ([_P, C.c_size_t], _I),

@@ -78,6 +78,9 @@ int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long lon
 // Before the first forward. 0 or -1.
 int xtier_gsq_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,
                           const int32_t *resident,int count,const float *scores,float half_life);
+// The GSQ slot's three regions (the gate, the up and the down) and the distance between two slots' regions: where
+// the GPU cache's copy of an expert comes from (the cold pool's swaps). 0 or -1.
+int xtier_gsq_slot_pieces(void *plan,int slot,void **pointers,size_t *bytes);
 // For readers on other threads (the GPU pool's copies): the slot holding `expert`, kept until xtier_slot_unpin;
 // -1 if it is not in RAM.
 int xtier_slot_pin(void *plan,int expert);
