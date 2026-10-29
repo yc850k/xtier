@@ -44,8 +44,11 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // its block scales, before the first forward.
 // The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each, and the type per
 // expert (the ggml type ids: 16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M).
+// The tensor-parallel split of the GSQ experts: the gate and the up take the rank's rows of I (row_off, row_count),
+// the down the rank's columns of I (col_off, col_count); full_inter is I of the file.
 void *xtier_create5(int hidden,int inter,int experts,int threads,float limit,const uint8_t *gate,
-                    const uint8_t *up,const uint8_t *down,const uint8_t *types,float swiglu_alpha,float swiglu_beta);
+                    const uint8_t *up,const uint8_t *down,const uint8_t *types,float swiglu_alpha,float swiglu_beta,
+                    long row_off,long row_count,long col_off,long col_count,long full_inter);
 void *xtier_create4(int hidden,int inter,int experts,int slots,int threads,float limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2,const int32_t *resident);

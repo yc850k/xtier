@@ -33,7 +33,8 @@ def engine() -> C.CDLL:
             lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
             lib.xtier_set_swiglu.restype = _I
         if hasattr(lib, 'xtier_create5'):   # the GSQ experts (a GGUF checkpoint's IQ-quantized rows)
-            lib.xtier_create5.argtypes = [_I, _I, _I, _I, C.c_float] + [_P] * 4 + [C.c_float, C.c_float]
+            lib.xtier_create5.argtypes = ([_I, _I, _I, _I, C.c_float] + [_P] * 4
+                                        + [C.c_float, C.c_float] + [C.c_long] * 5)
             lib.xtier_create5.restype = _P
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
@@ -87,7 +88,7 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, gsq_types=None):
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, gsq_types=None, gsq_split=None):
         if scale_format not in SCALE_FORMATS:
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
@@ -100,9 +101,13 @@ class CpuPlan:
             # expert (the ggml type ids).
             if not hasattr(self.lib, 'xtier_create5'):
                 raise RuntimeError('xtier: this engine build has no GSQ experts; rebuild it (tools/build_engine.sh)')
+            # gsq_split: (row_off, row_count, col_off, col_count, full_inter) of this tensor-parallel rank
+            row_off, row_count, col_off, col_count, full_inter = gsq_split or (0, self.inter, 0, self.inter, self.inter)
             self.plan = self.lib.xtier_create5(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
                                                weight_pointers[0], weight_pointers[1], weight_pointers[2],
-                                               gsq_types, float(swiglu_alpha), float(swiglu_beta))
+                                               gsq_types, float(swiglu_alpha), float(swiglu_beta),
+                                               int(row_off), int(row_count), int(col_off), int(col_count),
+                                               int(full_inter))
             if not self.plan:
                 raise RuntimeError(self.lib.xtier_last_error().decode())
             return
