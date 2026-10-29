@@ -228,7 +228,11 @@ print(f'the buffered path over the same ranges: {gbs(burst_bytes, buffered_s):.2
 print(f'the store: {stats[0] / 1e6:.1f} MB read in {stats[2]:.0f} reads, {stats[3]:.2f} s in reads', flush=True)
 print(f'the store\'s files: {len(paths)} shards on {mount_of(paths[0])} (the drive {devices[0]})', flush=True)
 
-check(abs(grew) < 4e6, f'the page cache did not grow with O_DIRECT ({grew / 1e6:.2f} MB)')
+# The page cache is the machine's, not the store's: other users grow it too. The signal is that the O_DIRECT path
+# caches far less than the buffered one over the same ranges.
+check(grew < max(2e6, buffered_grew / 8),
+      f'the page cache grew far less than the buffered path ({grew / 1e6:.2f} MB against '
+      f'{buffered_grew / 1e6:.1f} MB)')
 check(disk >= burst_bytes, f'the drive moved at least the bytes asked for ({disk / 1e6:.1f} MB)')
 check(disk < burst_bytes * 1.25, 'the drive moved no more than the windows around the ranges '
                                  f'({disk / burst_bytes:.3f}x; the drive\'s other users are in this number too)')
