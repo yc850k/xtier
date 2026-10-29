@@ -207,6 +207,9 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## 版本更新
 
+- 2026-10-29（晚）：GSQ 路径（GGUF 的 IQ 专家）补上两个主功能：热专家缓存（GPU 用 Triton 解 IQ 块，实测同一批路由
+  22.9 ms 对引擎 90.5 ms）与冷专家卸载到硬盘（`XTIER_COLD=1`，存储就是检查点自己的分片，O_DIRECT 读；本机实测
+  傲腾 2.4–3.5 GB/s，30% 卸载时 decode 每步缺 0.4 个专家、每步读 3.1 MB，步长不变）。详见[文档](docs/sm75.md)。
 - 2026-10-29：Turing（sm_75）适配，分支 `feat/sm75`：GPU 内核按显卡能力取 dtype 与内核（FP16 点积、软件 FP4 解码），
   加速包的 FP8/TMA/FP4 功能按等级关闭，新增 2× RTX 2080 Ti 的配置。详见[文档](docs/sm75.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
@@ -215,8 +218,6 @@ decode 约慢 10%），主要受限于硬盘速度。
   才报在线；DeepSeek 启动 472 → 186 s，卸载 30% 409 → 124 s。详见[文档](docs/reports/2026-10-27-fast-load.md)。
 - 2026-10-27：启动台新卡片「DeepSeek V4.1 Flash 1017 · 最小化」：32 GB 显存 + 128 GB 内存（模拟 RTX 5090），70% 的专家放硬盘，
   prefill 约 1,160、decode 约 30 tok/s。详见[文档](docs/reports/2026-10-27-ds41-minimal.md)。
-- 2026-10-26（晚）：冷专家卸载到硬盘（可选，`XTIER_COLD=1`），四个模型都能用；DeepSeek 卸载 30% 时 decode 每步 +44%。
-  详见[文档](docs/reports/2026-10-26-cold-experts.md)。
 
 更早的版本更新见 [docs/changelog.md](docs/changelog.md)。
 

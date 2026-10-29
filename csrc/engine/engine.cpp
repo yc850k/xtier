@@ -1774,6 +1774,7 @@ public:
     // Placement, from the plan's one caller between forwards (the call lock guards it): expert into slot; the expert
     // the slot held, -1 if none; -2 invalid, -3 a forward in progress.
     int place(int expert,int slot) override {
+        if constexpr(GSQ)return -2;   // the GSQ slots hold the experts' bytes (the cold pool moves them itself)
         if(expert<0||expert>=experts||slot<0||slot>=slots)return -2;
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())return -3;
