@@ -37,8 +37,8 @@ Each of them is reported once in the log when it is off.
 
 - The CPU engine runs the AVX2 build (`XTIER_ISA=avx2`): Broadwell has no AVX-512 BF16. The experts' FP4 unpacking
   is the same on both builds.
-- The GPU prefill's tiles are smaller than on the Blackwell hosts (Turing has 64 KiB of shared memory per SM, a
-  quarter of the RTX PRO 5000's): 64 wide with 2 stages.
+- The GPU prefill's tiles are smaller than on the Blackwell hosts (Turing has 64 KiB of shared memory per SM, the
+  RTX PRO 5000 has 100): 64 wide with 2 stages.
 - The hot expert cache holds few experts: an 11 GB card has no room for the 155 slots per layer of the RTX PRO 5000
   (`XTIER_CACHE_SLOTS=8`).
 

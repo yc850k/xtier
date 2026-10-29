@@ -1,10 +1,10 @@
-"""Prefill of a layer whose experts are all in the cache, on the packed slots in place: no staging copy and no BF16
-unpack of the whole layer (5 GB of writes per Qwen3.8 layer).
+"""Prefill of a layer whose experts are all in the cache, on the packed slots in place: no staging copy and no unpack
+of the whole layer (5 GB of writes per Qwen3.8 layer).
 
 Routes are sorted by expert and cut into tiles of up to BM routes of one expert (as in backend/prefill.py); each tile
-runs W4A16 gate/up and down with the cache's decode arithmetic (hardware FP4 -> FP16 conversion of two nibbles at a
-time, block scale applied in FP16, FP32 accumulation, BF16 intermediate; cache/pool.py ``_halves``), then the
-per-token sum of the routes in route order (FP32). The software FP4 decode inside the prefill GEMM
+runs W4A16 gate/up and down with the cache's decode arithmetic (FP4 -> FP16 conversion of two nibbles at a time,
+block scale applied in FP16, FP32 accumulation, the intermediate in the activation dtype; cache/pool.py ``_halves``),
+then the per-token sum of the routes in route order (FP32). The software FP4 decode inside the prefill GEMM
 (``UNPACKED=False`` there) reaches about 90 GB/s; this one runs at the bandwidth of the decode kernels.
 No kernel argument depends on the number of tokens at compile time, so a new prompt length compiles nothing.
 """
@@ -85,7 +85,8 @@ def _env_int(name, default):
 
 
 def resident_prefill(prefill, arena, x, ids, weights):
-    """x: BF16 [m, H], ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current stream) -> BF16 [m, H].
+    """x: the activations [m, H] in the model's dtype (BF16, or FP16 where the GPU has no BF16 tensor cores),
+    ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current stream) -> the same dtype [m, H].
     arena: the layer's slots [w13, w2, s13, s2], slot e = expert e."""
     H, I, E = prefill.hidden, prefill.inter, prefill.experts
     g13, g2 = prefill._globals()
@@ -140,8 +141,9 @@ def resident_prefill(prefill, arena, x, ids, weights):
 def hybrid_prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     """Prefill of a partly cached layer: routes to cached experts on the GPU (the tile kernels on the slots, W4A16),
     the others at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
-    x: BF16 [m, H], ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current stream) -> FP32 [m, H].
-    The residency is read once at the start: swaps are applied only by decode windows, which do not run meanwhile."""
+    x: the activations [m, H] in the model's dtype, ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current
+    stream) -> FP32 [m, H]. The residency is read once at the start: swaps are applied only by decode windows,
+    which do not run meanwhile."""
     import threading
 
     H, I, S = pool.H, pool.I, pool.S

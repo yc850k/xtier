@@ -147,6 +147,19 @@ def dtype():
     raise ValueError(f'xtier: XTIER_DTYPE={spec!r} is not bf16, fp16 or auto')
 
 
+def check_activation_dtype(dtype):
+    """The dtype of the activations: BF16 or FP16. BF16 needs a GPU with BF16 tensor cores (sm_80 and newer); below
+    that (Turing, sm_75) the model has to run in FP16. The CPU engine keeps its BF16 contract either way: the
+    activations are converted when they are staged for it."""
+    import torch
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
+    if dtype == torch.bfloat16 and not has_bf16():
+        raise TypeError(f'xtier: this GPU ({describe()}) has no BF16 tensor cores: run the model with '
+                        '--dtype float16')
+    return dtype
+
+
 def describe() -> str:
     """One line about the device, for the logs."""
     cap = capability()

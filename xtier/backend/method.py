@@ -47,15 +47,8 @@ DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured 
 
 
 def _activation_dtype(dtype):
-    """The dtype of the activations: BF16 or FP16. BF16 needs a GPU with BF16 tensor cores (sm_80 and newer); below
-    that (Turing, sm_75) the model has to run in FP16. The CPU engine keeps its BF16 contract either way: the
-    activations are converted when they are staged for it."""
-    if dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
-    if dtype == torch.bfloat16 and not arch.has_bf16():
-        raise TypeError(f'xtier: this GPU ({arch.describe()}) has no BF16 tensor cores: run the model with '
-                        '--dtype float16')
-    return dtype
+    """The dtype of the activations: BF16 or FP16 (arch.check_activation_dtype)."""
+    return arch.check_activation_dtype(dtype)
 
 
 @dataclasses.dataclass(frozen=True)
