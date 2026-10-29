@@ -15,7 +15,8 @@
 # - no TMA: the Qwen hyper-connection mix overlap stays off;
 # - 64 KiB of shared memory per SM: the GPU prefill's tiles are smaller than on the Blackwell hosts.
 set -eo pipefail
-M=${MODEL:-/mnt/optane/DeepSeek-V4.1-Flash/}      # the GGUF checkpoint (the shards and the Engram table)
+M=${MODEL:-/home/userroot/work/model/ds41-gguf}   # the GGUF checkpoint: config.json + tokenizer + the GGUF
+                                               # symlinks to the shards and the Engram table on the Optane drive
 D=${XTIER_ENV:-/home/userroot/work/.venvs/xtier-sm75}   # the python environment with SGLang and XTier
 PY=${XTIER_PYTHON:-$D/bin/python}
 PORT=${PORT:-18190}
