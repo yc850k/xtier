@@ -46,6 +46,13 @@ MAX_TOP_K = 10
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
 
 
+def _model_path() -> str:
+    """The checkpoint's path (the GSQ pack sits beside it)."""
+    from sglang.srt.server_args import get_server_args
+
+    return get_server_args().model_path
+
+
 def _activation_dtype(dtype):
     """The dtype of the activations: BF16 or FP16 (arch.check_activation_dtype)."""
     return arch.check_activation_dtype(dtype)
@@ -71,6 +78,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.gpu_method = gpu_method
         self.cfg = layer_config
         self.format = formats.detect(gpu_method)
+        self.gsq = False
         self.plan = None
         self.prefill = None
         self.mailbox = None
@@ -94,6 +102,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
         self.dtype = _activation_dtype(params_dtype)
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
+        if self.format.name == 'gsq':
+            # The experts stay in the mapped checkpoint file (the engine reads them there): the GPU method's expert
+            # parameters are not created, so the loader skips the expert tensors and the GPU never holds them.
+            self.gsq = True
+            return
         self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
         # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
         self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
@@ -205,6 +218,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self._convert(layer)
 
     def _convert(self, layer):
+        if self.gsq:
+            return self._convert_gsq(layer)
         source = self._source or 'copy'
         if source == 'copy':
             up_first = bool(getattr(self.gpu_method, 'load_up_proj_weight_first', False))
@@ -262,10 +277,33 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if direct.digest_enabled() and source == 'copy':   # the others' once their reads are done (direct.finish)
             logger.info('xtier: layer %d: shards digest %s', self.cfg.layer_id, direct.digest(self.plan))
 
+    def _convert_gsq(self, layer):
+        """The GSQ experts: the engine reads them from the mapped checkpoint file (the pack's tensors.txt and the
+        GGUF files), so nothing is copied and the GPU never holds the experts."""
+        from xtier.backend import gsq
+        placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
+        t0 = time.perf_counter()
+        pack = gsq.GsqPack(gsq.pack_path(_model_path()))
+        try:
+            gate, up, down, types = pack.layer_sources(self.cfg.layer_id)
+        finally:
+            pass   # the mapping stays open: the engine reads the experts from it
+        self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=self.inter,
+                            swiglu_limit=self.swiglu_limit, scale_format='gsq',
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta, gsq_types=types)
+        self.gsq_pack = pack
+        self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file
+        self.mailbox = Mailbox(self.plan)
+        self.pool = None      # the hot experts in the GPU cache: the GPU cannot decode the IQ blocks
+        logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
+                    self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
+
     def process_weights_after_loading(self, layer):
         if self.plan is None:   # some expert tensor never came through the loader
-            logger.warning('xtier: layer %d: loading did not complete (experts missing per parameter: %s); handing '
-                           'the experts over now', self.cfg.layer_id, {n: c for n, c in self._missing.items() if c})
+            if not self.gsq:   # the GSQ experts are read from the file: nothing to wait for
+                logger.warning('xtier: layer %d: loading did not complete (experts missing per parameter: %s); '
+                               'handing the experts over now', self.cfg.layer_id,
+                               {n: c for n, c in self._missing.items() if c})
             self._hand_off(layer)
 
     def _upload_from_cache(self, slot, e0, e1, stream, up_first=False):
@@ -312,6 +350,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
                 self._cache_start()
             out = self._decode(x, ids, weights, m, k)
             self.calls['decode'] += 1
+        elif self.gsq:
+            # The experts are in the checkpoint file: the CPU engine does everything (the GPU prefill and the hot
+            # expert cache need the packed weights, which the GPU cannot decode).
+            out = self._cpu_prefill(x, ids, weights, m, k)
+            self.calls['cpu_prefill'] += 1
         elif self.pool is not None and self.pool.full and config.resident_prefill():
             from xtier.cache.prefill import resident_prefill
             out = resident_prefill(self.prefill, self.pool.arena, x, ids, weights)

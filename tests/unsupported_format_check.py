@@ -21,27 +21,28 @@ def check(ok, what):
 
 
 class GGUFMoEMethod:
-    """SGLang's GGUF MoE method (the experts are dequantized from the GGUF file)."""
+    """SGLang's GGUF MoE method (the experts are the IQ-quantized tensors of a Maya pack)."""
 
 
 class UnquantizedFusedMoEMethod:
     """SGLang's method for unquantized (BF16/FP16) experts."""
 
 
-for cls in (GGUFMoEMethod, UnquantizedFusedMoEMethod):
-    try:
-        formats.detect(cls())
-        check(False, f'{cls.__name__}: no CPU engine format (the layer must stay with SGLang)')
-    except NotImplementedError as e:
-        check(True, f'{cls.__name__}: no CPU engine format ({e})')
+check(isinstance(formats.detect(GGUFMoEMethod()), formats.GsqExperts),
+      'the GGUF method has the GSQ format (the engine reads the experts from the file)')
+try:
+    formats.detect(UnquantizedFusedMoEMethod())
+    check(False, 'the unquantized method: no CPU engine format (the layer must stay with SGLang)')
+except NotImplementedError as e:
+    check(True, f'the unquantized method: no CPU engine format ({e})')
 
 # the hook: the layer stays with SGLang, and the load's self-check does not fail
 from xtier.backend import hooks  # noqa: E402
 from xtier.backend.method import LayerConfig  # noqa: E402
 
 cfg = LayerConfig(layer_id=7, threads=4)
-method = hooks.xtier_method(GGUFMoEMethod(), cfg)
-check(isinstance(method, GGUFMoEMethod), 'the GGUF layer stays with SGLang')
+method = hooks.xtier_method(UnquantizedFusedMoEMethod(), cfg)
+check(isinstance(method, UnquantizedFusedMoEMethod), 'the unquantized layer stays with SGLang')
 check(hooks.DELEGATED and hooks.DELEGATED[-1][0] == 7, f'the delegation is reported ({hooks.DELEGATED})')
 
 # a format XTier can read is taken
