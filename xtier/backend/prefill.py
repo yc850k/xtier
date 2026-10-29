@@ -20,6 +20,7 @@ import triton as tr
 import triton.language as tl
 
 from xtier import arch
+from xtier.backend.fp4 import e4m3_f32, ue8m0_f32
 
 logger = logging.getLogger(__name__)
 _fp4_warned = False
@@ -55,7 +56,9 @@ def _copy_ids(S, D, N: tl.constexpr, B: tl.constexpr):
 
 
 @tr.jit
-def _weight(W, S, e, row, col, ROWS: tl.constexpr, COLS: tl.constexpr, MX: tl.constexpr = False):
+def _weight(W, S, e, row, col, ROWS: tl.constexpr, COLS: tl.constexpr, MX: tl.constexpr = False,
+            HW8: tl.constexpr = True):
+    """One packed weight as FP32: the E2M1 value times its block scale (the scale's format follows MX)."""
     packed = tl.load(W + e * ROWS * (COLS // 2) + row * (COLS // 2) + col // 2)
     q = (packed >> ((col % 2) * 4)) & 15
     a = q & 7
@@ -63,10 +66,9 @@ def _weight(W, S, e, row, col, ROWS: tl.constexpr, COLS: tl.constexpr, MX: tl.co
     v = tl.where(q >= 8, -v, v)
     s = tl.load(S + e * ROWS * (COLS // (32 if MX else 16)) + row * (COLS // (32 if MX else 16)) + col // (32 if MX else 16))
     if MX:
-        # UE8M0 byte 0 represents 2^-127 (a float32 subnormal).
-        scale = tl.where(s == 0, 2.0 ** -127, (s.to(tl.uint32) << 23).to(tl.float32, bitcast=True))
+        scale = ue8m0_f32(s)
     else:
-        scale = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        scale = e4m3_f32(s, HW8)
     return v * scale
 
 
@@ -82,7 +84,8 @@ def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr
 def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
           K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, UNPACKED: tl.constexpr,
           HID: tl.constexpr, INT: tl.constexpr, LIMIT: tl.constexpr, MX: tl.constexpr = False,
-          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.bfloat16):
+          ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.bfloat16,
+          HW8: tl.constexpr = True):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -100,8 +103,8 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
             w0 = tl.load(W + ew*(2*INT)*HID + n[None,:]*HID + c[:,None]).to(DT)
             w1 = tl.load(W + ew*(2*INT)*HID + (n+INT)[None,:]*HID + c[:,None]).to(DT)
         else:
-            w0 = _weight(W, S, ew, n[None, :], c[:, None], 2*INT, HID, MX).to(DT)
-            w1 = _weight(W, S, ew, (n + INT)[None, :], c[:, None], 2*INT, HID, MX).to(DT)
+            w0 = _weight(W, S, ew, n[None, :], c[:, None], 2*INT, HID, MX, HW8).to(DT)
+            w1 = _weight(W, S, ew, (n + INT)[None, :], c[:, None], 2*INT, HID, MX, HW8).to(DT)
         gate = tl.dot(x, w0, gate)
         up = tl.dot(x, w1, up)
     gate *= tl.load(G + e * 2)
@@ -121,7 +124,7 @@ def _gate(X, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, MID, E0, R0,
 def _down(MID, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, ROUTE_OUT, E0, R0,
           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, PRECISION: tl.constexpr, UNPACKED: tl.constexpr,
           HID: tl.constexpr, INT: tl.constexpr, BY_ROW: tl.constexpr = False, MX: tl.constexpr = False,
-          DT: tl.constexpr = tl.bfloat16):
+          DT: tl.constexpr = tl.bfloat16, HW8: tl.constexpr = True):
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)  # expert offsets exceed 2**31 for DeepSeek V4.1
     ew = e - E0  # index inside the staged expert chunk; global scales use e
@@ -137,7 +140,7 @@ def _down(MID, W, S, G, ORDER, TILE_E, TILE_START, TILE_END, ROUTE_OUT, E0, R0,
         if UNPACKED:
             w = tl.load(W + ew*HID*INT + n[None,:]*INT + c[:,None]).to(tl.float32)
         else:
-            w = _weight(W, S, ew, n[None, :], c[:, None], HID, INT, MX)
+            w = _weight(W, S, ew, n[None, :], c[:, None], HID, INT, MX, HW8)
         if PRECISION == '16bit' or PRECISION == 'bf16':
             acc = tl.dot(x.to(DT), w.to(DT), acc)
         elif PRECISION == 'split-bf16':
@@ -513,6 +516,7 @@ class Prefill:
         global _slots, _unpacked, _pending, _copy_stream
         dt = in_dtype if in_dtype is not None else self.dtype
         tl_dt = _tl_dtype(dt)
+        hw8 = arch.has_fp8()   # the E4M3 scales: the hardware conversion (sm_89 and newer) or the formula
         output_dtype = output_dtype if output_dtype is not None else dt
         if m < 1 or not 1 <= k <= 10:
             raise ValueError('Invalid prefill shape')
@@ -669,19 +673,20 @@ class Prefill:
                     _gate[(t1 - t0, I // gbn)](Pointer(x+start*H*2, dt), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, e0, r0,
                                              k, tm, gbn, gbk, unpacked, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, HW8=hw8,
+                                             **gate_opts)
                     stamp('gate')
                     if self.down_tile128:
                         _down[(t1 - t0, H // 128)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                                    meta[2, t0:t1], routes, e0, r0,
                                                    32, 128, 32, _down_precision(),
-                                                   unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt,
+                                                   unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt, HW8=hw8,
                                                    num_warps=8, num_stages=3)
                     else:
                         _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                                   meta[2, t0:t1], routes, e0, r0,
                                                   tm, dbn, dbk, _down_precision(),
-                                                  unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt, **down_opts)
+                                                  unpacked, H, I, accum, MX=self.mxfp4, DT=tl_dt, HW8=hw8, **down_opts)
                     if not unpacked:
                         free = torch.cuda.Event(); free.record(compute); freed[slot] = free
                     stamp('down')
@@ -994,6 +999,7 @@ class Prefill:
         import numpy as np
         dt = in_dtype if in_dtype is not None else self.dtype
         tl_dt = _tl_dtype(dt)
+        hw8 = arch.has_fp8()   # the E4M3 scales: the hardware conversion (sm_89 and newer) or the formula
         H, I, E, CH = self.hidden, self.inter, self.experts, self.chunk
         n_chunks = (E + CH - 1) // CH
         n_slots = min(n_chunks, max(2, int(os.environ.get('XTIER_PREFILL_PREFETCH_CHUNKS', '2'))))
@@ -1141,11 +1147,12 @@ class Prefill:
                     _gate[(t1 - t0, I // gbn)](Pointer(x, dt), w13, s13, g13,
                                              order, meta[0, t0:t1], meta[1, t0:t1], meta[2, t0:t1], mid, j * CH, r0,
                                              k, tm, gbn, gbk, True, H, I, self.swiglu_limit, MX=self.mxfp4,
-                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, **gate_opts)
+                                             ALPHA=self.swiglu_alpha, BETA=self.swiglu_beta, DT=tl_dt, HW8=hw8,
+                                             **gate_opts)
                     _down[(t1 - t0, H // dbn)](mid, w2, s2, g2, order, meta[0, t0:t1], meta[1, t0:t1],
                                               meta[2, t0:t1], routes, j * CH, r0,
                                               tm, dbn, dbk, precision, True, H, I, True, MX=self.mxfp4, DT=tl_dt,
-                                              **down_opts)
+                                              HW8=hw8, **down_opts)
                 ev = torch.cuda.Event(); ev.record(compute); buf_free[b] = ev
                 if rows:
                     _accum[(rows, tr.cdiv(H, 256))](routes, order, inv, weights_ptr, acc, r0, rows, k, 256, H)

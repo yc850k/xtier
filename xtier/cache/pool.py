@@ -53,6 +53,7 @@ import triton
 import triton.language as tl
 
 from xtier import arch
+from xtier.backend.fp4 import e2m1_f16, e4m3_f32, ue8m0_f32
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
@@ -162,23 +163,15 @@ def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
 
 
 @triton.jit
-def _e2m1_f16(code):
-    """E2M1 nibble (sign in bit 3) -> FP16: the software form of Blackwell's cvt.rn.f16x2.e2m1x2 (the E2M1 values
-    are exactly representable in FP16, so both paths give the same numbers)."""
-    m = code & 7
-    v = tl.where(m < 4, m.to(tl.float32) * 0.5, tl.where(m == 4, 2.0, tl.where(m == 5, 3.0, tl.where(m == 6, 4.0, 6.0))))
-    return (v * tl.where((code & 8) != 0, -1.0, 1.0)).to(tl.float16)
-
-
-@triton.jit
 def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
-            HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
+            HW4: tl.constexpr = True, HW8: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     """Two FP16 tiles [BN, BK/2] of a pool slot: columns k0+2j (low nibbles) and k0+2j+1 (high nibbles).
     QE/QR: slot and row strides of the packed weights; SE/SR: of the linear E4M3 block scales.
-    HW: the GPU has the FP4 conversion instruction (sm_100 and newer); below it the E2M1 values are decoded in
-    software. DT: the dtype of the MXFP4 operands (the activation dtype)."""
+    HW4: the GPU has the FP4 conversion instruction (sm_100 and newer); below it the E2M1 values are decoded in
+    software. HW8: the FP8 conversion of the E4M3 scales (sm_89 and newer), the formula below it.
+    DT: the dtype of the MXFP4 operands (the activation dtype)."""
     pb = tl.load(Q + slot * QE + rows[:, None] * QR + (k0 // 2 + tl.arange(0, BK // 2))[None, :]).to(tl.uint32)
-    if HW:
+    if HW4:
         r = tl.inline_asm_elementwise(
             asm="{ .reg .b8 t; cvt.u8.u32 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
             constraints="=r,r", args=[pb], dtype=tl.uint32, is_pure=True, pack=1)
@@ -186,12 +179,12 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
         hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
     else:
         b = pb.to(tl.int32)
-        lo = _e2m1_f16(b & 15)
-        hi = _e2m1_f16(b >> 4)
+        lo = e2m1_f16(b & 15)
+        hi = e2m1_f16(b >> 4)
     GROUP: tl.constexpr = 32 if MX else 16
     c = k0 // GROUP + tl.arange(0, BK // GROUP)
     sb = tl.load(S + slot * SE + rows[:, None] * SR + c[None, :])
-    sc = (tl.where(sb == 0, 2.0 ** -127, (sb.to(tl.uint32) << 23).to(tl.float32, bitcast=True)) if MX else sb.to(tl.float8e4nv, bitcast=True).to(tl.float32).to(tl.float16))
+    sc = (ue8m0_f32(sb) if MX else e4m3_f32(sb, HW8).to(tl.float16))
     sc = tl.reshape(tl.broadcast_to(sc[:, :, None], (BN, BK // GROUP, GROUP // 2)), (BN, BK // 2))
     if MX:
         return (lo.to(tl.float32) * sc).to(DT), (hi.to(tl.float32) * sc).to(DT)
@@ -203,7 +196,7 @@ def _halves(Q, S, slot, rows, k0, QE, QR, SE, SR, BN: tl.constexpr, BK: tl.const
 def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: tl.constexpr, LIMIT,
              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False,
              ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, STAGED: tl.constexpr = False,
-             HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
+             HW4: tl.constexpr = True, HW8: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -222,8 +215,8 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
         ke = k0 + 2 * tl.arange(0, BK // 2)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
         xo = tl.load(X + tok[:, None] * H + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
-        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW, DT)
-        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW, DT)
+        gl, gh = _halves(Q13, S13, slot, n, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW4, HW8, DT)
+        ul, uh = _halves(Q13, S13, slot, n + I, k0, 2 * I * (H // 2), H // 2, 2 * I * (H // (32 if MX else 16)), H // (32 if MX else 16), BN, BK, MX, HW4, HW8, DT)
         accg = tl.dot(xe, tl.trans(gl), accg)
         accg = tl.dot(xo, tl.trans(gh), accg)
         accu = tl.dot(xe, tl.trans(ul), accu)
@@ -243,7 +236,7 @@ def _gate_up(X, SLOT_LIST, SLOT_EXP, Q13, S13, G13, MID, M, H: tl.constexpr, I: 
 @triton.jit
 def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.constexpr,
           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MX: tl.constexpr = False, STAGED: tl.constexpr = False,
-          HW: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
+          HW4: tl.constexpr = True, HW8: tl.constexpr = True, DT: tl.constexpr = tl.bfloat16):
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
     if slot < 0:
@@ -261,7 +254,7 @@ def _down(MID, SLOT_LIST, SLOT_EXP, Q2, S2, G2, PART, M, H: tl.constexpr, I: tl.
         ke = k0 + 2 * tl.arange(0, BK // 2)
         ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
         ao = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :] + 1, mask=tok[:, None] < M, other=0.0).to(DT if MX else tl.float16)
-        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX, HW, DT)
+        wl, wh = _halves(Q2, S2, slot, h, k0, H * (I // 2), I // 2, H * (I // (32 if MX else 16)), I // (32 if MX else 16), BN, BK, MX, HW4, HW8, DT)
         acc = tl.dot(ae, tl.trans(wl), acc)
         acc = tl.dot(ao, tl.trans(wh), acc)
     acc = acc * tl.load(G2 + e)
@@ -553,15 +546,15 @@ class LayerPool:
         nk = m * k
         dt = self.dtype
         tl_dt = _tl_dtype(dt)
-        hw = arch.has_fp4_convert()
+        hw4, hw8 = arch.has_fp4_convert(), arch.has_fp8()
         xb = Pointer(x, dt)
         _gate_up[(nk, I // cfg['gbn'])](xb, sc['slot_list'], sc['slot_exp'], self.arena[0], self.arena[2], g13,
                                         sc['mid'], m, H, I, self.limit, MAX_M, cfg['gbn'], self.bk_h,
-                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, HW=hw, DT=tl_dt,
+                                        MX=self.prefill.mxfp4, ALPHA=self.alpha, BETA=self.beta, HW4=hw4, HW8=hw8, DT=tl_dt,
                                         num_warps=cfg['gw'], num_stages=cfg['gs'])
         _down[(nk, H // cfg['dbn'])](sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena[1], self.arena[3], g2,
                                      sc['part'], m, H, I, MAX_M, cfg['dbn'], self.bk_i,
-                                     MX=self.prefill.mxfp4, HW=hw, DT=tl_dt,
+                                     MX=self.prefill.mxfp4, HW4=hw4, HW8=hw8, DT=tl_dt,
                                      num_warps=cfg['dw'], num_stages=cfg['ds'])
         if self.miss is not None:   # the missed experts _miss_select gave the GPU: into the staging slots, then as above
             mi, cap, stage = self.miss, _miss['cap'], self.miss['stage']
@@ -570,11 +563,11 @@ class LayerPool:
                 MISS_CHUNK, 1024)
             _gate_up[(cap, I // cfg['gbn'])](xb, _miss['r'], _miss['e'], stage[0], stage[2], g13, sc['mid'], m, H, I,
                                              self.limit, MAX_M, cfg['gbn'], self.bk_h, MX=self.prefill.mxfp4,
-                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, HW=hw, DT=tl_dt,
+                                             ALPHA=self.alpha, BETA=self.beta, STAGED=True, HW4=hw4, HW8=hw8, DT=tl_dt,
                                              num_warps=cfg['gw'], num_stages=cfg['gs'])
             _down[(cap, H // cfg['dbn'])](sc['mid'], _miss['r'], _miss['e'], stage[1], stage[3], g2, sc['part'], m, H,
                                           I, MAX_M, cfg['dbn'], self.bk_i, MX=self.prefill.mxfp4, STAGED=True,
-                                          HW=hw, DT=tl_dt, num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                          HW4=hw4, HW8=hw8, DT=tl_dt, num_warps=cfg['dw'], num_stages=cfg['ds'])
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout,
                                             H, k, MAX_M, 1024)
 

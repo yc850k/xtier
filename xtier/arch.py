@@ -128,9 +128,11 @@ def has_blackwell_mxfp4_moe() -> bool:
 
 
 def dot_dtype():
-    """The dtype the GPU's tensor cores take for a 16-bit dot product: BF16 from sm_80 on, FP16 below."""
+    """The dtype the GPU's tensor cores take for a 16-bit dot product: BF16 from sm_80 on, FP16 below. An unknown
+    capability (no GPU in sight) keeps the BF16 default."""
     import torch
-    return torch.bfloat16 if has_bf16() else torch.float16
+    cap = capability()
+    return torch.bfloat16 if cap is None or cap >= SM80 else torch.float16
 
 
 def dtype():
@@ -154,7 +156,7 @@ def check_activation_dtype(dtype):
     import torch
     if dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
-    if dtype == torch.bfloat16 and not has_bf16():
+    if dtype == torch.bfloat16 and capability() is not None and not has_bf16():
         raise TypeError(f'xtier: this GPU ({describe()}) has no BF16 tensor cores: run the model with '
                         '--dtype float16')
     return dtype
