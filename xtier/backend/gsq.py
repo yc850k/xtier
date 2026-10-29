@@ -9,6 +9,7 @@ cache of the files the experts are read from.
 import ctypes
 import mmap
 import os
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ class GsqPack:
         self.geometry = self._geometry()
         self.tensors, self.files = self._tensors()
         self._mapped = {}
+        self._profile = None
         self.experts = int(self.geometry.get('n_routed_experts', 0))
         self.hidden = int(self.geometry.get('hidden_size', 0))
         self.inter = int(self.geometry.get('moe_intermediate_size', 0))
@@ -90,6 +92,66 @@ class GsqPack:
         if dtype not in TYPES:
             raise ValueError(f'xtier: {name} is {dtype}, which the engine cannot read')
         return self._address(file, offset), TYPES[dtype], dims
+
+    def file_path(self, index):
+        """The path of the pack's file with this index (the GGUF shard)."""
+        name = self.files.get(index)
+        if name is None:
+            raise ValueError(f'xtier: the pack has no file {index}')
+        root = Path(self.geometry.get('model_dir', self.path.parent))
+        return Path(name) if os.path.isabs(name) else root / name
+
+    def expert_bytes(self, role, layer, expert):
+        """One expert's tensor of a role: the address, its byte size and the type id. The bytes are the checkpoint's
+        own (the GPU hot cache uploads them as they are)."""
+        name = f'layers.{layer}.ffn.experts.{expert}.{role}.weight'
+        entry = self.tensors.get(name)
+        if entry is None:
+            raise KeyError(f'xtier: the pack has no {name}')
+        dtype, file, offset, size, dims = entry
+        if dtype not in TYPES:
+            raise ValueError(f'xtier: {name} is {dtype}, which the engine cannot read')
+        return self._address(file, offset), size, TYPES[dtype]
+
+    def expert_locations(self, layer):
+        """Every expert of a layer as the cold store sees it: per role ('w1' the gate, 'w3' the up, 'w2' the down)
+        the file, the byte offset, the byte size and the type id of the expert's tensor. The cold pool reads these
+        ranges from the checkpoint's own files (they are already on the drive), so nothing is copied."""
+        out = []
+        for expert in range(self.experts):
+            roles = {}
+            for role in ('w1', 'w3', 'w2'):
+                name = f'layers.{layer}.ffn.experts.{expert}.{role}.weight'
+                entry = self.tensors.get(name)
+                if entry is None:
+                    raise KeyError(f'xtier: the pack has no {name}')
+                dtype, file, offset, size, dims = entry
+                if dtype not in TYPES:
+                    raise ValueError(f'xtier: {name} is {dtype}, which the engine cannot read')
+                roles[role] = (file, offset, size, TYPES[dtype])
+            out.append(roles)
+        return out
+
+    def profile(self):
+        """The pack's usage profile: how often every expert of every layer was routed to (expert-profile.bin: the
+        counts per layer and expert, one uint32 each). Empty when the pack has no profile."""
+        if self._profile is None:
+            self._profile = {}
+            path = self.path / 'expert-profile.bin'
+            if path.exists() and self.experts:
+                raw = path.read_bytes()
+                if len(raw) % (4 * self.experts) == 0:
+                    values = struct.unpack(f'<{len(raw) // 4}I', raw)
+                    self._profile = {layer: values[layer * self.experts:(layer + 1) * self.experts]
+                                     for layer in range(len(values) // self.experts)}
+        return self._profile
+
+    def ranking(self, layer):
+        """The layer's experts, the most used first (the pack's usage profile; the expert order without one)."""
+        row = self.profile().get(int(layer))
+        if not row or len(row) != self.experts:
+            return list(range(self.experts))
+        return sorted(range(self.experts), key=lambda e: -row[e])
 
     def layer_sources(self, layer):
         """A layer's experts as the engine takes them: the gate, the up and the down (the base addresses of the

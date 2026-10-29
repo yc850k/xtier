@@ -306,7 +306,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.gsq_pack = pack
         self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file
         self.mailbox = Mailbox(self.plan)
-        self.pool = None      # the hot experts in the GPU cache: the GPU cannot decode the IQ blocks
+        self.pool = None
+        # The hot experts in the GPU cache: the GPU decodes the IQ blocks (xtier/backend/gsq_gpu.py). The experts'
+        # bytes go into the VRAM as the checkpoint has them.
+        slots = self.experts if self.cfg.cache_slots < 0 else self.cfg.cache_slots
+        if slots > 0:
+            from xtier.cache.gsq_pool import GsqPool
+            self.pool = GsqPool(pack, self.cfg.layer_id, slots, self.mailbox, dtype=self.dtype,
+                                 swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
+                                 swiglu_beta=self.swiglu_beta)
         logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
 
@@ -550,16 +558,23 @@ class XTierMoEMethod(FusedMoEMethodBase):
         follow the NUMA localize (pinned pages cannot migrate)."""
         new, cls._registered = cls.layers[cls._registered:], len(cls.layers)
         cached = any(method.pool is not None for method in new)
+        gsq = any(getattr(method, 'gsq_pack', None) is not None for method in new)
         if not config.gpu_prefill_min() and not cached:
             return
         t0 = time.perf_counter()
         for method in new:
-            method.prefill.ensure_registered()
+            if method.prefill is not None:
+                method.prefill.ensure_registered()
         logger.info('xtier: pinned the shards of %d layers for GPU prefill in %.1f s', len(new),
                     time.perf_counter() - t0)
         if cached:
             from xtier.cache import pool
             pool.fill_all()
+        if gsq:
+            from xtier.cache import gsq_pool
+            n = gsq_pool.fill_all()
+            if n:
+                logger.info('xtier: %d GSQ experts uploaded to the GPU cache in %.1f s', n, time.perf_counter() - t0)
 
     @staticmethod
     def _cache_start():

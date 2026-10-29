@@ -9,6 +9,11 @@ A block is 256 values: the bytes of one row of the expert's tensor (the rows of 
 the rows of I values for the down). The decode of a block is a @triton.jit function over the [BN, 256] values of the
 BN rows at a given byte offset, so the GEMM kernels can decode the block they need. The u16 fields are read through
 a second view of the same bytes (B16): the offsets are even (the block sizes are), so the rows stay aligned.
+
+The cache's GEMM kernels are here too (gate_up, down): they decode the blocks of the expert they need and multiply
+them by the activations, like the FP4 pool's kernels (xtier/cache/pool.py) do with the packed FP4 weights. The
+decode's arithmetic is FP32 (the block scales are FP16 and the index arithmetic must not round); the dot takes the
+decoded values in FP16 (as the FP4 pool's does) with an FP32 accumulator.
 """
 
 import re
@@ -167,3 +172,91 @@ def decode_rows(TYPE, B8, B16, ROW0, ROW_STRIDE, BLK, BLOCK_BYTES, OUT, G1, G2, 
     vals = _iq_vals(TYPE, B8, B16, base, G1, G2, G3, KS, BN)
     row = tl.arange(0, BN)
     tl.store(OUT + row[:, None] * 256 + tl.arange(0, 256)[None, :], vals)
+
+
+@triton.jit
+def _block_bytes(TYPE):
+    """The bytes of one 256-value block of a type (csrc/engine/gsq.h: the IQ2_XXS, IQ2_XS, IQ1_S and IQ1_M blocks)."""
+    return tl.where(TYPE == 16, 66, tl.where(TYPE == 17, 74, tl.where(TYPE == 19, 50, 56)))
+
+
+@triton.jit
+def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.constexpr, I: tl.constexpr,
+            LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
+            ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16):
+    """The gate and the up of a cached expert: its IQ blocks decoded and multiplied by the tokens.
+
+    Program (route, tile): the rows n of the expert's gate and up (I rows of H values, a run of 256-value blocks a
+    row) for the tokens of the call. The intermediate (SiLU(gate) * up) goes to MID[route, token, n].
+
+    ARENA/ARENA16: the slots' bytes (the uint8 and the uint16 view of them). TYPES: the type of every expert per role
+    (the gate, the up, the down), OFFS: where an expert's three tensors start in its slot, STRIDE: the bytes of a
+    slot. The blocks are decoded in FP32 (the scales are FP16 and the index arithmetic must not round) and the dot
+    takes them in FP16 (the tensor cores of the card), with an FP32 accumulator.
+    """
+    p = tl.program_id(0)
+    slot = tl.load(SLOT_LIST + p)
+    if slot < 0:
+        return
+    row = p
+    e = tl.load(SLOT_EXP + p).to(tl.int64)
+    base = slot.to(tl.int64) * STRIDE
+    tg = tl.load(TYPES + e * 3)
+    tu = tl.load(TYPES + e * 3 + 1)
+    og = tl.load(OFFS + e * 3).to(tl.int64)
+    ou = tl.load(OFFS + e * 3 + 1).to(tl.int64)
+    bg = _block_bytes(tg).to(tl.int64)
+    bu = _block_bytes(tu).to(tl.int64)
+    rg = (H // 256) * bg     # the bytes of a gate row
+    ru = (H // 256) * bu     # the bytes of an up row
+    tok = tl.arange(0, BM)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    accg = tl.zeros((BM, BN), dtype=tl.float32)
+    accu = tl.zeros((BM, BN), dtype=tl.float32)
+    for kb in range(H // 256):
+        ke = kb * 256 + tl.arange(0, 256)
+        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
+        wg = _iq_vals(tg, ARENA, ARENA16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
+        wu = _iq_vals(tu, ARENA, ARENA16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
+        accg = tl.dot(xe, tl.trans(wg), accg)
+        accu = tl.dot(xe, tl.trans(wu), accu)
+    g = accg
+    u = accu
+    if LIMIT > 0:
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+        g = tl.minimum(g, LIMIT)
+    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+        val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
+    else:
+        val = g / (1.0 + tl.exp(-g)) * u
+    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(DT), mask=tok[:, None] < M)
+
+
+@triton.jit
+def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.constexpr, I: tl.constexpr,
+         STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr, DT: tl.constexpr = tl.float16):
+    """The down of a cached expert: its IQ blocks decoded and multiplied by the intermediate.
+
+    Program (route, tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row) for
+    the tokens of the call. The partial output goes to PART[route, token, h] (FP32).
+    """
+    p = tl.program_id(0)
+    slot = tl.load(SLOT_LIST + p)
+    if slot < 0:
+        return
+    row = p
+    e = tl.load(SLOT_EXP + p).to(tl.int64)
+    base = slot.to(tl.int64) * STRIDE
+    td = tl.load(TYPES + e * 3 + 2)
+    od = tl.load(OFFS + e * 3 + 2).to(tl.int64)
+    bd = _block_bytes(td).to(tl.int64)
+    rd = (I // 256) * bd     # the bytes of a down row
+    tok = tl.arange(0, BM)
+    h = tl.program_id(1) * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kb in range(I // 256):
+        ke = kb * 256 + tl.arange(0, 256)
+        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
+        w = _iq_vals(td, ARENA, ARENA16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
+        acc = tl.dot(ae, tl.trans(w), acc)
+    tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
