@@ -172,5 +172,21 @@ if err > 1e-2:
 check(err < 5e-2, f'the engine\'s GSQ experts against the FP32 reference (relative L2 {err:.2e})')
 plan.close()
 
+# the tensor-parallel split: every rank takes a part of the intermediate (the gate and the up take the rows, the down
+# the columns) and SGLang adds the ranks' partial outputs up
+for tp in (2, 4):
+    part = I // tp
+    total = np.zeros((M, H), dtype=np.float32)
+    for rank in range(tp):
+        rank_plan = CpuPlan(E, THREADS, [gate_ptr, up_ptr, down_ptr], hidden=H, inter=part, gsq_types=types_ptr,
+                            gsq_split=(rank * part, part, rank * part, part, I))
+        rank_out = (C.c_float * (M * H))()
+        rc = rank_plan.forward(M, K, C.addressof(x16), C.addressof(ids32), C.addressof(rw32), C.addressof(rank_out))
+        check(rc >= 0, f'the engine computed the layer on the tensor-parallel rank {rank} of {tp} (rc {rc})')
+        total += np.frombuffer(rank_out, dtype=np.float32).reshape(M, H)
+        rank_plan.close()
+    err = float(np.linalg.norm(total - ref) / np.linalg.norm(ref))
+    check(err < 5e-2, f'the engine\'s GSQ experts over {tp} tensor-parallel ranks (relative L2 {err:.2e})')
+
 print('GSQ-CHECK', 'PASS' if not bad else f'FAIL ({len(bad)})')
 sys.exit(1 if bad else 0)

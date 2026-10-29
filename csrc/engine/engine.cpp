@@ -614,6 +614,11 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     std::vector<size_t> gsq_gate_row,gsq_up_row,gsq_down_row;    // the bytes of one row
     std::vector<size_t> gsq_gate_off,gsq_up_off,gsq_down_off;    // where an expert's tensor starts
     size_t gsq_gate_bytes=0,gsq_up_bytes=0,gsq_down_bytes=0;
+    // The tensor-parallel split: the gate and the up take the rank's rows of I (a contiguous range inside every
+    // expert), the down the rank's columns of I (a strided range inside every row).
+    size_t gsq_row_off=0,gsq_row_count=0;      // the gate/up rows of this rank
+    size_t gsq_col_off=0,gsq_col_count=0;      // the down columns of this rank
+    size_t gsq_full_inter=0;                   // I of the file (every expert's rows have all of it)
     // The bytes of one IQ block of an expert (the type says how many).
     size_t gsq_block_bytes(int e) const { return xtier::gsq_row_bytes(gsq_types[e], 256); }
     const uint16_t *input=nullptr;
@@ -682,6 +687,8 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         const auto &group=groups[g];const int e=group.expert;
         const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
         const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e],block=gsq_block_bytes(e);
+        // the rank's rows of I (the tensor-parallel split): the local row r is the file's row gsq_row_off + r
+        const size_t grow_off=gsq_row_off*grow;
         static thread_local std::vector<float> buffer;
         if(buffer.size()<size_t(MT)*H)buffer.resize(size_t(MT)*H);
         for(int t=0;t<MT;t++) {
@@ -696,8 +703,8 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
             for(int c=0;c<H;c+=256) {
                 for(int j=0;j<R;j++) {
                     const size_t row=size_t(node*IN+r+j);
-                    xtier::gsq_dequant_row(gsq_types[e],gsrc+row*grow+size_t(c/256)*block,gw,256);
-                    xtier::gsq_dequant_row(gsq_types[e],usrc+row*urow+size_t(c/256)*block,uw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],gsrc+grow_off+row*grow+size_t(c/256)*block,gw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],usrc+grow_off+row*urow+size_t(c/256)*block,uw,256);
                     for(int t=0;t<MT;t++) {
                         const float *xp=xf+size_t(t)*H+c;
                         for(int k=0;k<16;k++) {
@@ -724,6 +731,10 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         const auto &group=groups[g];const int e=group.expert;
         const uint8_t *dsrc=gsq_down+gsq_down_off[e];
         const size_t drow=gsq_down_row[e],block=gsq_block_bytes(e);
+        // the rank's columns of I (the tensor-parallel split): a strided range inside every row, so the blocks that
+        // overlap it are decoded and only its columns are used
+        const size_t col0=gsq_col_off,col1=gsq_col_off+gsq_col_count;
+        const size_t IFULL=gsq_full_inter?gsq_full_inter:size_t(I);
         float route[MT];int token[MT];const float *rows[MT];
         for(int t=0;t<MT;t++){route[t]=group.route[t0+t];token[t]=group.token[t0+t];rows[t]=mid+(size_t(group.row)+t0+t)*I;}
 
@@ -732,11 +743,23 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
             __m512 acc[R][MT];
             for(int j=0;j<R;j++)for(int t=0;t<MT;t++)acc[j][t]=_mm512_setzero_ps();
             const size_t row=size_t(node*HN+r);
-            for(int c=0;c<I;c+=256) {
+            for(size_t c=0;c<IFULL;c+=256) {
                 xtier::gsq_dequant_row(gsq_types[e],dsrc+row*drow+size_t(c/256)*block,w,256);
+                // the columns of this block that belong to the rank (the mid holds the rank's columns)
+                const size_t b0=c>col0?c:col0,b1=c+256<col1?c+256:col1;
+                if(b1<=b0)continue;
                 for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
-                    const float *xp=rows[t]+c;   // the intermediate (FP32)
-                    for(int k=0;k<16;k++)acc[j][t]=_mm512_fmadd_ps(_mm512_loadu_ps(w+16*k),_mm512_loadu_ps(xp+16*k),acc[j][t]);
+                    const float *xp=rows[t]+c-col0;   // the intermediate (FP32), the rank's columns
+                    if(b0==c&&b1==c+256) {
+                        for(int k=0;k<16;k++)acc[j][t]=_mm512_fmadd_ps(_mm512_loadu_ps(w+16*k),_mm512_loadu_ps(xp+16*k),acc[j][t]);
+                    } else {
+                        // the boundary block: only the rank's columns (a masked load)
+                        for(size_t q=b0-c;q<b1-c;q+=16) {
+                            const int cnt=(int)std::min<size_t>(16,b1-c-q);
+                            const __mmask16 m=cnt==16?(__mmask16)0xFFFFu:(__mmask16)((1u<<cnt)-1u);
+                            acc[j][t]=_mm512_fmadd_ps(_mm512_maskz_loadu_ps(m,w+q),_mm512_maskz_loadu_ps(m,xp+q),acc[j][t]);
+                        }
+                    }
                 }
             }
             for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
@@ -933,6 +956,8 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         const auto &group=groups[g];const int e=group.expert;
         const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
         const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e],block=gsq_block_bytes(e);
+        // the rank's rows of I (the tensor-parallel split): the local row r is the file's row gsq_row_off + r
+        const size_t grow_off=gsq_row_off*grow;
         // FP32 inputs once per call (thread-local), as in the FP4 path.
         static thread_local std::vector<float> buffer;
         if(buffer.size()<size_t(MT)*H)buffer.resize(size_t(MT)*H);
@@ -948,8 +973,8 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
             for(int c=0;c<H;c+=256) {
                 for(int j=0;j<R;j++) {
                     const size_t row=size_t(node*IN+r+j);
-                    xtier::gsq_dequant_row(gsq_types[e],gsrc+row*grow+size_t(c/256)*block,gw,256);
-                    xtier::gsq_dequant_row(gsq_types[e],usrc+row*urow+size_t(c/256)*block,uw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],gsrc+grow_off+row*grow+size_t(c/256)*block,gw,256);
+                    xtier::gsq_dequant_row(gsq_types[e],usrc+grow_off+row*urow+size_t(c/256)*block,uw,256);
                     for(int t=0;t<MT;t++) {
                         const float *xp=xf+size_t(t)*H+c;
                         __m256 *ga=ag+(j*MT+t)*S;
@@ -977,6 +1002,10 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         const auto &group=groups[g];const int e=group.expert;
         const uint8_t *dsrc=gsq_down+gsq_down_off[e];
         const size_t drow=gsq_down_row[e],block=gsq_block_bytes(e);
+        // the rank's columns of I (the tensor-parallel split): a strided range inside every row, so the blocks that
+        // overlap it are decoded and only its columns are used
+        const size_t col0=gsq_col_off,col1=gsq_col_off+gsq_col_count;
+        const size_t IFULL=gsq_full_inter?gsq_full_inter:size_t(I);
         float route[MT];int token[MT];const float *rows[MT];
         for(int t=0;t<MT;t++){route[t]=group.route[t0+t];token[t]=group.token[t0+t];rows[t]=mid+(size_t(group.row)+t0+t)*I;}
 
@@ -985,12 +1014,24 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
             __m256 acc[R*MT*2];
             for(int q=0;q<R*MT*2;q++)acc[q]=_mm256_setzero_ps();
             const size_t row=size_t(node*HN+r);
-            for(int c=0;c<I;c+=256) {
+            for(size_t c=0;c<IFULL;c+=256) {
                 xtier::gsq_dequant_row(gsq_types[e],dsrc+row*drow+size_t(c/256)*block,w,256);
+                // the columns of this block that belong to the rank (the mid holds the rank's columns)
+                const size_t b0=c>col0?c:col0,b1=c+256<col1?c+256:col1;
+                if(b1<=b0)continue;
                 for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
-                    const float *xp=rows[t]+c;   // the intermediate (FP32)
+                    const float *xp=rows[t]+c-col0;   // the intermediate (FP32), the rank's columns
                     __m256 *a=acc+(j*MT+t)*2;
-                    for(int k=0;k<32;k++)a[k&1]=_mm256_fmadd_ps(_mm256_loadu_ps(w+8*k),_mm256_loadu_ps(xp+8*k),a[k&1]);
+                    if(b0==c&&b1==c+256) {
+                        for(int k=0;k<32;k++)a[k&1]=_mm256_fmadd_ps(_mm256_loadu_ps(w+8*k),_mm256_loadu_ps(xp+8*k),a[k&1]);
+                    } else {
+                        // the boundary block: only the rank's columns (a masked load)
+                        for(size_t q=b0-c,k=0;q<b1-c;q+=8,k++) {
+                            const int cnt=(int)std::min<size_t>(8,b1-c-q);
+                            const __m256i m=_mm256_cmpgt_epi32(_mm256_set1_epi32(cnt),_mm256_setr_epi32(0,1,2,3,4,5,6,7));
+                            a[k&1]=_mm256_fmadd_ps(_mm256_maskload_ps(w+q,m),_mm256_maskload_ps(xp+q,m),a[k&1]);
+                        }
+                    }
                 }
             }
             for(int j=0;j<R;j++)for(int t=0;t<MT;t++) {
@@ -1234,7 +1275,8 @@ public:
     // GSQ: the experts are the IQ-quantized tensors of a GGUF checkpoint (the gate, the up and the down rows of every
     // expert, one tensor each, the type per expert). The engine reads them where they are.
     Plan(int h,int i,int e,int n,float limit,const uint8_t *gate,const uint8_t *up,const uint8_t *down,
-         const uint8_t *types,float swiglu_alpha_in=1.f,float swiglu_beta_in=0.f)
+         const uint8_t *types,float swiglu_alpha_in=1.f,float swiglu_beta_in=0.f,
+         size_t row_off=0,size_t row_count=0,size_t col_off=0,size_t col_count=0,size_t full_inter=0)
         :hidden(h),inter(i),experts(e),swiglu_limit(limit),pool(get_executor(n)),groups(MAX_ROUTES) {
         swiglu_alpha=swiglu_alpha_in;swiglu_beta=swiglu_beta_in;
         globals13.assign(e*2,1.f);globals2.assign(e,1.f);
@@ -1253,14 +1295,22 @@ public:
         // The rows of every expert: the type says how many bytes a row of H (gate, up) or I (down) values takes.
         gsq_gate_row.resize(e);gsq_up_row.resize(e);gsq_down_row.resize(e);
         gsq_gate_off.resize(e);gsq_up_off.resize(e);gsq_down_off.resize(e);
+        gsq_row_off=row_off;gsq_row_count=row_count?row_count:size_t(i);
+        gsq_col_off=col_off;gsq_col_count=col_count?col_count:size_t(i);
+        gsq_full_inter=full_inter?full_inter:size_t(i);
+        if(gsq_row_count>size_t(i)||gsq_col_count>size_t(i))
+            throw std::runtime_error("Invalid GSQ tensor-parallel split");
         size_t gate_bytes=0,up_bytes=0,down_bytes=0;
         for(int j=0;j<e;j++) {
             const int type=types[j];
-            const size_t gr=xtier::gsq_row_bytes(type,h),ur=xtier::gsq_row_bytes(type,h),dr=xtier::gsq_row_bytes(type,i);
+            // the gate and the up rows have H values, the down rows all of I: every expert's tensor holds the file's
+            // full rows, the rank takes a slice of them
+            const size_t gr=xtier::gsq_row_bytes(type,h),ur=xtier::gsq_row_bytes(type,h),
+                         dr=xtier::gsq_row_bytes(type,gsq_full_inter);
             if(!gr||!ur||!dr)throw std::runtime_error("Unsupported expert type "+std::to_string(type)+" for expert "+std::to_string(j));
             gsq_gate_row[j]=gr;gsq_up_row[j]=ur;gsq_down_row[j]=dr;
             gsq_gate_off[j]=gate_bytes;gsq_up_off[j]=up_bytes;gsq_down_off[j]=down_bytes;
-            gate_bytes+=gr*size_t(i);up_bytes+=ur*size_t(i);down_bytes+=dr*size_t(h);
+            gate_bytes+=gr*gsq_full_inter;up_bytes+=ur*gsq_full_inter;down_bytes+=dr*size_t(h);
         }
         gsq_gate_bytes=gate_bytes;gsq_up_bytes=up_bytes;gsq_down_bytes=down_bytes;
         if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
@@ -1616,12 +1666,29 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
 }
 // The GSQ experts: the IQ-quantized gate, up and down rows of every expert of a GGUF checkpoint (llama.cpp's IQ
 // types), one tensor each, and the type per expert (the ggml type ids). The engine reads them where they are.
+int XTIER_API(xtier_gsq_decode)(int type,const uint8_t *src,float *dst,int n) {
+    if(!src||!dst||n<=0||n%256||!xtier::gsq_row_bytes(type,n))return -1;
+    xtier::gsq_dequant_row(type,src,dst,n);
+    return 0;
+}
 void *XTIER_API(xtier_create5)(int hidden,int inter,int experts,int threads,float swiglu_limit,
                     const uint8_t *gate,const uint8_t *up,const uint8_t *down,const uint8_t *types,
-                    float swiglu_alpha,float swiglu_beta) {
+                    float swiglu_alpha,float swiglu_beta,
+                    long row_off,long row_count,long col_off,long col_count,long full_inter) {
     try {
         if(!gate||!up||!down||!types)throw std::runtime_error("Invalid GSQ arguments");
-        return new Handle{std::make_shared<Plan<false,true>>(hidden,inter,experts,threads,swiglu_limit,gate,up,down,types,swiglu_alpha,swiglu_beta)};
+#if XTIER_AVX512
+        if(!__builtin_cpu_supports("avx512bf16")||!__builtin_cpu_supports("avx512bw"))
+            throw std::runtime_error("AVX512 BF16/BW required");
+#else
+        if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
+            throw std::runtime_error("AVX2/FMA required");
+#endif
+        return new Handle{std::make_shared<Plan<false,true>>(hidden,inter,experts,threads,swiglu_limit,gate,up,down,
+            types,swiglu_alpha,swiglu_beta,
+            row_off>0?size_t(row_off):0,row_count>0?size_t(row_count):0,
+            col_off>0?size_t(col_off):0,col_count>0?size_t(col_count):0,
+            full_inter>0?size_t(full_inter):0)};
     }catch(const std::exception &e){last_error=e.what();return nullptr;}
 }
 void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int threads,float swiglu_limit,int scale_format,

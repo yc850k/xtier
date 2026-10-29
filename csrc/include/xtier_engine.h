@@ -46,6 +46,10 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // expert (the ggml type ids: 16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M).
 // The tensor-parallel split of the GSQ experts: the gate and the up take the rank's rows of I (row_off, row_count),
 // the down the rank's columns of I (col_off, col_count); full_inter is I of the file.
+// The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values (n % 256 == 0) of the type's blocks
+// as FP32 (n floats). The type is the ggml type id (16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M); an unknown type
+// leaves the output untouched and returns -1.
+int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n);
 void *xtier_create5(int hidden,int inter,int experts,int threads,float limit,const uint8_t *gate,
                     const uint8_t *up,const uint8_t *down,const uint8_t *types,float swiglu_alpha,float swiglu_beta,
                     long row_off,long row_count,long col_off,long col_count,long full_inter);

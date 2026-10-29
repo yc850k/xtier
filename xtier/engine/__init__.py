@@ -32,6 +32,9 @@ def engine() -> C.CDLL:
         if hasattr(lib, 'xtier_set_swiglu'):   # builds before 2026-10-24 have the plain SiLU only
             lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
             lib.xtier_set_swiglu.restype = _I
+        if hasattr(lib, 'xtier_gsq_decode'):   # the GSQ experts' decode (llama.cpp's dequantize_row_iq*)
+            lib.xtier_gsq_decode.argtypes = [_I, _P, _P, _I]
+            lib.xtier_gsq_decode.restype = _I
         if hasattr(lib, 'xtier_create5'):   # the GSQ experts (a GGUF checkpoint's IQ-quantized rows)
             lib.xtier_create5.argtypes = ([_I, _I, _I, _I, C.c_float] + [_P] * 4
                                         + [C.c_float, C.c_float] + [C.c_long] * 5)

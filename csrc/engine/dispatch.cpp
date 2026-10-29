@@ -22,6 +22,7 @@ struct Impl {
     void *(*create2)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
     void *(*create5)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,float,float,
                      long,long,long,long,long);
+    int (*gsq_decode)(int,const uint8_t*,float*,int);
     void *(*create4)(int,int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,
                      const float*,const int32_t*);
     int (*place)(void*,int,int);
@@ -80,7 +81,8 @@ const Impl *load(const char *isa) {
             bind(h,p,"xtier_destroy",m.destroy)&&bind(h,p,"xtier_last_timings",m.last_timings)&&
             bind(h,p,"xtier_localize",m.localize)&&bind(h,p,"xtier_shard",m.shard)&&
             bind(h,p,"xtier_nodes",m.nodes)&&bind(h,p,"xtier_worker_cpus",m.worker_cpus)&&
-            bind(h,p,"xtier_create5",m.create5)&&bind(h,p,"xtier_create4",m.create4)&&bind(h,p,"xtier_place",m.place)&&
+            bind(h,p,"xtier_create5",m.create5)&&bind(h,p,"xtier_gsq_decode",m.gsq_decode)&&
+        bind(h,p,"xtier_create4",m.create4)&&bind(h,p,"xtier_place",m.place)&&
             bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&
             bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
             bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats);
@@ -124,6 +126,10 @@ void *xtier_create2(int hidden,int inter,int experts,int threads,float swiglu_li
                      const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                      const float *g13,const float *g2) {
     auto p=impl();return p?p->create2(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2):nullptr;
+}
+// The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values as FP32.
+int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n) {
+    auto p=impl();return p?p->gsq_decode(type,src,dst,n):-1;
 }
 // The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each, and the type per expert.
 void *xtier_create5(int h,int i,int e,int t,float l,const uint8_t *gate,const uint8_t *up,const uint8_t *down,

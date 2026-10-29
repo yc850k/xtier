@@ -288,16 +288,20 @@ class XTierMoEMethod(FusedMoEMethodBase):
             gate, up, down, types = pack.layer_sources(self.cfg.layer_id)
         finally:
             pass   # the mapping stays open: the engine reads the experts from it
-        # The tensor-parallel split: the IQ blocks of the down matrix are per row, so a rank's columns of I are not a
-        # whole block: the split is refused for now (the layer stays with SGLang) instead of computing the whole expert
-        # on every rank.
+        # The tensor-parallel split: this rank takes the rows of I of the gate and the up (a contiguous range inside
+        # every expert) and the columns of I of the down (a strided range inside every row, so the blocks that overlap
+        # it are decoded and only its columns are used). SGLang adds the ranks' partial outputs up.
+        rank = int(getattr(layer, 'moe_tp_rank', 0) or 0)
         size = int(getattr(layer, 'moe_tp_size', 1) or 1)
-        if size > 1:
-            raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: the GSQ experts cannot be split over the '
-                                      f'{size} tensor-parallel ranks yet')
-        self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=self.inter,
+        full = self.inter
+        if size > 1 and full % size:
+            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: the intermediate size {full} does not divide over the '
+                               f'{size} tensor-parallel ranks')
+        part = full // size
+        self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=part,
                             swiglu_limit=self.swiglu_limit, scale_format='gsq',
-                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta, gsq_types=types)
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta, gsq_types=types,
+                            gsq_split=(rank * part, part, rank * part, part, full))
         self.gsq_pack = pack
         self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file
         self.mailbox = Mailbox(self.plan)
