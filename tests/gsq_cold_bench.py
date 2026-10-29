@@ -28,7 +28,8 @@ P = argparse.ArgumentParser()
 P.add_argument('--pack', default='/mnt/optane/DeepSeek-V4.1-Flash/maya-ds4-gsq')
 P.add_argument('--layers', default='0,10,20,39', help='the layers to measure (they sit on different shards)')
 P.add_argument('--steps', type=int, default=20, help='the decode steps per layer')
-P.add_argument('--fraction', type=float, default=0.3, help='the share of the experts on the drive (XTIER_COLD_FRACTION)')
+P.add_argument('--fraction', type=float, default=0.3,
+               help='the share of the experts on the drive (XTIER_COLD_FRACTION)')
 P.add_argument('--topk', type=int, default=6, help='the experts per token')
 P.add_argument('--threads', type=int, default=int(os.environ.get('XTIER_THREADS', 24)))
 A = P.parse_args()
@@ -71,7 +72,7 @@ def run(plan, routes):
     return time.perf_counter() - t0
 
 
-print(f'\n{"layer":>5} {"experts":>8} {"RAM slots":>10} {"load":>8} {"step":>9} {"misses":>7} {"MB/step":>8} '
+print(f'\n{"layer":>5} {"experts":>8} {"on the drive":>12} {"load":>8} {"step":>9} {"misses":>7} {"MB/step":>8} '
       f'{"GB/s":>6} {"ref step":>9}')
 for layer in layers:
     gate, up, down, tg, tu, td = pack.layer_sources(layer)
@@ -96,8 +97,9 @@ for layer in layers:
     waited = stats[3] - stats_before[3]   # the seconds the store spent reading
     mb = read / 1e6
     bandwidth = read / 1e9 / waited if waited > 0 else 0.0
-    print(f'{layer:>5} {pack.experts:>8} {plan.slot_table().count(-1):>10} {load:>7.2f}s {t_pool / A.steps * 1e3:>8.1f}ms '
-          f'{misses / A.steps:>7.1f} {mb / A.steps:>8.1f} {bandwidth:>6.2f} {t_ref / A.steps * 1e3:>8.1f}ms')
+    print(f'{layer:>5} {pack.experts:>8} {plan.slot_table().count(-1):>10} {load:>7.2f}s '
+          f'{t_pool / A.steps * 1e3:>8.1f}ms {misses / A.steps:>7.1f} {mb / A.steps:>8.1f} {bandwidth:>6.2f} '
+          f'{t_ref / A.steps * 1e3:>8.1f}ms')
     plan.close()
 
 pack.close()
