@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# XTier on a Turing host (2x RTX 2080 Ti, sm_75): upstream SGLang main + XTier, the experts on the CPU engine and the
-# hot ones on the GPU. The checkpoint and the server arguments come from the caller:
+# XTier on a Turing host (2x RTX 2080 Ti, sm_75): upstream SGLang main + XTier on the GGUF checkpoint on the Optane
+# drive (the four model shards + the Engram table). The checkpoint and the server arguments come from the caller:
 #
-#   MODEL=/path/to/checkpoint PORT=18190 configs/sm75-2x2080ti/run-xtier-sm75.sh [SGLang flags]
+#   MODEL=/mnt/optane/DeepSeek-V4.1-Flash/ PORT=18200 configs/sm75-2x2080ti/run-xtier-sm75.sh [SGLang flags]
+#
+# The GGUF experts are not in a format the CPU engine can read (NVFP4/MXFP4), so the MoE layers stay with SGLang's own
+# GGUF kernels and XTier's hybrid path is off for this checkpoint (the load log says which layers and why).
 #
 # What sm_75 means here (docs/sm75.md):
 # - no BF16 tensor cores: the model runs in FP16 (--dtype float16) and the GPU kernels take FP16 operands; the CPU
@@ -12,10 +15,12 @@
 # - no TMA: the Qwen hyper-connection mix overlap stays off;
 # - 64 KiB of shared memory per SM: the GPU prefill's tiles are smaller than on the Blackwell hosts.
 set -eo pipefail
-M=${MODEL:?set MODEL to the checkpoint}
-D=${XTIER_ENV:-/home/userroot/work/llm-env}          # the python environment with SGLang
+M=${MODEL:-/mnt/optane/DeepSeek-V4.1-Flash/}      # the GGUF checkpoint (the shards and the Engram table)
+D=${XTIER_ENV:-/home/userroot/work/.venvs/xtier-sm75}   # the python environment with SGLang and XTier
 PY=${XTIER_PYTHON:-$D/bin/python}
 PORT=${PORT:-18190}
+CUDA=${XTIER_CUDA_ROOT:-$D/lib/python3.12/site-packages/nvidia/cu13}
+export CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH LD_LIBRARY_PATH=$CUDA/lib:${LD_LIBRARY_PATH:-} PYTHONUNBUFFERED=1
 # FlashInfer and TileLang compile for this device (7.5 on a Turing card, 12.0 on the RTX PRO 5000)
 ARCH=${XTIER_CUDA_ARCH:-$($PY -c 'import torch;c=torch.cuda.get_device_capability();print(f"{c[0]}.{c[1]}")' 2>/dev/null || echo 12.0)}
 export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH}
@@ -37,4 +42,5 @@ export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-8} XTIER_CACHE_SWAPS=${XTIER_CACHE
 exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NAME:-$(basename $M)} \
   --host 127.0.0.1 --port $PORT --tp-size 1 --trust-remote-code --skip-server-warmup \
   --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
+  --quantization gguf --load-format gguf \
   --weight-loader-drop-cache-after-load "$@"
