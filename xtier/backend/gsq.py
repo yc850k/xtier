@@ -93,17 +93,20 @@ class GsqPack:
 
     def layer_sources(self, layer):
         """A layer's experts as the engine takes them: the gate, the up and the down (the base addresses of the
-        experts' tensors) and the type of every expert."""
+        experts' tensors) and the type of every expert per role. The pack quantizes every role on its own, so the
+        down's type (and its byte size) often differs from the gate's."""
         gate, gate_type, gate_dims = self.expert('w1', layer, 0)
         up, _, _ = self.expert('w3', layer, 0)
         down, _, _ = self.expert('w2', layer, 0)
-        types = bytearray()
+        types_gate, types_up, types_down = bytearray(), bytearray(), bytearray()
         for expert in range(self.experts):
-            types.append(self.expert('w1', layer, expert)[1])
+            types_gate.append(self.expert('w1', layer, expert)[1])
+            types_up.append(self.expert('w3', layer, expert)[1])
+            types_down.append(self.expert('w2', layer, expert)[1])
         if gate_dims and (gate_dims[-1] != self.hidden or gate_dims[-2] != self.inter):
             raise ValueError(f'xtier: the gate of layer {layer} is {gate_dims}, not [experts, {self.inter}, '
                              f'{self.hidden}]')
-        return gate, up, down, bytes(types)
+        return gate, up, down, bytes(types_gate), bytes(types_up), bytes(types_down)
 
     def close(self):
         for handle, mapped in self._mapped.values():

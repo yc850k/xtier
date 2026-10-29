@@ -89,7 +89,9 @@ def dequant(type_id, blob, n):
 E, H, I, K, M = 10, 256, 256, 2, 4   # the IQ blocks hold 256 values, so H and I are multiples of 256
 THREADS = 4
 rng = np.random.default_rng(20261029)
-types = np.array([29, 29, 29, 16, 16, 29, 16, 29, 16, 29], dtype=np.uint8)   # IQ1_M and IQ2_XXS, mixed
+# the type of every expert per role: IQ1_M and IQ2_XXS, mixed, and the down quantizes on its own (as the pack does)
+types = np.array([29, 29, 29, 16, 16, 29, 16, 29, 16, 29], dtype=np.uint8)   # the gate and the up
+types_down = np.array([16, 29, 16, 29, 16, 16, 29, 16, 29, 16], dtype=np.uint8)   # the down
 BLOCK = {16: 66, 29: 56}
 ROW = {16: H // 256 * 66, 29: H // 256 * 56}       # the bytes of a gate row
 ROW_DOWN = {16: I // 256 * 66, 29: I // 256 * 56}   # the bytes of a down row
@@ -98,9 +100,10 @@ gate = np.zeros((E, ROW[29] * I if False else 0), dtype=np.uint8)
 gates, ups, downs = [], [], []
 for e in range(E):
     t = int(types[e])
+    td = int(types_down[e])
     g = rng.integers(0, 256, ROW[t] * I, dtype=np.uint8).copy()
     u = rng.integers(0, 256, ROW[t] * I, dtype=np.uint8).copy()
-    d = rng.integers(0, 256, ROW_DOWN[t] * H, dtype=np.uint8).copy()
+    d = rng.integers(0, 256, ROW_DOWN[td] * H, dtype=np.uint8).copy()
     gates.append(g)
     ups.append(u)
     downs.append(d)
@@ -122,7 +125,7 @@ def sane(blob, type_id, value=1.0):
 for e in range(E):
     gates[e] = sane(gates[e], int(types[e]))
     ups[e] = sane(ups[e], int(types[e]))
-    downs[e] = sane(downs[e], int(types[e]))
+    downs[e] = sane(downs[e], int(types_down[e]))
 gate = np.concatenate(gates).copy()
 up = np.concatenate(ups).copy()
 down = np.concatenate(downs).copy()
@@ -130,7 +133,7 @@ down = np.concatenate(downs).copy()
 gate_ptr = gate.ctypes.data
 up_ptr = up.ctypes.data
 down_ptr = down.ctypes.data
-types_ptr = types.ctypes.data
+types_ptr = (types.ctypes.data, types.ctypes.data, types_down.ctypes.data)
 
 plan = CpuPlan(E, THREADS, [gate_ptr, up_ptr, down_ptr], hidden=H, inter=I, gsq_types=types_ptr)
 print('engine ISA:', plan.lib.xtier_isa().decode())
@@ -157,9 +160,10 @@ for t in range(M):
     for s in range(K):
         e = int(ids[t, s])
         ty = int(types[e])
+        td = int(types_down[e])
         gw = np.stack([dequant(ty, gates[e][r * ROW[ty]:(r + 1) * ROW[ty]], H) for r in range(I)])
         uw = np.stack([dequant(ty, ups[e][r * ROW[ty]:(r + 1) * ROW[ty]], H) for r in range(I)])
-        dw = np.stack([dequant(ty, downs[e][r * ROW_DOWN[ty]:(r + 1) * ROW_DOWN[ty]], I) for r in range(H)])
+        dw = np.stack([dequant(td, downs[e][r * ROW_DOWN[td]:(r + 1) * ROW_DOWN[td]], I) for r in range(H)])
         gate_v = x[t] @ gw.T
         up_v = x[t] @ uw.T
         mid = gate_v / (1.0 + np.exp(-gate_v)) * up_v

@@ -285,7 +285,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         t0 = time.perf_counter()
         pack = gsq.GsqPack(gsq.pack_path(_model_path()))
         try:
-            gate, up, down, types = pack.layer_sources(self.cfg.layer_id)
+            gate, up, down, types_gate, types_up, types_down = pack.layer_sources(self.cfg.layer_id)
         finally:
             pass   # the mapping stays open: the engine reads the experts from it
         # The tensor-parallel split: this rank takes the rows of I of the gate and the up (a contiguous range inside
@@ -300,7 +300,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         part = full // size
         self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=part,
                             swiglu_limit=self.swiglu_limit, scale_format='gsq',
-                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta, gsq_types=types,
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                            gsq_types=(types_gate, types_up, types_down),
                             gsq_split=(rank * part, part, rank * part, part, full))
         self.gsq_pack = pack
         self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file

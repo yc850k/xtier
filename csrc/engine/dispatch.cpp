@@ -20,8 +20,8 @@ struct Impl {
     const char *(*isa)();
     void *(*create3)(int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
     void *(*create2)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
-    void *(*create5)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,float,float,
-                     long,long,long,long,long);
+    void *(*create5)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,
+                     const uint8_t*,float,float,long,long,long,long,long);
     int (*gsq_decode)(int,const uint8_t*,float*,int);
     void *(*create4)(int,int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,
                      const float*,const int32_t*);
@@ -133,10 +133,11 @@ int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n) {
 }
 // The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each, and the type per expert.
 void *xtier_create5(int h,int i,int e,int t,float l,const uint8_t *gate,const uint8_t *up,const uint8_t *down,
-                     const uint8_t *types,float alpha,float beta,long row_off,long row_count,long col_off,long col_count,
-                     long full_inter) {
-    auto p=impl();return p?p->create5(h,i,e,t,l,gate,up,down,types,alpha,beta,row_off,row_count,col_off,col_count,
-                                      full_inter):nullptr;
+                    const uint8_t *types_gate,const uint8_t *types_up,const uint8_t *types_down,
+                    float alpha,float beta,long row_off,long row_count,long col_off,long col_count,
+                    long full_inter) {
+    auto p=impl();return p?p->create5(h,i,e,t,l,gate,up,down,types_gate,types_up,types_down,alpha,beta,
+                                      row_off,row_count,col_off,col_count,full_inter):nullptr;
 }
 void *xtier_create4(int h,int i,int e,int slots,int t,float l,int f,const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,
                     const uint8_t *s2,const float *g13,const float *g2,const int32_t *resident) {

@@ -36,7 +36,7 @@ def engine() -> C.CDLL:
             lib.xtier_gsq_decode.argtypes = [_I, _P, _P, _I]
             lib.xtier_gsq_decode.restype = _I
         if hasattr(lib, 'xtier_create5'):   # the GSQ experts (a GGUF checkpoint's IQ-quantized rows)
-            lib.xtier_create5.argtypes = ([_I, _I, _I, _I, C.c_float] + [_P] * 4
+            lib.xtier_create5.argtypes = ([_I, _I, _I, _I, C.c_float] + [_P] * 6
                                         + [C.c_float, C.c_float] + [C.c_long] * 5)
             lib.xtier_create5.restype = _P
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
@@ -101,14 +101,17 @@ class CpuPlan:
         self.dynamic = None   # cold experts: the RAM slots experts can leave (cold.attach)
         if gsq_types is not None:
             # The GSQ experts: the gate, the up and the down rows of every expert, one tensor each, and the type per
-            # expert (the ggml type ids).
+            # expert per role (the ggml type ids): the pack quantizes every role on its own, so the down's type often
+            # differs from the gate's.
             if not hasattr(self.lib, 'xtier_create5'):
                 raise RuntimeError('xtier: this engine build has no GSQ experts; rebuild it (tools/build_engine.sh)')
             # gsq_split: (row_off, row_count, col_off, col_count, full_inter) of this tensor-parallel rank
             row_off, row_count, col_off, col_count, full_inter = gsq_split or (0, self.inter, 0, self.inter, self.inter)
+            types_gate, types_up, types_down = gsq_types
             self.plan = self.lib.xtier_create5(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
                                                weight_pointers[0], weight_pointers[1], weight_pointers[2],
-                                               gsq_types, float(swiglu_alpha), float(swiglu_beta),
+                                               types_gate, types_up, types_down,
+                                               float(swiglu_alpha), float(swiglu_beta),
                                                int(row_off), int(row_count), int(col_off), int(col_count),
                                                int(full_inter))
             if not self.plan:

@@ -42,8 +42,9 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // create3 / create4 with w13, w2, s13 and s2 all null allocate the shards without filling them: the caller writes
 // every slot (xtier_shard / xtier_slot_pieces, e.g. read straight from the checkpoint or the cold store) and checks
 // its block scales, before the first forward.
-// The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each, and the type per
-// expert (the ggml type ids: 16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M).
+// The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each. The type per expert
+// and per role (the ggml type ids: 16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M); the pack quantizes every role on its
+// own, so the down's type (and its byte size) often differs from the gate's.
 // The tensor-parallel split of the GSQ experts: the gate and the up take the rank's rows of I (row_off, row_count),
 // the down the rank's columns of I (col_off, col_count); full_inter is I of the file.
 // The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values (n % 256 == 0) of the type's blocks
@@ -51,7 +52,8 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // leaves the output untouched and returns -1.
 int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n);
 void *xtier_create5(int hidden,int inter,int experts,int threads,float limit,const uint8_t *gate,
-                    const uint8_t *up,const uint8_t *down,const uint8_t *types,float swiglu_alpha,float swiglu_beta,
+                    const uint8_t *up,const uint8_t *down,const uint8_t *types_gate,const uint8_t *types_up,
+                    const uint8_t *types_down,float swiglu_alpha,float swiglu_beta,
                     long row_off,long row_count,long col_off,long col_count,long full_inter);
 void *xtier_create4(int hidden,int inter,int experts,int slots,int threads,float limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
