@@ -28,6 +28,9 @@ export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH}
 export TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=${TVM_FFI_CUDA_ARCH_LIST:-$ARCH}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export XTIER=${XTIER:-1}
+# Fast load: the experts go straight from the checkpoint files into the CPU engine (still all installed before the
+# server reports ready; the loader's own copy of them is skipped)
+export XTIER_FAST_LOAD=${XTIER_FAST_LOAD:-1}
 # The CPU engine: Broadwell (AVX2 only, no AVX-512 BF16), 2 NUMA nodes of 14 cores
 export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-24} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 export XTIER_SPIN_COUNT=${XTIER_SPIN_COUNT:-1048576}

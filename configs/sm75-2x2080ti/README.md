@@ -56,6 +56,13 @@ self-check says that no layer uses a format the engine can read. XTier's hybrid 
 
 Each of them is reported once in the log when it is off.
 
+## Fast load
+
+`XTIER_FAST_LOAD=1` (the launcher sets it): the experts go straight from the checkpoint files into the CPU engine
+instead of through SGLang's loader, and the server still reports ready only when every expert is installed
+(DeepSeek V4.1 on the production host: 472 → 186 s). It needs a checkpoint whose expert tensors XTier reads
+(NVFP4/MXFP4) — a GGUF checkpoint goes through SGLang's own loader.
+
 ## The engine and the GPU
 
 - The CPU engine runs the AVX2 build (`XTIER_ISA=avx2`): Broadwell has no AVX-512 BF16. The experts' FP4 unpacking
