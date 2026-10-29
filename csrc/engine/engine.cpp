@@ -553,6 +553,9 @@ struct PlanBase {
     virtual int slot_pieces(int slot,int node,void **pointers,size_t *bytes) const=0;
     virtual int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
                             float half_life)=0;
+    // The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files).
+    virtual int attach_cold_gsq(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,
+                                const int32_t *resident,int count,const float *scores,float half_life)=0;
     virtual int pin(int expert)=0;
     virtual void unpin(int slot)=0;
     virtual void cold_stats(double *out)=0;
@@ -618,6 +621,17 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     std::vector<size_t> gsq_gate_block,gsq_up_block,gsq_down_block;  // the bytes of one 256-value block
     std::vector<size_t> gsq_gate_off,gsq_up_off,gsq_down_off;    // where an expert's tensor starts
     size_t gsq_gate_bytes=0,gsq_up_bytes=0,gsq_down_bytes=0;
+    // Where every expert's bytes are: the checkpoint file, or the RAM slot it was read into (the cold pool: the hot
+    // experts stay in RAM, the cold ones are read from the drive when a forward routes to them).
+    std::vector<const uint8_t*> gsq_gate_ptr,gsq_up_ptr,gsq_down_ptr;
+    std::vector<Bytes> gsq_slot;               // one per RAM slot: the gate, the up and the down of an expert
+    std::vector<size_t> gsq_slot_reg;          // the three role offsets in a slot (the same in every slot)
+    std::vector<size_t> gsq_role_bytes;        // the bytes of the three roles (the largest expert of the layer)
+    std::vector<size_t> gsq_gate_size,gsq_up_size,gsq_down_size;   // per expert: the bytes of its tensors
+    std::vector<int32_t> gsq_cold_file;        // per expert and role: the store's file (-1: never leaves RAM)
+    std::vector<long long> gsq_cold_off;       // per expert and role: the store's offset
+    size_t gsq_slot_bytes=0;                   // the bytes of a slot
+    bool gsq_cold=false;                       // the cold pool is attached: the routed experts are read into RAM slots
     // The tensor-parallel split: the gate and the up take the rank's rows of I (a contiguous range inside every
     // expert), the down the rank's columns of I (a strided range inside every row).
     size_t gsq_row_off=0,gsq_row_count=0;      // the gate/up rows of this rank
@@ -691,7 +705,7 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const auto &group=groups[g];const int e=group.expert;
-        const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
+        const uint8_t *gsrc=gsq_gate_ptr[e],*usrc=gsq_up_ptr[e];
         const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e];
         const size_t gblock=gsq_gate_block[e],ublock=gsq_up_block[e];
         // the rank's rows of I (the tensor-parallel split): the local row r is the file's row gsq_row_off + r
@@ -736,7 +750,7 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     template<int R,int MT,int HC,int IC> void down_core_gsq(int node,int g,int begin,int end,float *__restrict out,int t0) {
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
         const auto &group=groups[g];const int e=group.expert;
-        const uint8_t *dsrc=gsq_down+gsq_down_off[e];
+        const uint8_t *dsrc=gsq_down_ptr[e];
         const size_t drow=gsq_down_row[e],block=gsq_down_block[e];
         // the rank's columns of I (the tensor-parallel split): a strided range inside every row, so the blocks that
         // overlap it are decoded and only its columns are used
@@ -961,7 +975,7 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
         float *__restrict const out_mid=mid;const float limit=swiglu_limit;const bool round=down_bf16;
         const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
         const auto &group=groups[g];const int e=group.expert;
-        const uint8_t *gsrc=gsq_gate+gsq_gate_off[e],*usrc=gsq_up+gsq_up_off[e];
+        const uint8_t *gsrc=gsq_gate_ptr[e],*usrc=gsq_up_ptr[e];
         const size_t grow=gsq_gate_row[e],urow=gsq_up_row[e];
         const size_t gblock=gsq_gate_block[e],ublock=gsq_up_block[e];
         // the rank's rows of I (the tensor-parallel split): the local row r is the file's row gsq_row_off + r
@@ -1008,7 +1022,7 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     template<int R,int MT,int S,int HC,int IC> void down_core_gsq(int node,int g,int begin,int end,float *__restrict out,int t0) {
         const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
         const auto &group=groups[g];const int e=group.expert;
-        const uint8_t *dsrc=gsq_down+gsq_down_off[e];
+        const uint8_t *dsrc=gsq_down_ptr[e];
         const size_t drow=gsq_down_row[e],block=gsq_down_block[e];
         // the rank's columns of I (the tensor-parallel split): a strided range inside every row, so the blocks that
         // overlap it are decoded and only its columns are used
@@ -1329,6 +1343,20 @@ public:
             gate_bytes+=gr*gsq_full_inter;up_bytes+=ur*gsq_full_inter;down_bytes+=dr*size_t(h);
         }
         gsq_gate_bytes=gate_bytes;gsq_up_bytes=up_bytes;gsq_down_bytes=down_bytes;
+        // Where every expert's bytes are (the checkpoint file, or the RAM slot it is read into by the cold pool) and
+        // how many bytes they are: the expert's whole tensors, as the checkpoint has them.
+        gsq_gate_ptr.resize(e);gsq_up_ptr.resize(e);gsq_down_ptr.resize(e);
+        gsq_gate_size.resize(e);gsq_up_size.resize(e);gsq_down_size.resize(e);
+        gsq_role_bytes.assign(3,0);
+        for(int j=0;j<e;j++) {
+            gsq_gate_ptr[j]=gsq_gate+gsq_gate_off[j];gsq_up_ptr[j]=gsq_up+gsq_up_off[j];
+            gsq_down_ptr[j]=gsq_down+gsq_down_off[j];
+            gsq_gate_size[j]=gsq_gate_row[j]*gsq_full_inter;gsq_up_size[j]=gsq_up_row[j]*gsq_full_inter;
+            gsq_down_size[j]=gsq_down_row[j]*size_t(h);
+            gsq_role_bytes[0]=std::max(gsq_role_bytes[0],gsq_gate_size[j]);
+            gsq_role_bytes[1]=std::max(gsq_role_bytes[1],gsq_up_size[j]);
+            gsq_role_bytes[2]=std::max(gsq_role_bytes[2],gsq_down_size[j]);
+        }
         if(const char *v=std::getenv("XTIER_DYNAMIC"))dynamic=std::stoi(v);
         if(dynamic<0||dynamic>2)throw std::runtime_error("XTIER_DYNAMIC must be 0, 1 or 2");
         if(const char *v=std::getenv("XTIER_GATE_GRAIN"))gate_grain=std::stoi(v);
@@ -1403,7 +1431,11 @@ public:
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())throw std::runtime_error("Plan does not permit concurrent callers");
         if(tokens<1||tokens>MAX_BATCH||k<1||k>MAX_K||!x||!ids||!rw||!y)throw std::runtime_error("Invalid input");
-        void *reads=cold_store?ensure_resident(tokens,k,ids):nullptr;
+        void *reads=nullptr;
+        if(cold_store) {
+            if constexpr(GSQ)reads=ensure_resident_gsq(tokens,k,ids);
+            else reads=ensure_resident(tokens,k,ids);
+        }
         if(!reads)return compute(tokens,k,x,ids,rw,y);
         // Experts being read (overlap): first the routes to the experts in RAM, then the others once their reads
         // landed, into a second buffer added to the first (two FP32 sums: not bitwise the one-pass order)
@@ -1571,10 +1603,140 @@ public:
         {
             std::lock_guard<std::mutex> g(resident_lock);
             for(size_t q=0;q<cold_miss.size();q++){slot_of[cold_miss[q]]=cold_taken[q];expert_of[cold_taken[q]]=cold_miss[q];}
+            if constexpr(GSQ) {   // the expert's bytes are now in its slot: the kernel reads them there
+                for(size_t q=0;q<cold_miss.size();q++)gsq_point(cold_miss[q],cold_taken[q]);
+            }
         }
         const double spent=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
         cold_loads+=(long long)cold_miss.size();cold_seconds+=spent;
         if(tokens<=8){cold_small_loads+=(long long)cold_miss.size();cold_small_seconds+=spent;}
+    }
+    // The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files, on the
+    // drive). The slot's layout: the three tensors of one expert (the gate, the up and the down) as the checkpoint
+    // has them, each at its region's start; the region's size is the largest of the layer's experts, so every
+    // expert's slot has the same stride. The expert's bytes are read from the store into a slot when a forward
+    // routes to it (the coldest resident expert leaves RAM), exactly like the FP4 path's pool.
+    void gsq_point(int e,int s) {   // where the expert's three tensors are: its slot, or the checkpoint file
+        uint8_t *base=gsq_slot[size_t(s)].get();
+        gsq_gate_ptr[e]=base+gsq_slot_reg[0];gsq_up_ptr[e]=base+gsq_slot_reg[1];gsq_down_ptr[e]=base+gsq_slot_reg[2];
+    }
+    void gsq_unpoint(int e) {   // the expert is not in RAM: the file's bytes (the kernel never reads them)
+        gsq_gate_ptr[e]=gsq_gate+gsq_gate_off[e];gsq_up_ptr[e]=gsq_up+gsq_up_off[e];gsq_down_ptr[e]=gsq_down+gsq_down_off[e];
+    }
+    // The experts this call routes to that are not in RAM are read from the store (one job per expert and role: the
+    // checkpoint's own tensor) into the slots of the experts with the lowest decayed use counts that this call does
+    // not use and nobody pinned (the FP4 path's policy).
+    void *ensure_resident_gsq(int tokens,int k,const int32_t *ids) {
+        const long long now=++cold_forwards;
+        if(tokens<=8)cold_small_forwards++;
+        cold_used.clear();
+        for(int j=0;j<tokens*k;j++) {
+            const int e=ids[j];
+            if(e<0||e>=experts||cold_mark[e]==now)continue;   // invalid routes fail in the grouping below
+            cold_mark[e]=now;cold_used.push_back(e);
+        }
+        for(int e:cold_used){cold_score[e]=cold_score[e]*std::exp(cold_log*double(now-cold_stamp[e]))+1;cold_stamp[e]=now;}
+        cold_miss.clear();
+        for(int e:cold_used)if(slot_of[e]<0)cold_miss.push_back(e);
+        if(cold_miss.empty())return nullptr;
+        const auto t0=std::chrono::steady_clock::now();
+        std::vector<int> taken;
+        {
+            std::lock_guard<std::mutex> g(resident_lock);
+            for(int e:cold_miss) {
+                if(gsq_cold_file[size_t(e)*3]<0)throw std::runtime_error("Expert "+std::to_string(e)+" is not in the store");
+                int best=-1;double low=0;
+                for(int s=0;s<slots;s++) {
+                    if(pins[s])continue;
+                    const int v=expert_of[s];double u=-1;   // a free slot first
+                    if(v==-2)continue;                      // reserved for another expert of this call
+                    if(v>=0) {
+                        if(cold_mark[v]==now)continue;
+                        u=cold_score[v]*std::exp(cold_log*double(now-cold_stamp[v]));
+                    }
+                    if(best<0||u<low){best=s;low=u;}
+                }
+                if(best<0)throw std::runtime_error("No RAM slot for expert "+std::to_string(e));
+                if(expert_of[best]>=0){slot_of[expert_of[best]]=-1;gsq_unpoint(expert_of[best]);}
+                expert_of[best]=-2;
+                taken.push_back(best);
+            }
+        }
+        const int jobs=int(cold_miss.size())*3;
+        std::vector<int> files(jobs);std::vector<long long> offsets(jobs);
+        std::vector<void*> dst(static_cast<size_t>(jobs));std::vector<size_t> len(static_cast<size_t>(jobs));
+        for(size_t q=0;q<cold_miss.size();q++) {
+            const int e=cold_miss[q];uint8_t *base=gsq_slot[size_t(taken[q])].get();
+            for(int r=0;r<3;r++) {
+                const int j=int(q)*3+r;
+                files[j]=gsq_cold_file[size_t(e)*3+r];offsets[j]=gsq_cold_off[size_t(e)*3+r];
+                dst[j]=base+gsq_slot_reg[r];
+                len[j]=r==0?gsq_gate_size[e]:r==1?gsq_up_size[e]:gsq_down_size[e];
+            }
+        }
+        cold_taken=taken;
+        if(cold_overlap) {
+            std::vector<int> group(size_t(jobs),0);
+            void *ticket=cold_io.submit(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),1,group.data(),1);
+            if(!ticket){release_taken();throw std::runtime_error("Reading cold experts from NVMe failed");}
+            return ticket;
+        }
+        if(cold_io.read(cold_store,jobs,files.data(),offsets.data(),dst.data(),len.data(),1)) {
+            release_taken();
+            throw std::runtime_error("Reading cold experts from NVMe failed");
+        }
+        land(tokens,t0);
+        return nullptr;
+    }
+    // The GSQ cold pool: the experts of the RAM slots and the rest in the store (the checkpoint's own files).
+    // files[3*e+role] and offsets[3*e+role]: where the expert's tensor is in the store (role 0 the gate, 1 the up,
+    // 2 the down). resident[0..count): the experts to have in RAM (slot i holds resident[i]); they are read from the
+    // store now. The others are read into a slot when a forward routes to them.
+    int attach_cold_gsq(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,
+                        const int32_t *resident,int count,const float *scores,float half_life) override {
+        if constexpr(!GSQ)return -1;
+        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
+        if(!guard.owns_lock()||!store||!io||!io->read||!io->submit||!io->finish||!files||!offsets||!resident
+           ||count<1||count>experts||!(half_life>0))return -1;
+        // per expert and role ([e*3+role]): where the expert's tensor is in the store
+        gsq_cold_file.assign(files,files+size_t(experts)*3);gsq_cold_off.assign(offsets,offsets+size_t(experts)*3);
+        for(int e=0;e<experts;e++)if(gsq_cold_file[size_t(e)*3]<0)return -1;   // every expert is in the store
+        // the RAM slots: the resident experts (the profile's ranking), the rest are read when they are routed to
+        gsq_slot_reg.assign(3,0);
+        size_t at=0;
+        for(int r=0;r<3;r++) {gsq_slot_reg[r]=at;at+=(gsq_role_bytes[r]+511)&~size_t(511);}
+        gsq_slot_bytes=at;
+        gsq_slot.clear();
+        for(int s=0;s<count;s++)gsq_slot.push_back(alloc(gsq_slot_bytes,0));
+        slots=count;
+        slot_of.assign(experts,-1);expert_of.assign(count,-1);
+        for(int s=0;s<count;s++) {
+            const int e=resident[s];
+            if(e<0||e>=experts)return -1;
+            slot_of[e]=s;expert_of[s]=e;gsq_point(e,s);
+        }
+        // read the resident experts into their slots (the store's own files, O_DIRECT)
+        cold_io=*io;cold_store=store;
+        std::vector<int> files_r(size_t(count)*3);std::vector<long long> offsets_r(size_t(count)*3);
+        std::vector<void*> dst(size_t(count)*3);std::vector<size_t> len(size_t(count)*3);
+        for(int s=0;s<count;s++) {
+            const int e=resident[s];uint8_t *base=gsq_slot[size_t(s)].get();
+            for(int r=0;r<3;r++) {
+                const int j=s*3+r;
+                files_r[j]=gsq_cold_file[size_t(e)*3+r];offsets_r[j]=gsq_cold_off[size_t(e)*3+r];
+                dst[j]=base+gsq_slot_reg[r];
+                len[j]=r==0?gsq_gate_size[e]:r==1?gsq_up_size[e]:gsq_down_size[e];
+            }
+        }
+        if(cold_io.read(store,count*3,files_r.data(),offsets_r.data(),dst.data(),len.data(),1))return -1;
+        cold_score.assign(experts,0.0);
+        if(scores)for(int e=0;e<experts;e++)cold_score[e]=scores[e];
+        cold_stamp.assign(experts,0);cold_mark.assign(experts,0);pins.assign(slots,0);
+        cold_log=std::log(0.5)/double(half_life);
+        const char *overlap=std::getenv("XTIER_COLD_OVERLAP");
+        cold_overlap=!overlap||std::string(overlap)!="0";
+        gsq_cold=true;
+        return 0;
     }
     int attach_cold(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,const float *scores,
                     float half_life) override {
@@ -1736,6 +1898,17 @@ int XTIER_API(xtier_cold_attach)(void *plan,void *store,void *io,const int32_t *
     if(!plan){last_error="Null plan";return -1;}
     int rc=static_cast<Handle*>(plan)->plan->attach_cold(store,static_cast<const ColdIO*>(io),files,offsets,scores,half_life);
     if(rc)last_error="Invalid cold attach (an expert in neither RAM nor the store, or a forward in progress)";
+    return rc;
+}
+// The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files).
+// files[3*e+role] and offsets[3*e+role]: where the expert's tensor is in the store (role 0 the gate, 1 the up,
+// 2 the down). resident[0..count): the experts to have in RAM (slot i holds resident[i]).
+int XTIER_API(xtier_gsq_cold_attach)(void *plan,void *store,void *io,const int32_t *files,const long long *offsets,
+                                      const int32_t *resident,int count,const float *scores,float half_life) {
+    if(!plan){last_error="Null plan";return -1;}
+    int rc=static_cast<Handle*>(plan)->plan->attach_cold_gsq(store,static_cast<const ColdIO*>(io),files,offsets,
+                                                             resident,count,scores,half_life);
+    if(rc)last_error="Invalid GSQ cold attach (an expert not in the store, or a forward in progress)";
     return rc;
 }
 int XTIER_API(xtier_slot_pin)(void *plan,int expert) {return plan?static_cast<Handle*>(plan)->plan->pin(expert):-1;}

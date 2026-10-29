@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from xtier import arch, config, platform
 from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
+from xtier.cache import gsq_cold
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
@@ -315,6 +316,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self.pool = GsqPool(pack, self.cfg.layer_id, slots, self.mailbox, dtype=self.dtype,
                                  swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
                                  swiglu_beta=self.swiglu_beta)
+        # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
+        # drive). The routed experts that are not in RAM are read from there when a forward needs them.
+        if gsq_cold.enabled():
+            from xtier.cache import gsq_cold
+            gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0)
         logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
 

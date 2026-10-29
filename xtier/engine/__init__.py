@@ -67,6 +67,9 @@ def engine() -> C.CDLL:
                                     ('cold_close', [_P], None), ('cold_error', [], C.c_char_p)):
                 fn = getattr(lib, 'xtier_' + name)
                 fn.argtypes, fn.restype = args, res
+        if hasattr(lib, 'xtier_gsq_cold_attach'):   # the GSQ cold pool (the IQ experts, 2026-10-29)
+            lib.xtier_gsq_cold_attach.argtypes = [_P, _P, _P, _P, _P, _I, _P, C.c_float]
+            lib.xtier_gsq_cold_attach.restype = _I
         _engine = lib
     return _engine
 
@@ -226,6 +229,22 @@ class CpuPlan:
         sc = (C.c_float * self.experts)(*scores)
         if self.lib.xtier_cold_attach(self.plan, store.handle, C.cast(f, _P), C.cast(o, _P), C.cast(sc, _P),
                                       float(half_life)):
+            raise RuntimeError(self.lib.xtier_last_error().decode())
+
+    def attach_cold_gsq(self, store, files, offsets, resident, scores, half_life):
+        """The GSQ cold pool: the store's locations of every expert's three tensors ([e * 3 + role]; role 0 the
+        gate, 1 the up, 2 the down), the experts to have in RAM (slot i holds resident[i]), their initial decayed
+        use counts and their half-life in forwards (xtier_gsq_cold_attach)."""
+        if not hasattr(self.lib, 'xtier_gsq_cold_attach'):
+            raise RuntimeError('xtier: this engine build has no GSQ cold pool; rebuild it (tools/build_engine.sh)')
+        if len(files) != self.experts * 3 or len(offsets) != len(files):
+            raise ValueError('xtier: the GSQ cold files / offsets need one entry per expert and role')
+        f = (C.c_int32 * len(files))(*files)
+        o = (C.c_longlong * len(offsets))(*offsets)
+        r = (C.c_int32 * len(resident))(*resident)
+        sc = (C.c_float * self.experts)(*scores)
+        if self.lib.xtier_gsq_cold_attach(self.plan, store.handle, C.cast(f, _P), C.cast(o, _P), C.cast(r, _P),
+                                          len(resident), C.cast(sc, _P), float(half_life)):
             raise RuntimeError(self.lib.xtier_last_error().decode())
 
     def cold_stats(self):

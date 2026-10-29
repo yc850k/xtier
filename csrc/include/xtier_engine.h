@@ -70,6 +70,14 @@ int xtier_place(void *plan,int expert,int slot);
 // computes the routes to the experts in RAM while those reads run, then the others (two FP32 sums, added: not bitwise
 // the one-pass order); 0: it waits for the reads first. Before the first forward. 0 or -1.
 int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,const float *scores,float half_life);
+// The GSQ cold pool (the IQ experts of a GGUF checkpoint): the experts of the RAM slots and the rest in the store (the
+// checkpoint's own files, on the drive). files[3*e+role] / offsets[3*e+role] locate expert e's tensor (role 0 the gate,
+// 1 the up, 2 the down) in the store; resident[0..count) are the experts to have in RAM (slot i holds resident[i]),
+// read from the store now. The others are read into a slot when a forward routes to them (the coldest resident expert
+// leaves RAM, the FP4 path's policy). The kernel reads an expert's bytes from its slot, as the checkpoint has them.
+// Before the first forward. 0 or -1.
+int xtier_gsq_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,
+                          const int32_t *resident,int count,const float *scores,float half_life);
 // For readers on other threads (the GPU pool's copies): the slot holding `expert`, kept until xtier_slot_unpin;
 // -1 if it is not in RAM.
 int xtier_slot_pin(void *plan,int expert);
