@@ -95,13 +95,14 @@ class CpuPlan:
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
                  swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, gsq_types=None, gsq_split=None):
-        if scale_format not in SCALE_FORMATS:
+        if scale_format not in SCALE_FORMATS and not (scale_format == 'gsq' and gsq_types is not None):
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
         self.hidden, self.inter, self.experts = int(hidden), int(inter), int(experts)
         self.swiglu_limit, self.scale_format = float(swiglu_limit), scale_format
         self.slots = self.experts if resident is None else len(resident)   # resident: the experts of slots 0..
         self.dynamic = None   # cold experts: the RAM slots experts can leave (cold.attach)
+        self._localized = False
         if gsq_types is not None:
             # The GSQ experts: the gate, the up and the down rows of every expert, one tensor each, and the type per
             # expert per role (the ggml type ids): the pack quantizes every role on its own, so the down's type often
@@ -138,7 +139,6 @@ class CpuPlan:
                 raise RuntimeError('xtier: this engine build has no GPT-OSS SwiGLU; rebuild it (tools/build_engine.sh)')
             if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
                 raise RuntimeError(self.lib.xtier_last_error().decode())
-        self._localized = False
 
     def forward(self, m, k, x, ids, routing, out):
         """x: BF16 [m, H], ids: int32 [m, k], routing: float32 [m, k] -> out: float32 [m, H] (host addresses here)."""

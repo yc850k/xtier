@@ -103,15 +103,16 @@ class XTierMoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
         self.dtype = _activation_dtype(params_dtype)
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
-        if self.format.name == 'gsq':
-            # The experts stay in the mapped checkpoint file (the engine reads them there): the GPU method's expert
-            # parameters are not created, so the loader skips the expert tensors and the GPU never holds them.
-            self.gsq = True
-            return
         self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
         # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
         self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
         self.swiglu_beta = 0.0 if rc.gemm1_beta is None else float(rc.gemm1_beta)
+        if self.format.name == 'gsq':
+            # The experts stay in the mapped checkpoint file (the engine reads them there): the GPU method's expert
+            # parameters are not created, so the loader skips the expert tensors and the GPU never holds them.
+            self.gsq = True
+            XTierMoEMethod.layers.append(self)   # the layer registers itself: its cache is filled with the others'
+            return
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
         with torch.device('cpu'):
             self.gpu_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition,
@@ -284,7 +285,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         from xtier.backend import gsq
         placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
         t0 = time.perf_counter()
-        pack = gsq.GsqPack(gsq.pack_path(_model_path()))
+        pack = gsq.GsqPack(gsq.pack_dir() or gsq.pack_path(_model_path()))
         try:
             gate, up, down, types_gate, types_up, types_down = pack.layer_sources(self.cfg.layer_id)
         finally:
@@ -319,7 +320,6 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
         # drive). The routed experts that are not in RAM are read from there when a forward needs them.
         if gsq_cold.enabled():
-            from xtier.cache import gsq_cold
             gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0)
         logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)

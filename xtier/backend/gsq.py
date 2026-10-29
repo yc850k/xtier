@@ -177,9 +177,15 @@ class GsqPack:
         self._mapped.clear()
 
 
+def pack_dir():
+    """The pack's directory when XTIER_GSQ_PACK names it (the model's path needs the server's arguments)."""
+    env = os.environ.get('XTIER_GSQ_PACK', '').strip()
+    return Path(env) if env else None
+
+
 def pack_path(model_path):
     """The pack of a checkpoint: XTIER_GSQ_PACK, else <model>/maya-ds4-gsq."""
-    env = os.environ.get('XTIER_GSQ_PACK', '').strip()
-    if env:
-        return Path(env)
+    env = pack_dir()
+    if env is not None:
+        return env
     return Path(model_path) / 'maya-ds4-gsq'

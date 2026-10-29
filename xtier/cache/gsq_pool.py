@@ -61,6 +61,7 @@ class GsqPool:
         self.pack, self.layer_id, self.mailbox = pack, int(layer_id), mailbox
         self.E, self.H, self.I = int(pack.experts), int(pack.hidden), int(pack.inter)
         self.S = min(int(slots), self.E)
+        self.full = self.S >= self.E   # every expert of the layer is in the VRAM (the FP4 pool's flag)
         self.dtype = dtype if dtype is not None else arch.dtype()
         self.limit = float(swiglu_limit)
         self.alpha, self.beta = float(swiglu_alpha), float(swiglu_beta)
