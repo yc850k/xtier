@@ -22,6 +22,7 @@ ROLES = ('w1', 'w3', 'w2')     # the gate, the up, the down (the pack's names)
 
 _stores = {}                  # the pack's path -> (the store, the pack's file index -> the store's index)
 _store_lock = threading.Lock()
+_layers = []                  # (layer id, plan, store) of every layer with a cold pool (the stats reporter)
 
 
 def enabled():
@@ -94,10 +95,44 @@ def attach(plan, pack, layer_id, gpu_slots=0):
               for e in range(experts)]
     plan.attach_cold_gsq(store, files, offsets, resident, scores, half_life)
     plan.dynamic = slots   # the slots experts can leave: bounds a call's passes (CpuPlan.forward)
+    _layers.append((layer_id, plan, store))
+    _start_reporter()
     logger.info('xtier cold: layer %d: %d of %d experts in RAM, the rest in %d checkpoint files on the drive '
                 '(%d GB read at load) in %.1f s', layer_id, slots, experts, len(index),
                 sum(locations[e][role][2] for e in resident for role in ROLES) / 1e9, time.perf_counter() - t0)
     return slots
+
+
+_reporter = None
+
+
+def _start_reporter():
+    """XTIER_COLD_LOG=60: every this many seconds, what the pool read from the drive."""
+    global _reporter
+    if _reporter is not None:
+        return
+    every = int(os.environ.get('XTIER_COLD_LOG', '0') or 0)
+    if every <= 0:
+        return
+    _reporter = threading.Thread(target=_report, args=(every,), name='xtier-gsq-cold-log', daemon=True)
+    _reporter.start()
+
+
+def _report(every):
+    last = None
+    while True:
+        time.sleep(every)
+        now = [0.0] * 6
+        for _, plan, _ in _layers:
+            st = plan.cold_stats()
+            for i in range(6):
+                now[i] += st[i]
+        if last is not None:
+            d = [a - b for a, b in zip(now, last)]
+            if d[0] or d[1]:
+                logger.info('xtier cold: the last %d s: %d forwards read %d experts (%.2f per forward) in %.1f s',
+                            every, d[0], d[1], d[1] / d[0] if d[0] else 0.0, d[2])
+        last = now
 
 
 def stats(plan):

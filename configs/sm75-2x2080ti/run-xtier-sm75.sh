@@ -75,6 +75,6 @@ exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NA
   --quantization gguf --load-format gguf \
   --mem-fraction-static ${XTIER_MEM_FRACTION:-0.92} \
   --kv-cache-dtype fp8_e4m3 \
-  --chunked-prefill-size ${XTIER_CHUNKED_PREFILL:-1024} \
+  --chunked-prefill-size ${XTIER_CHUNKED_PREFILL:-256} \
   --disable-cuda-graph \
   --weight-loader-drop-cache-after-load "$@"

@@ -3,12 +3,13 @@
 The checkpoint is the GGUF one on the Optane drive: the four shards of the model (IQ2_XXS, mixed per expert) and
 the Engram table (IQ4_NL) in the same directory. SGLang reads it with ``--quantization gguf --load-format gguf``.
 
-The card's other fields follow the host: FP16 (no BF16 tensor cores), the CPU engine's AVX2 build, few hot expert
+The card's other fields follow the host: BF16 (the card has no BF16 tensor cores, so the dot products are emulated -
+exact, and the hyper-connection's residual stream needs BF16's range), the CPU engine's AVX2 build, few hot expert
 slots (11 GB per card), the smaller tiles of Turing's 64 KiB of shared memory.
 
-The experts of a GGUF checkpoint are not in a format the CPU engine can read (it reads NVFP4 and MXFP4), so the MoE
-layers stay with SGLang's own GGUF kernels: XTier's hybrid path is off for this checkpoint (the load log says so).
-The Blackwell hosts' cards are not offered here: their checkpoints and their kernels belong to those machines.
+The routed experts are not in the GGUF shards: they come from the GSQ pack (the IQ experts in the format the CPU
+engine reads) on the Optane drive, and the hybrid path is on for this checkpoint (the load log names the layers it
+took). The Blackwell hosts' cards are not offered here: their checkpoints and their kernels belong to those machines.
 """
 
 import os
@@ -32,8 +33,8 @@ MODEL = {
     'notes': [
         {'when': {}, 'text': f'检查点：{CHECKPOINT}（--quantization gguf --load-format gguf）'},
         {'when': {'packs': 'on'}, 'text': 'Turing 上没有 BF16/FP8/FP4 张量核：加速包里跑不了的功能自动关闭（启动时日志里报一次）'},
-        {'when': {'packs': 'on'}, 'text': 'GGUF 的专家不是 CPU 引擎能读的格式（NVFP4/MXFP4），MoE 层留给 SGLang 自己的 '
-                                          'GGUF 内核：混合推理对这个检查点不生效', 'warn': True},
+        {'when': {'packs': 'on'}, 'text': '路由专家来自傲腾盘上的 GSQ 包（CPU 引擎读的 IQ 格式）：混合推理对这个检查点生效；'
+                                          '内存放不下的专家按路由读盘（XTIER_COLD=1）'},
     ],
 }
 

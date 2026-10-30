@@ -29,4 +29,7 @@ exec systemd-run --user --unit=$UNIT --collect \
   --working-directory=/home/userroot/work/xtier \
   --setenv=PATH="/home/userroot/.bun/bin:/usr/local/cuda-13.2/bin:/home/userroot/.npm-global/bin:/home/userroot/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   --setenv=MODEL=$M --setenv=PORT=$PORT --setenv=XTIER_DEBUG_ROUTE=${XTIER_DEBUG_ROUTE:-0} \
+  --setenv=XTIER_COLD_FRACTION=${XTIER_COLD_FRACTION:-0.3} \
+  --setenv=XTIER_COLD_LOG=${XTIER_COLD_LOG:-60} \
+  --setenv=XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500} \
   /home/userroot/work/xtier/configs/sm75-2x2080ti/run-xtier-sm75.sh
