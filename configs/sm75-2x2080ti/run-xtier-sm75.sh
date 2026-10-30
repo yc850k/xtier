@@ -47,4 +47,5 @@ exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NA
   --host 127.0.0.1 --port $PORT --tp-size 1 --trust-remote-code --skip-server-warmup \
   --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
   --quantization gguf --load-format gguf \
+  --mem-fraction-static ${XTIER_MEM_FRACTION:-0.92} \
   --weight-loader-drop-cache-after-load "$@"
