@@ -11,6 +11,9 @@
   3. 索引器与 KV 压缩器的权重固定是 BF16，激活按它们的 dtype 走；BF16→FP32 的 GEMM 要 sm_80，改为上转型
      （`xtier/packs/deepseek_v4/dtypes.py`）；
   4. 模型的 dtype 改回 BF16：超连接的残差流在 FP16 下到第 23 层就撑爆 65504（上游也是 BF16）。
+  端到端三层都在日志里：GPU 热缓存命中 7% 的路由（8 个槽对 384 个专家），其余由 CPU 引擎算（每层调用 35 ms），
+  内存与 GPU 槽里都没有的专家由冷池从傲腾盘读（每步约 1 个）；另外把分块 prefill 的块从 1024 改成 256（便携注意力
+  一次 gather 1.75 GiB，卡上只剩 1.25 GiB），GSQ 冷池也补上了统计日志（`XTIER_COLD_LOG`）。
   详见[文档](sm75.md)。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读的是**一个**文件（`gguf` 包的 reader 没有分片支持：
   第一个分片里只有 42 个张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片。XTier 现在把分片当一个
