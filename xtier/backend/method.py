@@ -361,7 +361,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         k = ids.shape[1]
         if not 1 <= k <= MAX_TOP_K:
             raise ValueError(f'xtier: top-k {k} not supported')
-        if os.environ.get('XTIER_DEBUG_ROUTE'):
+        if config.debug():
             bad = ((ids < -1) | (ids >= 384)).nonzero()
             nan = (~torch.isfinite(weights)).nonzero()
             logger.error('xtier debug: layer %d m %d k %d: the ids out of range %s the weights not finite %s '
@@ -416,7 +416,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             torch.cuda.current_stream().synchronize()
             self._time(m, time.perf_counter() - t0)
         out = out.to(x.dtype)
-        if os.environ.get('XTIER_DEBUG_ROUTE'):
+        if config.debug():
             logger.error('xtier debug: layer %d: the MoE output not finite %s', self.cfg.layer_id,
                          int((~torch.isfinite(out)).sum()))
         rsf = layer.moe_runner_config.routed_scaling_factor

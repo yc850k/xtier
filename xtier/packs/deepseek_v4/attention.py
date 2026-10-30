@@ -15,6 +15,8 @@ portable path.
 import logging
 import os
 
+from xtier import config
+
 logger = logging.getLogger(__name__)
 
 FLASH_MLA = 'sgl_kernel.flash_mla.flash_mla_with_kvcache'
@@ -42,7 +44,7 @@ def _portable_flash_mla(**kwargs):
         kwargs.get('extra_topk_length'),
     )
     # the portable path gives BF16 (the Blackwell hosts' activation dtype); on Turing the activations are FP16
-    if os.environ.get('XTIER_DEBUG_ROUTE'):
+    if config.debug():
         import torch
         kv = kwargs['k_cache'][0, 0, 0, :256].float()   # a slice: the whole cache would be gigabytes
         logger.error('xtier debug: the attention: the q not finite %s the out not finite %s the kv bytes not finite %s',

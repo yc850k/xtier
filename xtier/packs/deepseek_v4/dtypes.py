@@ -13,6 +13,8 @@ import os
 
 import torch
 
+from xtier import config
+
 logger = logging.getLogger(__name__)
 
 MODELS = 'sglang.srt.models.deepseek_v4'
@@ -94,7 +96,7 @@ def install(registry, hook_type):
 
     if not supported((8, 0), 'the BF16 GEMM with an FP32 output (deepseek_v4)'):
         registry.register(LINEAR_BF16_FP32, _linear_bf16_fp32, hook_type.REPLACE)
-    if os.environ.get('XTIER_DEBUG_ROUTE'):
+    if config.debug():
         registry.register(RMS_NORM, _debug_norm, hook_type.AROUND)
         registry.register(MIX_STATS, _debug_mix, hook_type.AROUND)
         registry.register(MHC_POST, _debug_post, hook_type.AROUND)

@@ -43,6 +43,11 @@ def _flag(name: str, default: str = '0') -> bool:
     return os.environ.get(name, default) == '1'
 
 
+def debug() -> bool:
+    """XTIER_DEBUG_ROUTE=1: the route and the activation diagnostics in the log (the NaN hunt)."""
+    return _flag('XTIER_DEBUG_ROUTE')
+
+
 def _int(name: str, default: int) -> int:
     value = os.environ.get(name, '')
     return int(value) if value.strip() else default

@@ -30,7 +30,7 @@ import os
 import torch
 import triton
 
-from xtier import arch
+from xtier import arch, config
 from xtier.backend.gsq_gpu import down, gate_up, tables
 from xtier.backend.kernels import Pointer
 from xtier.backend.prefill import _check, _runtime
@@ -221,7 +221,7 @@ class GsqPool:
             self._pool_on = True
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
-        if os.environ.get('XTIER_DEBUG_ROUTE'):
+        if config.debug():
             import ctypes as C
             cudart = _runtime()
             host = torch.empty(m * k, dtype=torch.float32, device='cpu')
