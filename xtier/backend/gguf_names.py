@@ -36,6 +36,10 @@ LAYER = {
     'attn_compressor_gate': 'self_attn.compressor.wgate.weight',
     'hc_ffn_scale': 'hc_ffn_scale',
     'ffn_gate_inp': 'mlp.gate.weight',
+    # the shared expert: the gate and the up are stacked into the model's fused gate_up projection
+    'ffn_gate_shexp': 'mlp.shared_experts.gate_proj.weight',
+    'ffn_up_shexp': 'mlp.shared_experts.up_proj.weight',
+    'ffn_down_shexp': 'mlp.shared_experts.down_proj.weight',
 }
 
 # The global tensors.

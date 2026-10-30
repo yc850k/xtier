@@ -25,7 +25,9 @@ class Pointer:
 def _pack(X, IDS, ROUTE, ACT, SX, SIDS, SROUTE, NX: tl.constexpr, NK: tl.constexpr, K: tl.constexpr,
           HAS_ACT: tl.constexpr, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
-    tl.store(SX + i, tl.load(X + i, i < NX), i < NX)
+    # the engine reads BF16 (its contract): the activations are converted here, as on a BF16 host the round trip is
+    # exact (on an FP16 host the model runs in FP16 and the engine still wants BF16)
+    tl.store(SX + i, tl.load(X + i, i < NX).to(tl.float32).to(tl.bfloat16), i < NX)
     if tl.program_id(0) == 0:
         j = tl.arange(0, 128)  # m*k <= 8*10 routes
         ids = tl.load(IDS + j, j < NK)

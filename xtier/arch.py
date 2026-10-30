@@ -17,7 +17,10 @@ GPU, for the tests); ``XTIER_ARCH=none`` means "no GPU": only the CPU paths run.
 """
 
 import functools
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 SM75 = (7, 5)     # Turing: FP16 tensor cores, no BF16, no FP8, no TMA, no FP4
 SM80 = (8, 0)     # Ampere: BF16 and TF32
@@ -136,12 +139,12 @@ def dot_dtype():
 
 
 def dtype():
-    """The dtype of the activations XTier's GPU kernels compute in. ``XTIER_DTYPE=bf16|fp16|auto`` (default auto:
-    the device's dot dtype)."""
+    """The dtype of the activations XTier's GPU kernels compute in: the model's dtype (BF16; a card without BF16
+    tensor cores emulates it, which is exact and only slower). ``XTIER_DTYPE=bf16|fp16|auto`` (default auto)."""
     import torch
     spec = os.environ.get('XTIER_DTYPE', 'auto').strip().lower()
     if spec in ('', 'auto'):
-        return dot_dtype()
+        return torch.bfloat16
     if spec == 'bf16':
         return torch.bfloat16
     if spec == 'fp16':
@@ -150,15 +153,17 @@ def dtype():
 
 
 def check_activation_dtype(dtype):
-    """The dtype of the activations: BF16 or FP16. BF16 needs a GPU with BF16 tensor cores (sm_80 and newer); below
-    that (Turing, sm_75) the model has to run in FP16. The CPU engine keeps its BF16 contract either way: the
-    activations are converted when they are staged for it."""
+    """The dtype of the activations: BF16 or FP16. The CPU engine keeps its BF16 contract either way: the
+    activations are converted when they are staged for it.
+
+    BF16 without BF16 tensor cores (Turing, sm_75) is allowed: the emulation is exact, only slower, and the
+    models whose hyper-connection mixes the residual stream need BF16's range (FP16 overflows at 65504)."""
     import torch
     if dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
     if dtype == torch.bfloat16 and capability() is not None and not has_bf16():
-        raise TypeError(f'xtier: this GPU ({describe()}) has no BF16 tensor cores: run the model with '
-                        '--dtype float16')
+        logger.warning('xtier: %s has no BF16 tensor cores: the BF16 activations are emulated (slower, exact)',
+                       describe())
     return dtype
 
 

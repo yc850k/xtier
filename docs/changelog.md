@@ -2,6 +2,16 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN，
+  速度约 0.4 tok/s（BF16 的点积由软件模拟，MoE 在 CPU 引擎上）。修了四处：
+  1. GGUF 的名字对照漏了共享专家的三个张量（gate/up/down），共享专家的权重一直没初始化：隐藏状态变 NaN，引擎拒绝
+     路由权重（`xtier/backend/gguf_names.py`）；
+  2. 压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3，Triton 只在 sm_89 以上能编，改走 SGLang 自己的 torch 路径
+     （`xtier/packs/deepseek_v4/fp4_rope.py`）；
+  3. 索引器与 KV 压缩器的权重固定是 BF16，激活按它们的 dtype 走；BF16→FP32 的 GEMM 要 sm_80，改为上转型
+     （`xtier/packs/deepseek_v4/dtypes.py`）；
+  4. 模型的 dtype 改回 BF16：超连接的残差流在 FP16 下到第 23 层就撑爆 65504（上游也是 BF16）。
+  详见[文档](sm75.md)。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读的是**一个**文件（`gguf` 包的 reader 没有分片支持：
   第一个分片里只有 42 个张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片。XTier 现在把分片当一个
   文件读（`xtier/backend/gguf_split.py`），给出该模型的张量名对照（`gguf_names.py`）与权重的反量化

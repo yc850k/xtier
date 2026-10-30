@@ -49,12 +49,15 @@ for spec, bf16, tf32, fp8, tma, fp4, mxfp4 in (('7.5', False, False, False, Fals
     check(a.has_fp4_convert() == fp4, f'{spec}: the FP4 conversion instruction {fp4}')
     check(a.has_blackwell_mxfp4_moe() == mxfp4, f'{spec}: the SM120 MXFP4 fused MoE {mxfp4}')
 
-# the dot products follow the device: FP16 below sm_80 (no BF16 tensor cores), BF16 from sm_80 on
+# the dot products follow the device: FP16 below sm_80 (no BF16 tensor cores), BF16 from sm_80 on; the activations
+# are the model's dtype (BF16 everywhere: a card without BF16 tensor cores emulates it, and the models whose
+# hyper-connection mixes the residual stream need BF16's range)
 with_arch('7.5')
 check(arch.dot_dtype() == torch.float16, 'sm_75: the dot products are FP16')
-check(arch.dtype() == torch.float16, 'sm_75: the activations are FP16')
+check(arch.dtype() == torch.bfloat16, 'sm_75: the activations are BF16')
 with_arch('12.0')
 check(arch.dot_dtype() == torch.bfloat16, 'sm_120: the dot products are BF16')
+check(arch.dtype() == torch.bfloat16, 'sm_120: the activations are BF16')
 os.environ['XTIER_DTYPE'] = 'fp16'
 check(arch.dtype() == torch.float16, 'XTIER_DTYPE=fp16: the activations are FP16')
 del os.environ['XTIER_DTYPE']
@@ -78,13 +81,10 @@ check(supported((7, 5), 'the FP4 experts on the CPU'), 'sm_75: the CPU-side feat
 with_arch('12.0')
 check(supported((8, 9), 'the FP8 weights'), 'sm_120: the FP8 features are on')
 
-# the activations: BF16 or FP16, and BF16 only where the GPU has BF16 tensor cores
+# the activations: BF16 or FP16; BF16 is accepted everywhere (a card without BF16 tensor cores emulates it, and the
+# models whose hyper-connection mixes the residual stream need BF16's range)
 with_arch('7.5')
-try:
-    arch.check_activation_dtype(torch.bfloat16)
-    check(False, 'sm_75: BF16 activations are refused')
-except TypeError as e:
-    check('float16' in str(e), f'sm_75: BF16 activations are refused ({e})')
+check(arch.check_activation_dtype(torch.bfloat16) == torch.bfloat16, 'sm_75: BF16 activations are accepted')
 check(arch.check_activation_dtype(torch.float16) == torch.float16, 'sm_75: FP16 activations are accepted')
 try:
     arch.check_activation_dtype(torch.float32)

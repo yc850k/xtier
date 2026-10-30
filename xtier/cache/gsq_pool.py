@@ -221,6 +221,19 @@ class GsqPool:
             self._pool_on = True
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
+        if os.environ.get('XTIER_DEBUG_ROUTE'):
+            import ctypes as C
+            cudart = _runtime()
+            host = torch.empty(m * k, dtype=torch.float32, device='cpu')
+            cudart.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int, C.c_void_p]
+            cudart.cudaMemcpy.restype = C.c_int
+            cudart.cudaMemcpy(C.c_void_p(host.data_ptr()), C.c_void_p(sroute), m * k * 4, 2, 0)
+            ids_host = torch.empty(m * k, dtype=torch.int32, device='cpu')
+            cudart.cudaMemcpy(C.c_void_p(ids_host.data_ptr()), C.c_void_p(sids), m * k * 4, 2, 0)
+            torch.cuda.synchronize()
+            logger.error('xtier debug: layer %d m %d: the staged routing %s the staged ids %s',
+                         self.layer_id, m, host[:6].tolist(), ids_host[:6].tolist())
+            torch.cuda.current_stream().synchronize()
         self.mailbox.signal(stream, m, k, 1)
         self._kernels(m, k, x, routing, sc['gout'])
         self.mailbox.signal(stream, m, k, 2)

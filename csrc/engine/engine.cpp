@@ -1471,7 +1471,7 @@ public:
         for(int t=0;t<m;t++)for(int q=0;q<k;q++) {
             int e=ids[t*k+q];float weight=rw[t*k+q];
             if(e==-1)continue;  // route computed elsewhere (hybrid CPU/GPU prefill)
-            if(e<0||e>=experts||!std::isfinite(weight))throw std::runtime_error("Invalid route");
+            if(e<0||e>=experts||!std::isfinite(weight))throw std::runtime_error("Invalid route: the expert "+std::to_string(e)+" of "+std::to_string(experts)+" the weight "+std::to_string(weight)+" the token "+std::to_string(t));
             int g=0;
             if(m<=4) {
                 for(;g<groups_n;g++)if(groups[g].expert==e)break;

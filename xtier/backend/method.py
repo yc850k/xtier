@@ -49,7 +49,7 @@ DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured 
 
 def _model_path() -> str:
     """The checkpoint's path (the GSQ pack sits beside it)."""
-    from sglang.srt.server_args import get_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     return get_server_args().model_path
 
@@ -361,6 +361,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
         k = ids.shape[1]
         if not 1 <= k <= MAX_TOP_K:
             raise ValueError(f'xtier: top-k {k} not supported')
+        if os.environ.get('XTIER_DEBUG_ROUTE'):
+            bad = ((ids < -1) | (ids >= 384)).nonzero()
+            nan = (~torch.isfinite(weights)).nonzero()
+            logger.error('xtier debug: layer %d m %d k %d: the ids out of range %s the weights not finite %s '
+                         'the ids[:4] %s the weights[:4] %s the x not finite %s', self.cfg.layer_id, m, k, bad.shape[0],
+                         nan.shape[0], ids[:4].tolist(), weights[:4].tolist(),
+                         int((~torch.isfinite(x)).sum()))
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
@@ -409,6 +416,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
             torch.cuda.current_stream().synchronize()
             self._time(m, time.perf_counter() - t0)
         out = out.to(x.dtype)
+        if os.environ.get('XTIER_DEBUG_ROUTE'):
+            logger.error('xtier debug: layer %d: the MoE output not finite %s', self.cfg.layer_id,
+                         int((~torch.isfinite(out)).sum()))
         rsf = layer.moe_runner_config.routed_scaling_factor
         if rsf is not None and rsf != 1.0 and not layer.should_fuse_routed_scaling_factor_in_topk:
             out.mul_(rsf)

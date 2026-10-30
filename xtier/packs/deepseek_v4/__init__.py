@@ -297,10 +297,26 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 
 def install(registry, hook_type):
     from xtier.packs import supported
-    from xtier.packs.deepseek_v4 import paged_indexer, tilelang, wo_a
+    from xtier.packs.deepseek_v4 import (
+        attention,
+        dtypes,
+        fp4_rope,
+        kv_fp8,
+        paged_indexer,
+        rope,
+        tilelang,
+        wo_a,
+    )
 
     if not supported((8, 0), 'the TileLang kernels of DeepSeek V4.1'):
         tilelang.install()
+        rope.install()
+    if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache'):
+        kv_fp8.install()
+        fp4_rope.install(registry, hook_type)
+    if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1'):
+        attention.install(registry, hook_type)
+    dtypes.install(registry, hook_type)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
     if supported((8, 0), 'the wo_a FP8 einsum (deepseek_v4)'):   # BF16 dot products

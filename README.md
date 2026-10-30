@@ -18,7 +18,7 @@ XTier 是官方 SGLang 的插件（跟 main 分支），做 CPU/GPU 分层 MoE �
 - **不改 SGLang 源码**：只用官方插件框架的钩子（接在官方 KTransformers 混合推理的入口上），加载后自检是否接管成功。
 - **与模型无关**：混合推理包在官方 `FusedMoE` 的量化方法外面，用标准 MoE 层的模型装上就能跑（NVFP4、MXFP4 专家）。
 - **加速包可选**：某个模型独有的修正和内核放在 `xtier/packs/` 下。
-- **按卡适配**：GPU 内核跟显卡的能力走（Turing sm_75 上是 FP16，因为它没有 BF16 张量核；FP8/TMA/FP4 的功能按等级关闭），见 [docs/sm75.md](docs/sm75.md)。
+- **按卡适配**：GPU 内核跟显卡的能力走（FP8/TMA/FP4 的功能按等级关闭；Turing sm_75 没有 BF16 张量核，BF16 的点积由软件模拟），见 [docs/sm75.md](docs/sm75.md)。
 
 ## 结构
 
@@ -200,13 +200,16 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## Turing（sm_75）
 
-分支 `feat/sm75` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：内核的点积按卡的能力取操作数（Turing 没有 BF16
-张量核，模型以 FP16 跑；TF32 也没有，下投影用 16 位点积），热专家缓存的 FP4 解码用软件实现（没有
-`cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB 共享内存缩小。CPU 引擎不变。
+分支 `feat/sm75` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：内核按卡的能力取实现（Turing 没有 BF16 张量核，
+模型以 BF16 跑、由软件模拟——超连接的残差流需要 BF16 的范围，FP16 在第 23 层就溢出；TF32 也没有，下投影用 16 位点积），
+热专家缓存的 FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB
+共享内存缩小。CPU 引擎不变。DeepSeek V4.1 Flash 在 2× RTX 2080 Ti 上已经能出答案（"2+2 equals 4."，40 层没有 NaN），
+速度受 BF16 模拟与 CPU 引擎的 MoE 限制，约 0.4 tok/s。
 详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
 
 ## 版本更新
 
+- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 跑通了：一次请求有答案，40 层没有 NaN。修了四处：GGUF 的名字对照漏了共享专家的三个张量（权重一直没初始化，隐藏状态变 NaN）；压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3（Triton 只在 sm_89 以上能编）；索引器与 KV 压缩器的 BF16 权重要 BF16 的激活、BF16→FP32 的 GEMM 要 sm_80；模型的 dtype 改回 BF16（残差流在 FP16 下第 23 层就溢出）。详见[文档](docs/sm75.md)。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读一个文件（`gguf` 包没有分片支持：第一个分片只有 42 个
   张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片：XTier 把分片当一个文件读，并给出该模型的张量名
   对照与权重的反量化。详见[文档](docs/sm75.md)。

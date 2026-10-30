@@ -2,9 +2,9 @@
 
   python tests/sm75_gpu_check.py
 
-On a Turing card (sm_75) this is what the branch is about: no BF16 tensor cores (the activations and the dot products
-are FP16) and no FP4 conversion instruction (the E2M1 values are decoded in software). The same checks run on any GPU:
-the dtype and the decode follow the device.
+On a Turing card (sm_75) this is what the branch is about: no BF16 tensor cores (the model's BF16 activations are
+emulated, which is exact) and no FP4 conversion instruction (the E2M1 values are decoded in software). The same checks
+run on any GPU: the dtype and the decode follow the device.
 
 - the cache's gate/up kernel (cache/pool.py) on packed NVFP4 and MXFP4 experts: the decoded weights and the 16-bit
   dot products against the same layer computed in FP32;
