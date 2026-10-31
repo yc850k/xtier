@@ -2,8 +2,9 @@
 
 按日期倒序，README 只列最近 5 条。
 
-- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN，
-  速度约 0.4 tok/s（BF16 的点积由软件模拟，MoE 在 CPU 引擎上）。修了四处：
+- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN。
+  实测速度：prefill 约 3.7 tok/s、decode 约 0.8 tok/s（SGLang 自己的计数），瓶颈是 BF16 的点积由软件模拟、MoE 在
+  CPU 引擎上、注意力走 PyTorch，不是显存。修了四处：
   1. GGUF 的名字对照漏了共享专家的三个张量（gate/up/down），共享专家的权重一直没初始化：隐藏状态变 NaN，引擎拒绝
      路由权重（`xtier/backend/gguf_names.py`）；
   2. 压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3，Triton 只在 sm_89 以上能编，改走 SGLang 自己的 torch 路径

@@ -204,7 +204,7 @@ decode 约慢 10%），主要受限于硬盘速度。
 模型以 BF16 跑、由软件模拟——超连接的残差流需要 BF16 的范围，FP16 在第 23 层就溢出；TF32 也没有，下投影用 16 位点积），
 热专家缓存的 FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB
 共享内存缩小。CPU 引擎不变。DeepSeek V4.1 Flash 在 2× RTX 2080 Ti 上已经能出答案（"2+2 equals 4."，40 层没有 NaN），
-速度受 BF16 模拟与 CPU 引擎的 MoE 限制，约 0.4 tok/s。
+实测 prefill 约 3.7 tok/s、decode 约 0.8 tok/s（瓶颈是 BF16 模拟、CPU 引擎的 MoE 与 PyTorch 注意力，不是显存）。
 详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
 
 ## 版本更新
