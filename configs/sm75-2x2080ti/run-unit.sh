@@ -32,4 +32,5 @@ exec systemd-run --user --unit=$UNIT --collect \
   --setenv=XTIER_COLD_FRACTION=${XTIER_COLD_FRACTION:-0.3} \
   --setenv=XTIER_COLD_LOG=${XTIER_COLD_LOG:-60} \
   --setenv=XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500} \
+  --setenv=XTIER_SPARSE_MLA=${XTIER_SPARSE_MLA:-1} \
   /home/userroot/work/xtier/configs/sm75-2x2080ti/run-xtier-sm75.sh

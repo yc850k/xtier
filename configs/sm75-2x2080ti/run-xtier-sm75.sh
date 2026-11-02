@@ -49,6 +49,9 @@ EOF
 )}
 [ -n "$CUDA" ] || CUDA=/usr/local/cuda
 export CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH LD_LIBRARY_PATH=$CUDA/lib:${LD_LIBRARY_PATH:-} PYTHONUNBUFFERED=1
+# Both cards compute (the GPU pool and the prefill can take the second one). The display is on the
+# AMD FirePro W4100, so the NVIDIA cards carry no output; the DRM path is off (gui-freeze-fix.sh).
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 # FlashInfer and TileLang compile for this device (7.5 on a Turing card, 12.0 on the RTX PRO 5000)
 ARCH=${XTIER_CUDA_ARCH:-$($PY -c 'import torch;c=torch.cuda.get_device_capability();print(f"{c[0]}.{c[1]}")' 2>/dev/null || echo 12.0)}
 export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH}
@@ -59,7 +62,9 @@ export XTIER=${XTIER:-1}
 # server reports ready; the loader's own copy of them is skipped)
 export XTIER_FAST_LOAD=${XTIER_FAST_LOAD:-1}
 # The CPU engine: Broadwell (AVX2 only, no AVX-512 BF16), 2 NUMA nodes of 14 cores
-export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-36} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
+# The engine's workers take all but a few CPUs: one for the mailbox dispatcher and a few for the process's own
+# threads (the scheduler, torch). All of them would leave the dispatcher without a CPU.
+export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-$(( $(nproc) - 4 ))} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 export XTIER_SPIN_COUNT=${XTIER_SPIN_COUNT:-1048576}
 # The GPU prefill: the tiles fit Turing's 64 KiB of shared memory (the Blackwell hosts run 128 x 64 with 3 stages)
 export XTIER_GPU_PREFILL_CHUNK=${XTIER_GPU_PREFILL_CHUNK:-4096} XTIER_PREFILL_EXPERT_CHUNK=${XTIER_PREFILL_EXPERT_CHUNK:-8}
@@ -75,7 +80,7 @@ export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-8} XTIER_CACHE_SWAPS=${XTIER_CACHE
 export XTIER_COLD=${XTIER_COLD:-1} XTIER_COLD_FRACTION=${XTIER_COLD_FRACTION:-0.3} XTIER_COLD_THREADS=${XTIER_COLD_THREADS:-8}
 exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NAME:-$(basename $M)} \
   --host 127.0.0.1 --port $PORT --tp-size 1 --trust-remote-code --skip-server-warmup \
-  --cuda-graph-backend-prefill disabled --dtype bfloat16 --max-running-requests 2 \
+  --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
   --quantization gguf --load-format gguf \
   --mem-fraction-static ${XTIER_MEM_FRACTION:-0.92} \
   --kv-cache-dtype fp8_e4m3 \

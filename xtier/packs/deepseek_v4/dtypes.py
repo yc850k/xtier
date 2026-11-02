@@ -24,6 +24,7 @@ MIX_STATS = 'sglang.srt.models.deepseek_v4_mhc.mix_stats'
 DOWNGRADE = 'sglang.srt.model_executor.model_runner.maybe_downgrade_dtype_for_legacy_gpu'
 MHC_NORM_CACHE = f'{MODELS}.DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache'
 MHC_POST = 'sglang.srt.models.deepseek_v4_mhc.post'
+MHC_COMBINE = 'sglang.srt.models.deepseek_v4_mhc.combine'
 MLP_FWD = 'sglang.srt.models.deepseek_v2.DeepseekV2MLP.forward'
 CLAMP = 'sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp'
 INDEXER = 'sglang.srt.layers.attention.dsv4.dsv41_sparse.DeepseekV41Indexer'
@@ -96,10 +97,12 @@ def install(registry, hook_type):
 
     if not supported((8, 0), 'the BF16 GEMM with an FP32 output (deepseek_v4)'):
         registry.register(LINEAR_BF16_FP32, _linear_bf16_fp32, hook_type.REPLACE)
+    if not supported((8, 0), 'the FP16 hyper-connection residual stream (deepseek_v4)'):
+        registry.register(MHC_POST, _post_fp32, hook_type.AROUND)
+        registry.register(MHC_COMBINE, _combine_fp16, hook_type.AROUND)
+        registry.register(RMS_NORM, _norm_fp32, hook_type.AROUND)
     if config.debug():
-        registry.register(RMS_NORM, _debug_norm, hook_type.AROUND)
         registry.register(MIX_STATS, _debug_mix, hook_type.AROUND)
-        registry.register(MHC_POST, _debug_post, hook_type.AROUND)
         registry.register(MLP_FWD, _debug_mlp, hook_type.AROUND)
         registry.register(CLAMP, _debug_clamp, hook_type.AROUND)
     logger.info('xtier: the DeepSeek V4.1 wo_a projection casts between the activation and the weight dtype')
@@ -135,67 +138,56 @@ def _mhc_norm_cache(original, self, *args, **kwargs):
     return out
 
 
-def _debug_norm(original, *args, **kwargs):
-    """The norm's input and output: where a NaN appears."""
-    x = args[1] if len(args) > 1 else kwargs.get('x')
-    out = original(*args, **kwargs)
-    bad_in = int((~torch.isfinite(x)).sum()) if torch.is_tensor(x) else -1
-    bad_out = int((~torch.isfinite(out)).sum()) if torch.is_tensor(out) else -1
-    if bad_in or bad_out:
-        logger.error('xtier debug: the norm: the input not finite %s the output not finite %s the dtypes %s %s',
-                     bad_in, bad_out, getattr(x, 'dtype', None), getattr(out, 'dtype', None))
+_norm_dtype = {}   # the norm's id -> the model's dtype (its weight's dtype)
+
+
+def _norm_fp32(original, self, x, *args, **kwargs):
+    """The RMSNorm with an FP32 input takes the torch path: the fused kernel is 16-bit only.
+
+    The MHC's combine reads the FP32 residual stream, and the fused rmsnorm kernel ("failed to dispatch data type
+    Float") only takes FP16 and BF16.
+    """
+    if x.dtype == torch.float32:
+        out = self.forward_native(x, *args, **kwargs)
+        if config.debug():
+            logger.error('xtier debug: the norm: the input not finite %s the output not finite %s the dtypes %s %s',
+                         int((~torch.isfinite(x.float())).sum()), int((~torch.isfinite(out.float())).sum()),
+                         x.dtype, out.dtype)
+        return out
+    return original(self, x, *args, **kwargs)
+
+
+def _post_fp32(original, cfg, x, residual, post_mix, comb):
+    """The MHC's post with the residual stream in FP32.
+
+    The stream carries the layer outputs and grows with the depth (284672 over the 40 layers, past FP16's 65504),
+    so it is kept in FP32: the sublayer's output is cast up for the arithmetic and SGLang's own cast back to the
+    activation's dtype would overflow.
+    """
+    out = original(cfg, x.float(), residual, post_mix, comb)
+    if config.debug():
+        names = ('x', 'residual', 'post_mix', 'comb')
+        counts = []
+        for i, name in enumerate(names, start=1):
+            tensor = (x, residual, post_mix, comb)[i - 1]
+            counts.append('%s %s' % (name, int((~torch.isfinite(tensor.float())).sum())))
+        logger.error('xtier debug: the post: %s the out %s the out dtype %s',
+                     ' '.join(counts), int((~torch.isfinite(out.float())).sum()), out.dtype)
     return out
 
 
-def _debug_post(original, *args, **kwargs):
-    """The MHC's post: the residual update (x, residual, post_mix, comb in, the residual out)."""
-    out = original(*args, **kwargs)
-    names = ('x', 'residual', 'post_mix', 'comb')
-    counts = []
-    for i, name in enumerate(names, start=1):
-        t = args[i] if len(args) > i else None
-        counts.append('%s %s' % (name, int((~torch.isfinite(t.float())).sum()) if torch.is_tensor(t) else -1))
-    bad = int((~torch.isfinite(out.float())).sum()) if torch.is_tensor(out) else -1
-    logger.error('xtier debug: the post: %s the out %s', ' '.join(counts), bad)
+def _combine_fp16(original, hc, state, quantized=None):
+    """The MHC's combine: the residual's rows are FP32, the sublayer's input is the model's dtype."""
+    out = original(hc, state, quantized)
+    weight = getattr(getattr(hc, 'norm', None), 'weight', None)
+    dtype = weight.dtype if torch.is_tensor(weight) else out.dtype
+    if out.dtype != dtype:
+        out = out.to(dtype)
+    if config.debug():
+        logger.error('xtier debug: the combine: the rows %s the out %s the dtype %s',
+                     int((~torch.isfinite(state.residual.float())).sum()),
+                     int((~torch.isfinite(out.float())).sum()), out.dtype)
     return out
-
-
-def _debug_mix(original, *args, **kwargs):
-    """The MHC's mix stats: the residual in, the triplet out."""
-    x = args[1] if len(args) > 1 else kwargs.get('x')
-    out = original(*args, **kwargs)
-    if torch.is_tensor(x):
-        f = x.float()
-        logger.error('xtier debug: the mix stats: the residual max %s the min %s the inf %s the nan %s the dtype %s',
-                     f.abs().max().item(), f.min().item(), int(torch.isinf(f).sum()),
-                     int(torch.isnan(f).sum()), x.dtype)
-    bad = -1
-    if torch.is_tensor(out):
-        bad = int((~torch.isfinite(out.float())).sum())
-    elif isinstance(out, (tuple, list)):
-        bad = sum(int((~torch.isfinite(t.float())).sum()) for t in out if torch.is_tensor(t))
-    if bad:
-        logger.error('xtier debug: the mix stats: the output not finite %s', bad)
-    return out
-
-
-_MLP_SEEN = set()
-
-
-def _stat(t):
-    """The non-finite count, the largest finite magnitude and the dtype of a tensor."""
-    if not torch.is_tensor(t):
-        return 'not a tensor'
-    f = t.float()
-    finite = torch.isfinite(f)
-    bad = int((~finite).sum())
-    top = float(f[finite].abs().max()) if bool(finite.any()) else float('nan')
-    return 'the bad %d the max %.6g the dtype %s' % (bad, top, t.dtype)
-
-
-def _bad(t):
-    """Whether a tensor holds a value that is not finite."""
-    return torch.is_tensor(t) and bool((~torch.isfinite(t.float())).any())
 
 
 def _debug_mlp(original, self, *args, **kwargs):

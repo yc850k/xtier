@@ -58,11 +58,57 @@ def _no_sparse_prefill(self, *args, **kwargs):
     return False
 
 
+def _sparse_flash_mla(original, module):
+    """FlashMLA's sparse FP8 call in the Triton sparse MLA; the PyTorch path takes over if the kernel cannot run.
+
+    The upstream's kernel (below SM90, the RTX 30 / 40 series) is the one in ``sparse_mla``; it reads the same packed
+    FP8 pages and gives the same attention. The calls that are not the sparse FP8 decode keep the PyTorch path: the
+    FlashMLA wheel has no build for this card.
+
+    ``XTIER_SPARSE_MLA=0`` keeps the PyTorch path (the measurement of the two).
+    """
+    state = {'failed': False, 'used': 0}
+
+    def call(**kwargs):
+        cache = kwargs.get('k_cache')
+        sparse = (kwargs.get('indices') is not None and kwargs.get('is_fp8_kvcache') and cache is not None
+                  and cache.shape[-1] == module.DATA_BYTES + module.SCALE_BYTES
+                  and kwargs.get('head_dim_v', module.DIM) == module.DIM)
+        if sparse and not state['failed'] and os.environ.get('XTIER_SPARSE_MLA', '1') != '0':
+            try:
+                scale = kwargs.get('softmax_scale')
+                q = kwargs['q']
+                out = module.sparse_mla(
+                    q, cache, kwargs['indices'], kwargs.get('topk_length'), kwargs.get('attn_sink'),
+                    scale if scale is not None else q.shape[-1] ** -0.5, kwargs.get('extra_k_cache'),
+                    kwargs.get('extra_indices_in_kvcache'), kwargs.get('extra_topk_length'))
+                state['used'] += 1
+                if state['used'] == 1:
+                    print('[xtier] the Triton sparse MLA took the first attention call', flush=True)
+                return out
+            except Exception as exc:      # the kernel does not fit this card: the PyTorch path
+                state['failed'] = True
+                logger.warning('xtier: the Triton sparse MLA failed (%s); the attention runs in PyTorch', exc)
+        return _portable_flash_mla(**kwargs)
+
+    return call
+
+
 def install(registry, hook_type):
-    """Replace the FlashMLA kernel with the portable one."""
+    """Replace the FlashMLA kernel with the Triton sparse MLA (the PyTorch path is the fallback)."""
     import sgl_kernel.flash_mla as flash_mla
 
-    flash_mla.flash_mla_with_kvcache = _portable_flash_mla
+    from xtier.packs.deepseek_v4 import sparse_mla
+
+    flash_mla.flash_mla_with_kvcache = _sparse_flash_mla(flash_mla.flash_mla_with_kvcache, sparse_mla)
+    # a newer SGLang reaches the kernel through the interface module (the upstream's symbol)
+    try:
+        from sglang.kernels.ops.attention import flash_mla_interface
+    except ImportError:
+        flash_mla_interface = None
+    if flash_mla_interface is not None and hasattr(flash_mla_interface, 'flash_mla_with_kvcache'):
+        flash_mla_interface.flash_mla_with_kvcache = _sparse_flash_mla(
+            flash_mla_interface.flash_mla_with_kvcache, sparse_mla)
     registry.register(SPARSE_PREFILL, _no_sparse_prefill, hook_type.REPLACE)
-    logger.info('xtier: the DeepSeek V4.1 attention runs in PyTorch on sm_75 (no FlashMLA)')
+    logger.info('xtier: the DeepSeek V4.1 attention runs in the Triton sparse MLA on sm_75 (no FlashMLA)')
     return True
