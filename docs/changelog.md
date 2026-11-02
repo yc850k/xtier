@@ -24,7 +24,8 @@
   2. 32×32 分块 FP8 的投影在 sm_89 以下也能跑（`xtier/packs/deepseek_v4/w8a16.py`）：保持 SGLang 自己的布局
      （不重排 Marlin、不动检查点），权重按位反量化进复用的 BF16 buffer 再走 cuBLAS；
   3. 记下一条量到的数：超连接的残差流在 40 层里涨到 **284672**（FP16 的上限是 65504），所以模型的 dtype 必须是
-     BF16——卡上没有 BF16 张量核，这部分是速度的主要代价。
+     BF16——卡上没有 BF16 张量核，这部分是速度的主要代价。单次实测（prompt 126 + decode 64）：全程 124 s，
+     decode 0.5 tok/s（SGLang 计数 0.40→0.76），冷 prefill 约 1 tok/s、热 prefill 3.7 tok/s。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读的是**一个**文件（`gguf` 包的 reader 没有分片支持：
   第一个分片里只有 42 个张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片。XTier 现在把分片当一个
   文件读（`xtier/backend/gguf_split.py`），给出该模型的张量名对照（`gguf_names.py`）与权重的反量化

@@ -59,7 +59,7 @@ export XTIER=${XTIER:-1}
 # server reports ready; the loader's own copy of them is skipped)
 export XTIER_FAST_LOAD=${XTIER_FAST_LOAD:-1}
 # The CPU engine: Broadwell (AVX2 only, no AVX-512 BF16), 2 NUMA nodes of 14 cores
-export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-24} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
+export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-36} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
 export XTIER_SPIN_COUNT=${XTIER_SPIN_COUNT:-1048576}
 # The GPU prefill: the tiles fit Turing's 64 KiB of shared memory (the Blackwell hosts run 128 x 64 with 3 stages)
 export XTIER_GPU_PREFILL_CHUNK=${XTIER_GPU_PREFILL_CHUNK:-4096} XTIER_PREFILL_EXPERT_CHUNK=${XTIER_PREFILL_EXPERT_CHUNK:-8}
