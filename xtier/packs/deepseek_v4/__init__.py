@@ -305,6 +305,7 @@ def install(registry, hook_type):
         paged_indexer,
         rope,
         tilelang,
+        w8a16,
         wo_a,
     )
 
@@ -314,6 +315,7 @@ def install(registry, hook_type):
     if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache'):
         kv_fp8.install()
         fp4_rope.install(registry, hook_type)
+        w8a16.install(registry, hook_type)
     if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1'):
         attention.install(registry, hook_type)
     dtypes.install(registry, hook_type)

@@ -16,6 +16,15 @@
   内存与 GPU 槽里都没有的专家由冷池从傲腾盘读（每步约 1 个）；另外把分块 prefill 的块从 1024 改成 256（便携注意力
   一次 gather 1.75 GiB，卡上只剩 1.25 GiB），GSQ 冷池也补上了统计日志（`XTIER_COLD_LOG`）。
   详见[文档](sm75.md)。
+- 2026-11-02：Turing（sm_75）照搬别人提交的 **Ampere（RTX 30/40）适配**的做法：**不改检查点的存储格式，用软件适配**——
+  权重反量化到显卡能算的格式再算。落地了三件事：
+  1. E2M1/E4M3 的软硬件转换都齐了（`xtier/backend/fp4.py`）：E2M1 解码、E4M3 解码与编码，位级等于硬件指令
+     （`tests/fp4_decode_check.py`、`tests/fp8_decode_check.py`、`tests/fp8_encode_check.py`），
+     `XTIER_FP4_DECODE` / `XTIER_FP8_DECODE` 选路径，可在同一张卡上对拍；
+  2. 32×32 分块 FP8 的投影在 sm_89 以下也能跑（`xtier/packs/deepseek_v4/w8a16.py`）：保持 SGLang 自己的布局
+     （不重排 Marlin、不动检查点），权重按位反量化进复用的 BF16 buffer 再走 cuBLAS；
+  3. 记下一条量到的数：超连接的残差流在 40 层里涨到 **284672**（FP16 的上限是 65504），所以模型的 dtype 必须是
+     BF16——卡上没有 BF16 张量核，这部分是速度的主要代价。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读的是**一个**文件（`gguf` 包的 reader 没有分片支持：
   第一个分片里只有 42 个张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片。XTier 现在把分片当一个
   文件读（`xtier/backend/gguf_split.py`），给出该模型的张量名对照（`gguf_names.py`）与权重的反量化

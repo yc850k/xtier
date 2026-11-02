@@ -104,8 +104,23 @@ def has_tf32() -> bool:
     return at_least(*SM80)
 
 
+def _decode_mode(variable: str) -> str:
+    """XTIER_FP8_DECODE / XTIER_FP4_DECODE: hw (the hardware conversion), soft (the bit math) or auto (the card's)."""
+    mode = os.environ.get(variable, 'auto').strip().lower()
+    if mode not in ('hw', 'soft', 'auto'):
+        raise ValueError(f'xtier: {variable}={mode!r} is not hw, soft or auto')
+    return mode
+
+
 def has_fp8() -> bool:
-    """FP8 tensor cores (sm_89)."""
+    """FP8 tensor cores (sm_89): the E4M3 conversions the kernels do.
+
+    ``XTIER_FP8_DECODE=soft`` forces the software conversion (the bit math of ``xtier.backend.fp4``) on a card that
+    has the hardware one, so the two paths can be compared on the same GPU.
+    """
+    mode = _decode_mode('XTIER_FP8_DECODE')
+    if mode != 'auto':
+        return mode == 'hw'
     return at_least(*SM89)
 
 
@@ -121,7 +136,13 @@ def has_fp4() -> bool:
 
 def has_fp4_convert() -> bool:
     """The FP4 conversion instruction (cvt.rn.f16x2.e2m1x2, sm_100): the cache's decode kernels use it to convert
-    two E2M1 values at a time; below it the software decode is used."""
+    two E2M1 values at a time; below it the software decode is used.
+
+    ``XTIER_FP4_DECODE=soft`` forces the software decode on a card that has the instruction.
+    """
+    mode = _decode_mode('XTIER_FP4_DECODE')
+    if mode != 'auto':
+        return mode == 'hw'
     return at_least(*SM100)
 
 

@@ -41,3 +41,30 @@ def e4m3_f32(code, HW: tl.constexpr = True):
 def ue8m0_f32(code):
     """The UE8M0 block scales as FP32: the exponent in the byte (2^(e-127); the byte 0 is 2^-127)."""
     return tl.where(code == 0, 2.0 ** -127, (code.to(tl.uint32) << 23).to(tl.float32, bitcast=True))
+
+
+@triton.jit
+def e4m3_bits(x, HW: tl.constexpr = True):
+    """FP32 -> the E4M3 byte, as ``cvt.rn.satfinite.e4m3x2.f32`` gives it: round to nearest even, saturating to
+    +-448, NaN to 0x7F with its sign. From 2^-6 up the FP32 bits are rounded at mantissa bit 20 (a carry moves into
+    the exponent); below, the value is |x| * 2^9 subnormal steps rounded to the nearest even (8 steps are the
+    smallest normal, the code 0x08).
+
+    The hardware cast needs sm_89 (Triton has no float8e4nv below it), so the software path is the one a Turing card
+    takes when a kernel stores FP8 (the KV cache's e4m3 bytes).
+    """
+    if HW:
+        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    bits = x.to(tl.int32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    a = bits & 0x7FFFFFFF
+    r = a + 0x7FFFF + ((a >> 20) & 1)
+    normal = (((r >> 23) - 120) << 3) | ((r >> 20) & 7)
+    t = a.to(tl.float32, bitcast=True) * 512.0
+    lo = tl.floor(t)
+    steps = lo.to(tl.int32)
+    half = t - lo
+    steps += ((half > 0.5) | ((half == 0.5) & ((steps & 1) == 1))).to(tl.int32)
+    code = tl.where(a < 0x3C800000, steps, tl.minimum(normal, 0x7E))
+    code = tl.where(a > 0x7F800000, 0x7F, code)
+    return (code | sign).to(tl.uint8)

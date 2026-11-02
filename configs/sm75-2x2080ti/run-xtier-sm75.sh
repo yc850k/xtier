@@ -8,8 +8,12 @@
 # (XTIER_GSQ_PACK), which the CPU engine reads (the load log names the layers it took).
 #
 # What sm_75 means here (docs/sm75.md):
-# - no BF16 tensor cores: the model keeps the checkpoint's BF16 (the hyper-connection's residual stream needs BF16's
-#   range: it overflows FP16 at layer 23), so the GPU kernels emulate BF16; the CPU engine's contract is BF16 too;
+# - no BF16 tensor cores: the model keeps the checkpoint's BF16, the format its kernels were written for. The
+#   hyper-connection's residual stream needs BF16's range (it reaches 284672 over the 40 layers, past FP16's 65504),
+#   so the card's BF16 dots are emulated. The checkpoint's *weights* are dequantized into what the card computes:
+#   the GGUF's IQ blocks at load time, the FP8 and FP4 ones in the kernels, with bit math (the same numbers as the
+#   hardware conversions). The CPU engine keeps its BF16 contract (the activations are converted when they are
+#   staged for it);
 # - no FP8 and no FP4 tensor cores: the packs' FP8 features are off and the packed FP4 experts are decoded in
 #   software (the E2M1 values, the same numbers as the hardware conversion);
 # - no TMA: the Qwen hyper-connection mix overlap stays off;
