@@ -125,7 +125,7 @@ def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT,
         tl.store(SROUTE + j, tl.load(ROUTE + j, mk), mk)
         # used slots -> compact ranks (static shapes): SLOT_LIST[rank] = slot, RSLOT[route] = rank or -1
         s = tl.arange(0, SP)
-        tl.store(USED + s, 0, mask=s < S)
+        tl.store(USED + s, 0, mask=s < (SU if SU > 0 else S))
         tl.store(SLOT_LIST + j, -1)  # j covers all MAX_ROUTES (=128) entries
         tl.debug_barrier()
         tl.store(USED + slot, 1, mask=mk & (slot >= 0))
