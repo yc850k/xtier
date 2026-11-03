@@ -176,12 +176,14 @@ class GsqPool:
         sx, sids, sroute, sorig = staging
         sc = self.scratch
         nk = m * k
-        if torch.cuda.is_current_stream_capturing():
-            _glob['captured'] = True   # the adaptive policy starts only after the decode graphs exist
+        # the adaptive policy starts once the decode is running outside a capture: this path has no CUDA graphs
+        # (the launcher turns them off on this card), so the swaps can start with the first decode call
+        _glob['captured'] = True
         _calls[0] += 1
-        if _calls[0] % 2048 == 1:
-            logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d)',
-                        self.layer_id, int((self.table >= 0).sum()), self.E, _calls[0])
+        if _calls[0] % 16 == 1:
+            logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d, the table %s)',
+                        self.layer_id, int((self.table >= 0).sum()), self.E, _calls[0],
+                        self.table[self.table >= 0][:6].tolist())
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
