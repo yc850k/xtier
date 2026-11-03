@@ -352,9 +352,9 @@ def pin_slots(pool, plan, count):
 
     count: the engine's RAM slots of this layer (the cold pool's resident experts).
     """
-    if os.environ.get('XTIER_GSQ_PIN', '0') == '0':
+    if os.environ.get('XTIER_GSQ_PIN', '1') == '0':
         return 0
-    cap = int(float(os.environ.get('XTIER_GSQ_PIN_GIB', '4')) * 2 ** 30)
+    cap = int(float(os.environ.get('XTIER_GSQ_PIN_GIB', '64')) * 2 ** 30)
     cudart = _runtime()
     cudart.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
     cudart.cudaHostRegister.restype = C.c_int
@@ -431,7 +431,8 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     _t_stage = time.perf_counter()
     if want.numel() and upload_slots > 0:
         arena = _scratch_arena(pool, upload_slots)
-        experts = want[:min(int(want.numel()), upload_slots)].tolist() if arena is not None else []
+        # the arena may have shrunk (the card had no room): only the experts that fit in it are uploaded
+        experts = want[:min(int(want.numel()), upload_slots, arena.shape[0] if arena is not None else 0)].tolist()
         _t_up = time.perf_counter()
         if arena is not None:
             _upload(pool, plan, experts, arena, torch.cuda.current_stream())

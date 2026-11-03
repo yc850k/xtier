@@ -99,7 +99,7 @@ export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-10} XTIER_CACHE_SWAPS=${XTIER_CACH
 # The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 128 slots are 1 GB.
 # The card's VRAM after the weights (12.9 GB) and the KV cache (2.7 GB at the minimum mem-fraction) is about 5 GB:
 # 10 hot slots a layer (3.1 GB) and the scratch (1 GB) fit in it, the rest is the CUDA context.
-export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-128}
+export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-64}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
 # RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,
