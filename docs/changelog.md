@@ -26,7 +26,9 @@
      （`fp8_encode_check`、`ds_fp8_soft_check`、`qsa_fp8_check`）改成跟卡上有的参考比（torch 的 e4m3fn、池子自己的字节、
      SGLang 的 torch 路径）；
   6. **两张卡**：TP=2（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎，`tools/cpu_budget.py --tp 2` 分线程），
-     `XTIER_COLD_FRACTION=0.8`（两个 rank 的冷池各留 76/384 个专家在内存里，0.3 的话要 195 GB，cgroup 会卡住加载）。
+     `XTIER_COLD_FRACTION=0.8`（两个 rank 的冷池各留 77/384 个专家在内存里，0.3 的话要 195 GB，cgroup 会卡住加载）。
+     实测：两张卡都用满（各 20.9/22.5 GB），加载约 3 分钟（权重 167 s），一次请求（81 token 提示、64 token 输出）
+     冷 198.7 s、热 187.1 s，答案正确（prefill 0.4-1.35 tok/s、decode 0.24-0.44 tok/s，SGLang 的计数）。
   详见[文档](sm75.md)。
 - 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN。
   实测速度：prefill 约 3.7 tok/s、decode 约 0.8 tok/s（SGLang 自己的计数），瓶颈是 BF16 的点积由软件模拟、MoE 在

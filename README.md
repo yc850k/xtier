@@ -266,7 +266,8 @@ decode 约慢 10%），主要受限于硬盘速度。
 超连接的残差流留在 **FP32**（它 40 层涨到 284672，超过 FP16 的 65504）；TF32 也没有，下投影用 16 位点积；热专家缓存的
 FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB 共享内存缩小。
 注意力走 Triton 的稀疏 MLA（上游为 sm_90 以下做的那个，Turing 上把 tile 再缩小）。CPU 引擎不变。
-2× RTX 2080 Ti 上按 TP=2 跑（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎），DeepSeek V4.1 Flash 能出答案。
+2× RTX 2080 Ti 上按 TP=2 跑（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎）：两张卡都用满（各 20.9/22.5 GB），
+DeepSeek V4.1 Flash 能出答案（一次请求 81 token 提示 + 64 token 输出：冷 198.7 s、热 187.1 s，答案正确）。
 详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
 
 ## 版本更新

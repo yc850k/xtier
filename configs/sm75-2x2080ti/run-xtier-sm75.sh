@@ -92,8 +92,13 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 # An 11 GB card holds few hot experts: a few slots per layer instead of the 155 of the RTX PRO 5000
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-8} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
-# checkpoint's own files are the store, read with O_DIRECT)
-export XTIER_COLD=${XTIER_COLD:-1} XTIER_COLD_FRACTION=${XTIER_COLD_FRACTION:-0.3} XTIER_COLD_THREADS=${XTIER_COLD_THREADS:-8}
+# checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
+# RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,
+# 27.7 GB a rank), 0.3 would ask for 195 GB and the cgroup would throttle the load (it never finishes).
+export XTIER_COLD=${XTIER_COLD:-1} XTIER_COLD_THREADS=${XTIER_COLD_THREADS:-8}
+if [ -z "${XTIER_COLD_FRACTION:-}" ]; then
+  if [ "$TP" -gt 1 ]; then export XTIER_COLD_FRACTION=0.8; else export XTIER_COLD_FRACTION=0.3; fi
+fi
 exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NAME:-$(basename $M)} \
   --host 127.0.0.1 --port $PORT --tp-size $TP --trust-remote-code --skip-server-warmup \
   --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
