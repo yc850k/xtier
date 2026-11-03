@@ -168,8 +168,6 @@ struct PoolLayer {
     bool gsq=false;                       // the layer's experts are the GSQ ones (the IQ blocks)
     char *gsq_arena=nullptr;             // device: the slots
     size_t gsq_stride=0;                  // the bytes of a slot
-    const char *gsq_src[3]{};             // host: the engine's RAM slots, per role (the region's base)
-    size_t gsq_src_stride[3]{};           // the distance between two slots' regions
     std::vector<int32_t> gsq_off;        // per expert and role: the tensor's offset in its slot
     std::vector<size_t> gsq_size;        // per expert and role: the tensor's bytes
     std::vector<int> resident;        // slot -> expert (-1 empty), as decided (copies may be in flight)
@@ -248,9 +246,15 @@ public:
     // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts)
     void upload(PoolLayer &L,int ram,int slot,int expert,char *const *arena,cudaStream_t stream) {
         if(L.gsq&&expert>=0) {   // the GSQ path: the expert's three tensors (the gate, the up and the down) as the checkpoint has them
+            // The source is the engine's RAM slot (the cold pool's): its three regions hold the expert's tensors, each
+            // at the region's start. The slots are separate allocations, so the slot's own pointers are needed (the
+            // first slot's plus a stride would read outside them).
+            void *ptr[3];size_t bytes[3];
+            if(xtier_gsq_slot_pieces(L.bridge->plan,ram,ptr,bytes)<0)
+                throw std::runtime_error("The GSQ pool's RAM slot is gone");
             for(int r=0;r<3;r++) {
                 char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
-                const char *src=L.gsq_src[r]+size_t(ram)*L.gsq_src_stride[r];
+                const char *src=static_cast<const char*>(ptr[r]);
                 check(cudaMemcpyAsync(dst,src,L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,stream));
             }
             return;
@@ -1002,10 +1006,9 @@ int xtier_mailbox_pool_attach_gsq(void *bridge,int layer,int slots,int active,in
         L->gsq=true;L->gsq_arena=static_cast<char*>(arena);L->gsq_stride=stride;
         L->gsq_off.assign(offsets,offsets+size_t(experts)*3);
         L->gsq_size.assign(sizes,sizes+size_t(experts)*3);
-        // the engine's RAM slots: the three regions (the gate, the up and the down) and the distance between slots
+        // the engine's RAM slots: the copies read them (the expert's three tensors) when they land
         void *ptr[3];size_t bytes[3];
         if(xtier_gsq_slot_pieces(b->plan,0,ptr,bytes)<0)throw std::runtime_error(xtier_last_error());
-        for(int r=0;r<3;r++){L->gsq_src[r]=static_cast<const char*>(ptr[r]);L->gsq_src_stride[r]=bytes[r];}
         L->resident.assign(resident,resident+slots);L->slot_of.assign(experts,-1);L->busy.assign(slots,0);
         L->usage.assign(experts,0.f);
         for(int s=0;s<slots;s++)if(L->resident[s]>=0&&L->resident[s]<experts)L->slot_of[L->resident[s]]=s;
