@@ -19,7 +19,7 @@ from xtier.console.core import common_options, miss_env, miss_option
 
 HERE = Path(__file__).resolve().parent
 CHECKPOINT = os.environ.get('MODEL', '/home/userroot/work/model/ds41-gguf')
-NAME = os.environ.get('XTIER_SM75_NAME', 'DeepSeek V4.1 Flash 1017 · GGUF')
+NAME = os.environ.get('CONSOLE_NAME', 'DeepSeek V4.1 Flash 1017 · GGUF')
 
 MODEL = {
     'id': 'sm75', 'order': 90,
