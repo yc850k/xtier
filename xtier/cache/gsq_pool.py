@@ -178,6 +178,10 @@ class GsqPool:
         nk = m * k
         if torch.cuda.is_current_stream_capturing():
             _glob['captured'] = True   # the adaptive policy starts only after the decode graphs exist
+        _calls[0] += 1
+        if _calls[0] % 2048 == 1:
+            logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d)',
+                        self.layer_id, int((self.table >= 0).sum()), self.E, _calls[0])
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
@@ -283,6 +287,7 @@ class GsqPool:
                                                    m * self.H, BLOCK)
 
 
+_calls = [0]             # the decode calls (the residency log)
 _scratch_arenas = {}      # (device, stride) -> the arena the prefills upload the experts into
 _pinned = {}              # (device, size) -> the pinned buffer the upload stages the bytes in
 
