@@ -93,7 +93,7 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 # A GSQ expert is ~10 MB of IQ bytes, so a slot per layer costs 10 MB x the layers: 12 slots a layer are 4.8 GB.
 # The dense weights alone take 73% of a card (16.4 GB), so the KV cache (the context here is a few hundred tokens)
 # and the hot experts share what is left.
-export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-10} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
+export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-14} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
 # The batched prefill uploads the experts the batch routes to (the ones that are not in the VRAM) over PCIe and
 # decodes them on the GPU: the scratch arena they go into (shared by the layers) is this many slots.
 # The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 128 slots are 1 GB.
