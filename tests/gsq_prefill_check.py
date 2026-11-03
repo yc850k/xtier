@@ -132,9 +132,29 @@ check(n == len(CACHED), f'the pool uploaded the hot experts ({n} experts, {pool.
 xd = torch.from_numpy(x).to(DTYPE).cuda()
 ids_d = torch.from_numpy(ids).int().cuda()
 rw_d = torch.from_numpy(rw).float().cuda()
-got = prefill(pool, plan, xd, ids_d, rw_d)
+
+
+class CountingPlan:
+    """The engine's plan, counting the calls and keeping the output pointer (the engine's part must be empty)."""
+
+    def __init__(self, plan):
+        self.plan, self.calls, self.out = plan, 0, None
+
+    def forward(self, n, k, x, ids, w, out):
+        self.calls += 1
+        self.out = out
+        return self.plan.forward(n, k, x, ids, w, out)
+
+
+counting = CountingPlan(plan)
+got = prefill(pool, counting, xd, ids_d, rw_d)
 torch.cuda.synchronize()
 got = got.cpu().numpy()
+# the engine's part: every route was computed on the GPU (the hot experts from the VRAM, the others uploaded), so
+# the engine's output buffer is untouched
+engine_out = np.frombuffer((C.c_float * (M * H)).from_address(counting.out), dtype=np.float32)
+check(counting.calls == 1 and not engine_out.any(),
+      f'the engine computed nothing (its {counting.calls} call wrote no value): the GPU did the whole prefill')
 
 errs = [rel(got[t], ref[t]) for t in range(M)]
 print('xtier: the batched prefill against the engine: the relative L2 ' +

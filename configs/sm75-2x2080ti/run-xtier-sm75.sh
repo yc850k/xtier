@@ -94,6 +94,9 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 # The dense weights alone take 73% of a card (16.4 GB), so the KV cache (the context here is a few hundred tokens)
 # and the hot experts share what is left.
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-12} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
+# The batched prefill uploads the experts the batch routes to (the ones that are not in the VRAM) over PCIe and
+# decodes them on the GPU: the scratch arena they go into (shared by the layers) is this many slots.
+export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-64}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
 # RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,
@@ -106,7 +109,7 @@ exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NA
   --host 127.0.0.1 --port $PORT --tp-size $TP --trust-remote-code --skip-server-warmup \
   --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
   --quantization gguf --load-format gguf \
-  --mem-fraction-static ${XTIER_MEM_FRACTION:-0.76} \
+  --mem-fraction-static ${XTIER_MEM_FRACTION:-0.74} \
   --kv-cache-dtype fp8_e4m3 \
   --chunked-prefill-size ${XTIER_CHUNKED_PREFILL:-256} \
   --disable-cuda-graph \

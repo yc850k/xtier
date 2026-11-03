@@ -241,19 +241,93 @@ class GsqPool:
                                                    m * self.H, BLOCK)
 
 
+_scratch_arenas = {}      # (device, stride) -> the arena the prefills upload the experts into
+_pinned = {}              # (device, size) -> the pinned buffer the upload stages the bytes in
+
+
+def _scratch_arena(pool, slots):
+    """The arena a prefill uploads the routed experts into (shared by the layers: they take turns with it).
+
+    A layer's experts are ~10 MB of IQ bytes, so the arena is small (the slots of the deepest layer's stride).
+    """
+    key = (pool.arena.device, pool.slot_bytes)
+    arena = _scratch_arenas.get(key)
+    if arena is None:
+        arena = _scratch_arenas[key] = torch.empty((slots, pool.slot_bytes), dtype=torch.uint8,
+                                                    device=pool.arena.device)
+    return arena
+
+
+def _upload(pool, plan, experts, arena, stream):
+    """The experts' bytes into the scratch arena over PCIe: the engine's RAM slot when the expert is there (the
+    cold pool's RAM is fast), else the checkpoint's files (the pack's mapping).
+
+    This is the batched prefill's trade: the bytes of every expert the batch routes to are moved once and decoded on
+    the GPU, instead of being read and decoded by the CPU engine. The cost is the transfer (PCIe), the gain is the
+    GPU's decode (about a thousand times faster than the engine's).
+
+    The bytes are staged in pinned memory first: a copy from a mapped file (the pack's mapping) is a pageable one,
+    and the driver stages those in small chunks (about a tenth of the bandwidth).
+    """
+    cudart = _runtime()
+    cudart.cudaMemcpyAsync.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int, C.c_void_p]
+    cudart.cudaMemcpyAsync.restype = C.c_int
+    lib = getattr(plan, 'lib', None)
+    handle = getattr(plan, 'plan', None)
+    with torch.cuda.stream(stream):
+        for j, e in enumerate(experts):
+            e = int(e)
+            # the expert's bytes: the engine's RAM slot when it is there (the cold pool's RAM is fast), else the
+            # checkpoint's files (the pack's mapping)
+            ram = lib.xtier_slot_pin(handle, e) if lib is not None and handle is not None \
+                and hasattr(lib, 'xtier_slot_pin') else -1
+            sources = None
+            if ram >= 0:
+                ptrs = (C.c_void_p * 3)()
+                sizes = (C.c_size_t * 3)()
+                if lib.xtier_gsq_slot_pieces(handle, ram, C.cast(ptrs, C.c_void_p),
+                                             C.cast(sizes, C.c_void_p)) == 0:
+                    sources = [(ptrs[r], int(sizes[r])) for r in range(3)]
+            try:
+                for role, off, want in zip(ROLES, pool.offsets[e], pool.sizes[e]):
+                    if sources is not None:
+                        address, size = sources[ROLES.index(role)]
+                    else:
+                        address, size, _ = pool.pack.expert_bytes(role, pool.layer_id, e)
+                    if size != want:
+                        raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes of '
+                                         f'{role}, the layout says {want}')
+                    key = (pool.arena.device, size)
+                    staged = _pinned.get(key)
+                    if staged is None:
+                        staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+                    C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
+                    dst = arena.data_ptr() + j * pool.slot_bytes + off
+                    _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()), C.c_size_t(size), 1,
+                                                 C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
+                    stream.synchronize()   # the next expert stages over the same buffer
+            finally:
+                if ram >= 0:
+                    lib.xtier_slot_unpin(handle, ram)
+
+
 def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
-    """The prefill of a partly cached layer: the routes to the cached experts on the GPU (their IQ blocks decoded in
-    the tile kernels), the others at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
+    """The prefill of a partly cached layer: the routes the GPU computes (the IQ blocks decoded in the tile kernels),
+    the rest at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
 
     x: the activations [m, H] in the model's dtype, ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current
     stream) -> FP32 [m, H]. The residency is read once at the start (the swaps are applied by the decode windows,
     which do not run meanwhile).
 
-    The batched prefill is where the hot experts pay off: their bytes are in the VRAM (the upload happened once, at
-    the load), so the GPU decodes them for every route of the batch and the CPU engine only sees the routes of the
-    experts that are not cached.
+    Where the GPU's part comes from: the hot experts are in the VRAM (their bytes were uploaded once, at the load),
+    and the experts the batch routes to that are not in the VRAM are **uploaded over PCIe** (the checkpoint's files
+    into the scratch arena) and decoded here. That is the trade of a batched prefill: the bytes move once and the
+    GPU decodes them (about a thousand times faster than the engine), so the CPU engine only sees the routes of the
+    experts that did not fit in the scratch (XTIER_GSQ_PREFILL_UPLOAD slots).
     """
     import threading
+    import time
+    import time as _time
 
     H, I, E = pool.H, pool.I, pool.E
     m, k = ids.shape
@@ -262,13 +336,32 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     if pool.tables is None:
         pool.tables = tables(torch.device('cuda', torch.cuda.current_device()))
     t = pool.tables
-    # the routes of the cached experts (the slot of the expert, -1 if it is not in the VRAM)
     di = ids.reshape(-1)
-    on_gpu = pool.table[di] >= 0
+    counts_all = torch.bincount(di, minlength=E)
     order = torch.argsort(di, stable=True)          # the routes sorted by the expert
-    gpu_order = order[on_gpu[order]]                 # the cached experts' routes, in that order
-    n_gpu = int(gpu_order.numel())
-    # the CPU part: the routes of the experts that are not in the VRAM (the engine skips the others, the id -1)
+    hot_expert = pool.table >= 0                    # the experts in the VRAM
+    hot = hot_expert[di]
+    # the experts the batch routes to that are not in the VRAM: they are uploaded and computed on the GPU
+    want = ((counts_all > 0) & ~hot_expert).nonzero().flatten()
+    upload_slots = int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '32'))
+    arena, experts, uploaded = None, [], torch.zeros(E, dtype=torch.bool, device=di.device)
+    upload_ms = 0.0
+    _t_stage = time.perf_counter()
+    if want.numel() and upload_slots > 0:
+        arena = _scratch_arena(pool, upload_slots)
+        experts = want[:min(int(want.numel()), upload_slots)].tolist()
+        _t_up = time.perf_counter()
+        _upload(pool, plan, experts, arena, torch.cuda.current_stream())
+        upload_ms = (time.perf_counter() - _t_up) * 1e3
+        uploaded[want[:len(experts)]] = True
+    stage_ms = (time.perf_counter() - _t_stage) * 1e3
+    on_gpu = hot | uploaded[di]                     # the routes the GPU computes
+    # the routes of each part, in the expert order (the tiles cut them per expert)
+    hot_routes = order[hot[order]]
+    up_routes = order[uploaded[di[order]]]
+    n_gpu = int(hot_routes.numel()) + int(up_routes.numel())
+    # the CPU part: the routes of the experts that are neither in the VRAM nor uploaded (the engine skips the
+    # others, the id -1)
     x_h = torch.empty((m, H), dtype=torch.bfloat16, pin_memory=True)
     ids_h = torch.empty((m, k), dtype=torch.int32, pin_memory=True)
     w_h = torch.empty((m, k), dtype=torch.float32, pin_memory=True)
@@ -289,38 +382,49 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
             errors.append(e)
         cpu_done.append(_time.perf_counter())
 
-    import time as _time
     worker = threading.Thread(target=cpu_part, name='xtier-gsq-prefill')
     worker.start()
     _t0 = _time.perf_counter()
+    _t_pre = _time.perf_counter()
     try:
         out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
         if n_gpu:
-            # the tiles of the cached experts: the routes of one expert, BM at a time
+            # the tiles of one expert's routes, BM at a time
             bm = int(os.environ.get('XTIER_GSQ_PREFILL_TILE_M', '32'))
             bn = int(os.environ.get('XTIER_GSQ_PREFILL_TILE_N', '16'))
-            counts = torch.bincount(di[on_gpu], minlength=E).cpu().tolist()
-            slots = pool.table.cpu().tolist()
-            tiles, offset = [], 0
-            for e in range(E):
-                c = counts[e]
-                if not c or slots[e] < 0:
-                    continue
-                for q in range(0, c, bm):
-                    tiles.append((e, slots[e], offset + q, offset + c))
-                offset += c
-            meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-            mid = torch.empty((n_gpu, I), dtype=pool.dtype, device=x.device)
+            counts = counts_all.cpu().tolist()
+            hot_slots = pool.table.cpu().tolist()
+            scratch_slots = [-1] * E
+            for j, e in enumerate(experts):
+                scratch_slots[e] = j
             routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)
-            nt = len(tiles)
-            gate_up_tiles[(nt, I // bn)](
-                x, gpu_order, meta[0], meta[1], meta[2], meta[3], pool.arena, pool.arena16, pool.types, pool.offs,
-                mid, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
-                bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
-            down_tiles[(nt, H // bn)](
-                mid, gpu_order, meta[0], meta[1], meta[2], meta[3], pool.arena, pool.arena16, pool.types, pool.offs,
-                routes, H, I, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
-                bm, bn, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
+            for part, order_part, slot_of, arena_part in (
+                    ('hot', hot_routes, hot_slots, pool.arena),
+                    ('uploaded', up_routes, scratch_slots, arena)):
+                if order_part.numel() == 0:
+                    continue
+                tiles, offset = [], 0
+                for e in range(E):
+                    c = counts[e]
+                    if not c or slot_of[e] < 0:
+                        continue
+                    for q in range(0, c, bm):
+                        tiles.append((e, slot_of[e], offset + q, offset + c))
+                    offset += c
+                if not tiles:
+                    continue
+                meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
+                mid = torch.empty((int(order_part.numel()), I), dtype=pool.dtype, device=x.device)
+                nt = len(tiles)
+                gate_up_tiles[(nt, I // bn)](
+                    x, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
+                    pool.types, pool.offs, mid, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
+                    t['iq2xxs'], t['ksigns'], bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype),
+                    num_warps=4, num_stages=2)
+                down_tiles[(nt, H // bn)](
+                    mid, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
+                    pool.types, pool.offs, routes, H, I, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
+                    t['ksigns'], bm, bn, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
             # the per-token sum of the GPU's routes (the CPU's routes have no partial)
             w_gpu = torch.where(on_gpu.reshape(m, k), weights, 0.0).reshape(-1)
             _reduce[(m, triton.cdiv(H, 256))](routes, w_gpu, out_g, k, 256, H)
@@ -328,10 +432,10 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
         worker.join()
     if os.environ.get('XTIER_TIMING', '0') == '1':
-        logger.info('xtier: the GSQ prefill of layer %d: %d tokens, %d of %d routes on the GPU (%d experts in the '
-                    'VRAM, %d of the %d the routes hit): the GPU part %.1f ms, the CPU part %.1f ms', pool.layer_id, m,
-                    n_gpu, m * k, int((pool.table >= 0).sum()), int(torch.unique(di).numel()), E,
-                    (_t_gpu - _t0) * 1e3, ((cpu_done[0] - _t0) * 1e3 if cpu_done else 0.0))
+        logger.info('xtier: the GSQ prefill of layer %d: %d tokens, %d of %d routes on the GPU (%d in the VRAM, %d '
+                    'uploaded): the GPU part %.1f ms, the CPU part %.1f ms, the upload %.1f ms, the staging %.1f ms',
+                    pool.layer_id, m, n_gpu, m * k, int(hot_expert.sum()), len(experts), (_t_gpu - _t0) * 1e3,
+                    ((cpu_done[0] - _t0) * 1e3 if cpu_done else 0.0), upload_ms, stage_ms)
     if errors:
         raise errors[0]
     return out_g + out_h.to(x.device, non_blocking=True)
