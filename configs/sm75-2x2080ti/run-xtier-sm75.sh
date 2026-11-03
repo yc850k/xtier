@@ -96,7 +96,9 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-12} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
 # The batched prefill uploads the experts the batch routes to (the ones that are not in the VRAM) over PCIe and
 # decodes them on the GPU: the scratch arena they go into (shared by the layers) is this many slots.
-export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-64}
+# The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 190 slots are 1.5 GB,
+# the VRAM the card has left after the weights (12.9 GB) and the KV cache (the context here is short).
+export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-190}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
 # RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,

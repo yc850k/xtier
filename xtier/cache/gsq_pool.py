@@ -283,13 +283,16 @@ def _upload(pool, plan, experts, arena, stream):
             ram = lib.xtier_slot_pin(handle, e) if lib is not None and handle is not None \
                 and hasattr(lib, 'xtier_slot_pin') else -1
             sources = None
+            base = None
             if ram >= 0:
                 ptrs = (C.c_void_p * 3)()
                 sizes = (C.c_size_t * 3)()
                 if lib.xtier_gsq_slot_pieces(handle, ram, C.cast(ptrs, C.c_void_p),
                                              C.cast(sizes, C.c_void_p)) == 0:
+                    base = ptrs[0]
                     sources = [(ptrs[r], int(sizes[r])) for r in range(3)]
             try:
+                pinned = base is not None and base in pool.pinned
                 for role, off, want in zip(ROLES, pool.offsets[e], pool.sizes[e]):
                     if sources is not None:
                         address, size = sources[ROLES.index(role)]
@@ -298,14 +301,19 @@ def _upload(pool, plan, experts, arena, stream):
                     if size != want:
                         raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes of '
                                          f'{role}, the layout says {want}')
-                    key = (pool.arena.device, size)
-                    staged = _pinned.get(key)
-                    if staged is None:
-                        staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-                    C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
-                    _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()), C.c_size_t(size), 1,
-                                                 C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
+                    if pinned:
+                        # the RAM slot is registered with CUDA: the driver copies it straight to the card
+                        _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
+                                                     C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
+                    else:
+                        key = (pool.arena.device, size)
+                        staged = _pinned.get(key)
+                        if staged is None:
+                            staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+                        C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
+                        _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()), C.c_size_t(size), 1,
+                                                     C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
                     stream.synchronize()   # the next expert stages over the same buffer
             finally:
                 if ram >= 0:
