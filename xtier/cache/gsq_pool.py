@@ -249,13 +249,25 @@ _pinned = {}              # (device, size) -> the pinned buffer the upload stage
 def _scratch_arena(pool, slots):
     """The arena a prefill uploads the routed experts into (shared by the layers: they take turns with it).
 
-    A layer's experts are ~10 MB of IQ bytes, so the arena is small (the slots of the deepest layer's stride).
+    A layer's experts are ~10 MB of IQ bytes, so the arena is small (the slots of the deepest layer's stride). The
+    card may not have the room: the arena then shrinks (the experts that do not fit are computed by the engine).
     """
     key = (pool.arena.device, pool.slot_bytes)
     arena = _scratch_arenas.get(key)
+    if arena is not None:
+        return arena
+    while slots >= 8:
+        try:
+            arena = torch.empty((slots, pool.slot_bytes), dtype=torch.uint8, device=pool.arena.device)
+            break
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            slots //= 2
     if arena is None:
-        arena = _scratch_arenas[key] = torch.empty((slots, pool.slot_bytes), dtype=torch.uint8,
-                                                    device=pool.arena.device)
+        return None
+    _scratch_arenas[key] = arena
+    logger.info('xtier cache: the scratch arena of the batched prefill: %d experts (%.1f GiB)', slots,
+                arena.numel() / 2 ** 30)
     return arena
 
 
@@ -292,7 +304,6 @@ def _upload(pool, plan, experts, arena, stream):
                     base = ptrs[0]
                     sources = [(ptrs[r], int(sizes[r])) for r in range(3)]
             try:
-                pinned = base is not None and base in pool.pinned
                 for role, off, want in zip(ROLES, pool.offsets[e], pool.sizes[e]):
                     if sources is not None:
                         address, size = sources[ROLES.index(role)]
@@ -302,19 +313,30 @@ def _upload(pool, plan, experts, arena, stream):
                         raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes of '
                                          f'{role}, the layout says {want}')
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
-                    if pinned:
-                        # the RAM slot is registered with CUDA: the driver copies it straight to the card
-                        _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
-                                                     C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
-                    else:
-                        key = (pool.arena.device, size)
-                        staged = _pinned.get(key)
-                        if staged is None:
-                            staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-                        C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
-                        _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()), C.c_size_t(size), 1,
-                                                     C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
-                    stream.synchronize()   # the next expert stages over the same buffer
+                    pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
+                    try:
+                        if pinned:
+                            # the RAM slot is registered with CUDA: the driver copies it straight to the card
+                            rc = cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
+                                                        C.c_void_p(stream.cuda_stream))
+                            if rc != 0:
+                                cudart.cudaGetLastError()   # clear it: the staged copy below may still work
+                                pinned = False
+                        if not pinned:
+                            key = (pool.arena.device, size)
+                            staged = _pinned.get(key)
+                            if staged is None:
+                                staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+                            C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
+                            _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()),
+                                                         C.c_size_t(size), 1,
+                                                         C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
+                        stream.synchronize()   # the next expert stages over the same buffer
+                    except Exception as exc:   # noqa: BLE001  a failed upload must not take the server down
+                        cudart.cudaGetLastError()
+                        logger.warning('xtier cache: the upload of the expert %d of the layer %d failed (%s): the '
+                                       'engine computes its routes', e, pool.layer_id, exc)
+                        failed.add(e)
             finally:
                 if ram >= 0:
                     lib.xtier_slot_unpin(handle, ram)
@@ -330,13 +352,16 @@ def pin_slots(pool, plan, count):
 
     count: the engine's RAM slots of this layer (the cold pool's resident experts).
     """
-    if os.environ.get('XTIER_GSQ_PIN', '1') == '0':
+    if os.environ.get('XTIER_GSQ_PIN', '0') == '0':
         return 0
+    cap = int(float(os.environ.get('XTIER_GSQ_PIN_GIB', '4')) * 2 ** 30)
     cudart = _runtime()
     cudart.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
     cudart.cudaHostRegister.restype = C.c_int
     cudart.cudaHostUnregister.argtypes = [C.c_void_p]
     cudart.cudaHostUnregister.restype = C.c_int
+    cudart.cudaGetLastError.argtypes = []
+    cudart.cudaGetLastError.restype = C.c_int
     lib = plan.lib
     ptrs = (C.c_void_p * 3)()
     sizes = (C.c_size_t * 3)()
@@ -345,12 +370,22 @@ def pin_slots(pool, plan, count):
         if lib.xtier_gsq_slot_pieces(plan.plan, slot, C.cast(ptrs, C.c_void_p), C.cast(sizes, C.c_void_p)) != 0:
             break
         base = ptrs[0]
-        total = int(sizes[0]) + int(sizes[1]) + int(sizes[2])
+        # the slot's three regions are apart (the tensors are 256-byte aligned): the span is from the first to the
+        # last one's end, so that every region is inside the registered range
+        end = max(ptrs[r] + sizes[r] for r in range(3))
+        total = int(end - base)
+        if done + total > cap:
+            logger.info('xtier cache: layer %d: the RAM registration stops here (%.1f GiB: the driver\'s pinned '
+                        'memory is scarce, and the upload copies through its staging buffer)', pool.layer_id,
+                        cap / 2 ** 30)
+            break
         if cudart.cudaHostRegister(C.c_void_p(base), C.c_size_t(total), 0) != 0:
+            # a failed registration leaves a sticky CUDA error: clear it, or every later call fails with it
+            cudart.cudaGetLastError()
             logger.warning('xtier cache: the RAM slots of layer %d could not be registered with CUDA (the upload '
                            'stays pageable)', pool.layer_id)
             break
-        pool.pinned.append(base)
+        pool.pinned.append((int(base), total))
         done += total
     if done:
         logger.info('xtier cache: layer %d: %.1f GiB of the engine\'s RAM registered with CUDA (the GPU reads it '
@@ -396,11 +431,12 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
     _t_stage = time.perf_counter()
     if want.numel() and upload_slots > 0:
         arena = _scratch_arena(pool, upload_slots)
-        experts = want[:min(int(want.numel()), upload_slots)].tolist()
+        experts = want[:min(int(want.numel()), upload_slots)].tolist() if arena is not None else []
         _t_up = time.perf_counter()
-        _upload(pool, plan, experts, arena, torch.cuda.current_stream())
-        upload_ms = (time.perf_counter() - _t_up) * 1e3
-        uploaded[want[:len(experts)]] = True
+        if arena is not None:
+            _upload(pool, plan, experts, arena, torch.cuda.current_stream())
+            upload_ms = (time.perf_counter() - _t_up) * 1e3
+            uploaded[want[:len(experts)]] = True
     stage_ms = (time.perf_counter() - _t_stage) * 1e3
     on_gpu = hot | uploaded[di]                     # the routes the GPU computes
     # the routes of each part, in the expert order (the tiles cut them per expert)
