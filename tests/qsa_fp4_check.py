@@ -22,6 +22,12 @@ HEADS, DIM, ROWS, DEV = 2, 256, 70000, 'cuda'
 torch.manual_seed(20261023)
 one = torch.ones(1, dtype=torch.float32, device=DEV)
 
+if torch.cuda.get_device_capability() < (9, 0):
+    # SGLang's NVFP4 KV quantizer needs the FP4 tensor cores (SM90 and newer)
+    print('SKIP: the NVFP4 KV cache needs SM90 and newer (this card is sm_%d%d)'
+          % torch.cuda.get_device_capability())
+    sys.exit(0)
+
 
 def fp4_pool():
     """Packed K / V of ROWS tokens (per-token magnitudes spread over 3 decades) and their SGLang dequantization."""

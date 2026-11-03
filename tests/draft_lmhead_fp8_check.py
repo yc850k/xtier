@@ -34,6 +34,11 @@ def bf16(hidden, lm_head):
 
 
 head = Head()
+if torch.cuda.get_device_capability() < (8, 9):
+    # the FP8 draft head is torch._scaled_mm, which needs the FP8 tensor cores (SM89 and newer)
+    print('SKIP: the FP8 draft head needs SM89 and newer (this card is sm_%d%d)'
+          % torch.cuda.get_device_capability())
+    sys.exit(0)
 _quantize_lm_head(head)
 ok = True
 for rows in (1, 5, 10, 64):

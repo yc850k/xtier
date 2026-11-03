@@ -64,10 +64,15 @@ register('json.dumps', 'xtier')
 check('a hook that applies', stops(original) is None)
 register('sglang.no_such_module.no_such_function', 'someone_else')
 check('another plugin\'s hook fails: not stopped', stops(original) is None)
+# a target this SGLang does not have: the hook has nothing to patch, so the server goes on (the version warning says
+# so); a target that exists but did not take the hook stops the server
 register('sglang.no_such_module.other_function', 'xtier')
 message = stops(original)
-check('a hook of XTier fails: the server stops', bool(message) and 'other_function' in message, str(message))
-for target in ('sglang.no_such_module.no_such_function', 'sglang.no_such_module.other_function'):
+check('a hook of XTier on a target this SGLang lacks: not stopped', message is None, str(message))
+register('builtins.dict.fromkeys', 'xtier')   # a built-in type: the patch cannot be applied
+message = stops(original)
+check('a hook of XTier that does not apply: the server stops', bool(message) and 'fromkeys' in message, str(message))
+for target in ('sglang.no_such_module.no_such_function', 'sglang.no_such_module.other_function', 'builtins.dict.fromkeys'):
     registry._hooks.pop(target, None)
 
 unknown = 'XTIER' + '_NO_SUCH_SETTING'   # not spelled out: tools/repo_check.py lists the names the sources mention
@@ -80,7 +85,7 @@ check('an unknown setting is named, a known one not', unknown in err.getvalue() 
 
 from xtier.backend.method import XTierMoEMethod  # noqa: E402
 
-stub = SimpleNamespace(plan=None, cfg=SimpleNamespace(layer_id=7), _missing={'w13_weight': 3, 'w2_weight': 0})
+stub = SimpleNamespace(plan=None, cfg=SimpleNamespace(layer_id=7), _missing={'w13_weight': 3, 'w2_weight': 0}, gsq=False)
 try:
     XTierMoEMethod.process_weights_after_loading(stub, None)
     message = None

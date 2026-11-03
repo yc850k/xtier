@@ -29,8 +29,6 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
-from xtier import arch
-
 logger = logging.getLogger(__name__)
 
 
@@ -124,7 +122,7 @@ def dequantize_k_cache_paged_v41(
     if out is None:
         out = torch.empty(
             (num_tokens, 1, layout.data_bytes),
-            dtype=arch.dtype(),
+            dtype=torch.bfloat16,   # the contract (SGLang's workspace is BF16); a caller passes its own buffer
             device=quant_k_cache.device,
         )
     else:
@@ -223,7 +221,7 @@ def dequantize_k_cache_paged(
     if out is None:
         out = torch.empty(
             (num_tokens, 1, DIM_NOPE + DIM_ROPE),
-            dtype=arch.dtype(),
+            dtype=torch.bfloat16,   # the contract (SGLang's workspace is BF16); a caller passes its own buffer
             device=quant_k_cache.device,
         )
     else:

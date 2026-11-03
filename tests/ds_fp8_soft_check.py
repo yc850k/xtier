@@ -32,13 +32,41 @@ def fake_quant(out, rebuilt):
     torch.save({k: v.cpu() for k, v in result.items()}, out)
 
 
+def reference_gather(w, s, ids, dim, block, lo, hi):
+    """The pool's own values (read in torch): what the software gather must write. Only on a card where SGLang's
+    own kernel cannot run (no float8e4nv in Triton), the pool is the reference."""
+    idx = ids.long()
+    owned = (idx >= lo) & (idx < hi)
+    local = torch.where(owned, idx - lo, 0)
+    vals = w[local].view(torch.float8_e4m3fn).float()
+    e = s[local].to(torch.int32)
+    scale = torch.where(e == 0, 2.0 ** -127, (e << 23).view(torch.float32)).repeat_interleave(block, dim=1)
+    return torch.where(owned[:, None], vals * scale, torch.zeros((), device=vals.device)).to(torch.bfloat16)
+
+
+def torch_fake_quant():
+    """SGLang's own torch path of the FP4 fake quant (the one the pack takes below SM89)."""
+    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv, fake_quant_fp4
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+    dev = torch.device('cuda')
+    g = torch.Generator(device=dev).manual_seed(20261029)
+    x = torch.randn(8192, 512, device=dev, generator=g) * torch.logspace(-4, 2, 8192, device=dev)[:, None]
+    x = x.to(torch.bfloat16)
+    angles = torch.rand(8192, 32, device=dev, generator=g) * 6.3
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    out = {}
+    for kv, quant in ((True, fake_quant_compressed_kv), (False, fake_quant_fp4)):
+        out[('E4M3' if kv else 'UE8M0')] = quant(rope_tail(x, freqs, 64))
+    return {k: v.cpu() for k, v in out.items()}
+
+
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == '--fake-quant':
         return fake_quant(sys.argv[2], sys.argv[3] == '1')
     dev = torch.device('cuda')
     ok = True
+    from xtier import arch
     # Engram rows: random FP8 payloads (NaN codes left out) and E8M0 scales, ids also outside the table's rows
-    from sglang.kernels.ops.embeddings.engram_gather import engram_gather as sglang_gather
     from xtier.packs.deepseek_v4.engram_gather import engram_gather
     g = torch.Generator(device=dev).manual_seed(20261029)
     rows, dim, block = 200000, 256, 32
@@ -48,24 +76,42 @@ def main():
     s[s > 160] = 127
     ids = torch.randint(-1000, rows + 1000, (65536,), device=dev, generator=g)
     for lo, hi in ((0, rows), (50000, 150000)):
-        a = sglang_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
-                                                                          device=dev), dim, block, lo, hi)
         b = engram_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
                                                                         device=dev), dim, block, lo, hi)
-        same = torch.equal(a.view(torch.int16), b.view(torch.int16))
+        if arch.has_fp8():
+            from sglang.kernels.ops.embeddings.engram_gather import engram_gather as sglang_gather
+            a = sglang_gather(w.data_ptr(), s.data_ptr(), ids, torch.empty(ids.numel(), dim, dtype=torch.bfloat16,
+                                                                          device=dev), dim, block, lo, hi)
+            same = torch.equal(a.view(torch.int16), b.view(torch.int16))
+            print(f'Engram gather, rows [{lo}, {hi}): {ids.numel()} ids x {dim}: '
+                  f'{"bitwise equal" if same else "DIFFER"} (SGLang vs software)')
+        else:
+            # no float8e4nv in Triton: SGLang's own kernel cannot run here, so the pool's values are the reference
+            ref = reference_gather(w, s, ids, dim, block, lo, hi)
+            same = torch.equal(ref.view(torch.int16), b.view(torch.int16))
+            print(f'Engram gather, rows [{lo}, {hi}): {ids.numel()} ids x {dim}: '
+                  f'{"bitwise equal" if same else "DIFFER"} (the pool vs software)')
         ok &= same
-        print(f'Engram gather, rows [{lo}, {hi}): {ids.numel()} ids x {dim}: '
-              f'{"bitwise equal" if same else "DIFFER"}')
     with tempfile.TemporaryDirectory() as tmp:
         outs = []
         for rebuilt in (0, 1):
+            if rebuilt == 0 and not arch.has_fp8():
+                continue   # SGLang's own kernel needs float8e4nv in Triton (SM89 and newer)
             out = f'{tmp}/fq{rebuilt}.pt'
             subprocess.run([sys.executable, __file__, '--fake-quant', out, str(rebuilt)], check=True)
             outs.append(torch.load(out))
-        for key in outs[0]:
-            same = torch.equal(outs[0][key].view(torch.int16), outs[1][key].view(torch.int16))
-            ok &= same
-            print(f'FP4 fake quant, {key} block scales: {"bitwise equal" if same else "DIFFER"}')
+        if len(outs) == 2:
+            for key in outs[0]:
+                same = torch.equal(outs[0][key].view(torch.int16), outs[1][key].view(torch.int16))
+                ok &= same
+                print(f'FP4 fake quant, {key} block scales: {"bitwise equal" if same else "DIFFER"}')
+        else:
+            # no float8e4nv: the rebuilt kernel against SGLang's own torch path (the one the pack takes here)
+            ref = torch_fake_quant()
+            for key in outs[0]:
+                same = torch.equal(ref[key].view(torch.int16), outs[0][key].view(torch.int16))
+                ok &= same
+                print(f'FP4 fake quant, {key} block scales: {"bitwise equal" if same else "DIFFER"} (torch vs kernel)')
     print('DS-FP8-SOFT-CHECK', 'PASS' if ok else 'FAIL')
     raise SystemExit(0 if ok else 1)
 

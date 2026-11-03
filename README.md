@@ -261,15 +261,20 @@ decode 约慢 10%），主要受限于硬盘速度。
 
 ## Turing（sm_75）
 
-分支 `feat/sm75` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：内核按卡的能力取实现（Turing 没有 BF16 张量核，
-模型以 BF16 跑、由软件模拟——超连接的残差流需要 BF16 的范围，FP16 在第 23 层就溢出；TF32 也没有，下投影用 16 位点积），
-热专家缓存的 FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB
-共享内存缩小。CPU 引擎不变。DeepSeek V4.1 Flash 在 2× RTX 2080 Ti 上已经能出答案（"2+2 equals 4."，40 层没有 NaN），
-实测 prefill 约 3.7 tok/s、decode 约 0.8 tok/s（瓶颈是 BF16 模拟、CPU 引擎的 MoE 与 PyTorch 注意力，不是显存）。
+分支 `feat/sm75-turing` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：它是 **main（上游的 RTX 30/40 系那套）
+加上 Turing 这一档**——内核按卡的能力取实现：Turing 没有 BF16 张量核，**模型跑 FP16**（卡上张量核吃的就是 FP16），
+超连接的残差流留在 **FP32**（它 40 层涨到 284672，超过 FP16 的 65504）；TF32 也没有，下投影用 16 位点积；热专家缓存的
+FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB 共享内存缩小。
+注意力走 Triton 的稀疏 MLA（上游为 sm_90 以下做的那个，Turing 上把 tile 再缩小）。CPU 引擎不变。
+2× RTX 2080 Ti 上按 TP=2 跑（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎），DeepSeek V4.1 Flash 能出答案。
 详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
 
 ## 版本更新
 
+- 2026-11-03：Turing（sm_75）这一档做成了从 main 出发的分支 `feat/sm75-turing`：上游针对 30/40 系的整套做法搬过来，
+  再补上 RTX 30/40 不需要的一层（这里没有 BF16 张量核）：模型跑 FP16、超连接的残差流留在 FP32，上游那些按 BF16
+  模型写的内核改成跟着激活的 dtype 走。合并处的一个断点（`arch.e4m3_f32` 的两种调用风格）与检查又找出的三处合并伤
+  都修了；卡上的内核检查都通过。详见[文档](docs/sm75.md)。
 - 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 跑通了：一次请求有答案，40 层没有 NaN。修了四处：GGUF 的名字对照漏了共享专家的三个张量（权重一直没初始化，隐藏状态变 NaN）；压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3（Triton 只在 sm_89 以上能编）；索引器与 KV 压缩器的 BF16 权重要 BF16 的激活、BF16→FP32 的 GEMM 要 sm_80；模型的 dtype 改回 BF16（残差流在 FP16 下第 23 层就溢出）。详见[文档](docs/sm75.md)。
 - 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读一个文件（`gguf` 包没有分片支持：第一个分片只有 42 个
   张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片：XTier 把分片当一个文件读，并给出该模型的张量名

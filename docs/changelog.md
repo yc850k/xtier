@@ -2,6 +2,32 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-03：**Turing（sm_75）这一档做成了从 main 出发的分支** `feat/sm75-turing`：把上游针对 30/40 系（sm_86/sm_89）
+  的做法整套搬过来（分支 = main 的 `4b1e766` ＋ Turing 的那套活），再补上 RTX 30/40 不需要的一层：**这里没有 BF16
+  张量核**。落地的东西：
+  1. **dtype 层**：模型跑 **FP16**（卡上张量核吃的就是 FP16：实测 bf16 的 `mm` 6.2 TFLOP/s 对 fp16 的 106，Triton 的
+     BF16 `tl.dot` 更慢），超连接的残差流留在 **FP32**（它 40 层涨到 284672，超过 FP16 的 65504；`dtypes.py` 的
+     `_post_fp32`/`_combine_fp16`/`_norm_fp32`），CPU 引擎的 BF16 契约不变。上游那些按 BF16 模型写的内核改成跟着
+     激活的 dtype 走（`wo_a`、`w8a16`、`engram_gather`、Engram 行缓冲、FP8 KV 缓存、Qwen 的 PLE 行与打包 KV、
+     MiniMax 的 FP4 KV）：`arch.dtype()` 按卡取（sm_80 以下 FP16），内核用 `DT` 这个 constexpr；
+  2. **合并处的一个断点**：`arch.e4m3_f32` 的两种调用风格（上游 1 个参数、Turing 的内核 2 个）合不拢，Triton 报
+     `TypeError: too many positional arguments`，缓存的 gate/up 内核编不过；现在 `xtier/arch.py` 是唯一入口，硬件/软件
+     转换按调用传（`HW`），两种写法都能用；
+  3. 检查又找出三处合并伤，都修了：`_reduce` 的参数个数（上游的内核是 6 个）、`hybrid_prefill` 丢了上游的
+     `finally: worker.join()`（GPU 那半失败时 CPU 那半还活着）、GPU prefill 的权重反量化把 E4M3 转换留在硬件默认
+     （sm_89 以下编不过）；第二张卡当热专家池的那条路（`cache/second.py`）也补上了编解码标志；
+  4. **开关**：mHC pre-mix 的 TileLang split-K 要 sm_80（下面关掉，TileLang 那一整套本来就在下面关着）；FP8/FP4 的
+     功能按等级关闭（`supported()`）；
+  5. **卡上的检查**：`sm75_gpu_check`（缓存的 gate/up 与 GPU prefill 对 FP32 参考，FP16 下相对 L2 2.1e-4/3.0e-4）、
+     `fp4_decode_check`、`fp8_decode_check`、`fp8_encode_check`（940 万个值与 torch 的 e4m3fn 逐位相同）、
+     `ds_fp8_soft_check`、`ds_sparse_mla_check`、`sparse_mla_check`、`ds_w8a16_check`、`deepseek_fp8_kv_check`、
+     `qsa_decode_check`、`qsa_fp8_check`、`glm_indexer_torch_check`、`arch_check` 都通过；需要别的机器上的
+     safetensors 检查点或要 sm_89/sm_90 的那几条在本机改成 SKIP（原来直接失败）；跟 SGLang 自己 FP8 内核对不上的那几条
+     （`fp8_encode_check`、`ds_fp8_soft_check`、`qsa_fp8_check`）改成跟卡上有的参考比（torch 的 e4m3fn、池子自己的字节、
+     SGLang 的 torch 路径）；
+  6. **两张卡**：TP=2（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎，`tools/cpu_budget.py --tp 2` 分线程），
+     `XTIER_COLD_FRACTION=0.8`（两个 rank 的冷池各留 76/384 个专家在内存里，0.3 的话要 195 GB，cgroup 会卡住加载）。
+  详见[文档](sm75.md)。
 - 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN。
   实测速度：prefill 约 3.7 tok/s、decode 约 0.8 tok/s（SGLang 自己的计数），瓶颈是 BF16 的点积由软件模拟、MoE 在
   CPU 引擎上、注意力走 PyTorch，不是显存。修了四处：

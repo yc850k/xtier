@@ -21,6 +21,11 @@ from sglang.srt.layers.attention.qsa import mqa  # noqa: E402
 
 from xtier.packs.qwen4_exp import qsa_prefill  # noqa: E402
 
+if _cap < (8, 0):
+    # the check compares SGLang's TileLang prefill, whose MMA shapes need the tensor cores of sm_80 and newer
+    print('SKIP: the TileLang prefill needs SM80 and newer (this card is sm_%d%d)' % _cap)
+    sys.exit(0)
+
 HEADS, DIM, RATIO = 4, 128, 4
 torch.manual_seed(20261023)
 
