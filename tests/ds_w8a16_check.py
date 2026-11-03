@@ -25,23 +25,35 @@ NAMES = ('attn.wq_a', 'attn.wq_b', 'attn.wo_b', 'ffn.shared_experts.w1', 'ffn.sh
 
 
 def check():
+    from xtier import arch
     from xtier.packs.deepseek_v4 import w8a16
-    index = json.loads((Path(A.model) / 'model.safetensors.index.json').read_text())['weight_map']
+    model = Path(A.model)
+    index = None
+    if (model / 'model.safetensors.index.json').exists():
+        index = json.loads((model / 'model.safetensors.index.json').read_text())['weight_map']
     dev = torch.device('cuda')
     g = torch.Generator(device=dev).manual_seed(20261029)
+    dtype = arch.dtype()   # the activations' dtype (FP16 below sm_80, BF16 from sm_80 on)
     worst = 0.0
     for layer in (int(v) for v in A.layers.split(',')):
         for name in NAMES:
-            w_name, s_name = f'layers.{layer}.{name}.weight', f'layers.{layer}.{name}.scale'
-            if w_name not in index:
-                continue
-            with safe_open(str(Path(A.model) / index[w_name]), 'pt') as f:
-                weight = f.get_tensor(w_name).to(dev)
-                scale = f.get_tensor(s_name).to(dev).float()
+            if index is None:
+                # no checkpoint here: the same check on random FP8 weights (the codes 0..126, no NaN)
+                n, k = 1024, 1024
+                weight = torch.randint(0, 127, (n, k), dtype=torch.uint8, device=dev, generator=g).view(
+                    torch.float8_e4m3fn)
+                scale = (torch.rand((n // 32, k // 32), device=dev, generator=g) * 0.02 + 0.01).float()
+            else:
+                w_name, s_name = f'layers.{layer}.{name}.weight', f'layers.{layer}.{name}.scale'
+                if w_name not in index:
+                    continue
+                with safe_open(str(model / index[w_name]), 'pt') as f:
+                    weight = f.get_tensor(w_name).to(dev)
+                    scale = f.get_tensor(s_name).to(dev).float()
             n, k = weight.shape
             exact = (weight.double().view(n // 32, 32, k // 32, 32) * scale.double()[:, None, :, None]).view(n, k)
             for rows in (1, 6, 12, 300):
-                x = (torch.randn(rows, k, device=dev, generator=g) * 0.5).to(torch.bfloat16)
+                x = (torch.randn(rows, k, device=dev, generator=g) * 0.5).to(dtype)
                 out = w8a16.linear(None, x, weight, [32, 32], scale)
                 ref = x.double() @ exact.t()
                 err = ((out.double() - ref).norm() / ref.norm()).item()

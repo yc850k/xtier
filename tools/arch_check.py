@@ -34,7 +34,7 @@ from pathlib import Path
 
 _local = threading.local()
 # largest dynamic shared memory per block (opt-in), bytes
-SMEM = {80: 166912, 86: 101376, 87: 166912, 89: 101376, 90: 232448}
+SMEM = {75: 65536, 80: 166912, 86: 101376, 87: 166912, 89: 101376, 90: 232448}
 
 
 def install(archs, report_dir):

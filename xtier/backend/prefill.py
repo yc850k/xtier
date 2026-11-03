@@ -74,10 +74,11 @@ def _weight(W, S, e, row, col, ROWS: tl.constexpr, COLS: tl.constexpr, MX: tl.co
 
 
 @tr.jit
-def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr, MX: tl.constexpr = False):
+def _unpack_all(W, S, D, ROWS: tl.constexpr, COLS: tl.constexpr, B: tl.constexpr, MX: tl.constexpr = False,
+                HW8: tl.constexpr = True):
     e = tl.program_id(0).to(tl.int64)  # E*rows*cols exceeds 2**31 for DeepSeek V4.1 layers
     i = tl.program_id(1)*B + tl.arange(0,B)
-    value = _weight(W,S,e,i//COLS,i%COLS,ROWS,COLS,MX)
+    value = _weight(W,S,e,i//COLS,i%COLS,ROWS,COLS,MX,HW8)
     tl.store(D+e*ROWS*COLS+i,value)
 
 
@@ -598,8 +599,9 @@ class Prefill:
                         _unpacked = [torch.empty(shape, dtype=dt, device='cuda'),
                                      torch.empty((CH, H, I), dtype=dt, device='cuda')]
                     count = min(E, (j + 1) * CH) - j * CH
-                    _unpack_all[(count, 2 * I * H // 1024)](w[0], w[2], _unpacked[0], 2 * I, H, 1024, MX=self.mxfp4)
-                    _unpack_all[(count, H * I // 1024)](w[1], w[3], _unpacked[1], H, I, 1024, MX=self.mxfp4)
+                    _unpack_all[(count, 2 * I * H // 1024)](w[0], w[2], _unpacked[0], 2 * I, H, 1024, MX=self.mxfp4,
+                                                          HW8=hw8)
+                    _unpack_all[(count, H * I // 1024)](w[1], w[3], _unpacked[1], H, I, 1024, MX=self.mxfp4, HW8=hw8)
                     free = torch.cuda.Event(); free.record(compute); freed[slot] = free
                     weights = (_unpacked[0], _unpacked[1], w[2], w[3], slot)
                     stamp('unpack')
@@ -1051,8 +1053,8 @@ class Prefill:
                 w = _slots[slot]; dst = _unpacked2[b]
                 count = min(E, (j + 1) * CH) - j * CH
                 with torch.cuda.stream(_unpack_stream):
-                    _unpack_all[(count, 2 * I * H // 1024)](w[0], w[2], dst[0], 2 * I, H, 1024, MX=self.mxfp4)
-                    _unpack_all[(count, H * I // 1024)](w[1], w[3], dst[1], H, I, 1024, MX=self.mxfp4)
+                    _unpack_all[(count, 2 * I * H // 1024)](w[0], w[2], dst[0], 2 * I, H, 1024, MX=self.mxfp4, HW8=hw8)
+                    _unpack_all[(count, H * I // 1024)](w[1], w[3], dst[1], H, I, 1024, MX=self.mxfp4, HW8=hw8)
                     ev = torch.cuda.Event(); ev.record(_unpack_stream)
                 slot_free[slot] = ev
                 unpacked_done[j] = ev

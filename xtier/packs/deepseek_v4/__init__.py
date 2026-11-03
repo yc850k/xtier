@@ -65,6 +65,8 @@ from pathlib import Path
 
 import torch
 
+from xtier import arch
+
 logger = logging.getLogger(__name__)
 ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
 ENGRAM_LAYER = 'sglang.srt.layers.engram.Engram'
@@ -107,7 +109,8 @@ def open_table(model, layer_id, cache_bytes, row_range=None):
 
 
 class EngramLookup:
-    """BF16 Engram rows of device ids (zero rows outside the store's owned range), on the current stream."""
+    """The Engram rows of device ids in the model's dtype (zero rows outside the store's owned range), on the current
+    stream."""
 
     def __init__(self, store):
         from xtier.tables.lookup import GraphLookup
@@ -125,7 +128,7 @@ class EngramLookup:
         return out
 
     def __call__(self, indices):
-        return self.fill(indices, torch.empty(*indices.shape, ROW_BYTES, dtype=torch.bfloat16, device=indices.device))
+        return self.fill(indices, torch.empty(*indices.shape, ROW_BYTES, dtype=arch.dtype(), device=indices.device))
 
 
 def _check_rows(self, param, loaded_weight):
@@ -196,7 +199,7 @@ def _prefetch(hash_ids, self, input_ids, *args, **kwargs):
             continue
         view = hash_ids[:, index]
         ids = view.contiguous()
-        out = torch.empty(*view.shape, ROW_BYTES, dtype=torch.bfloat16, device=view.device)
+        out = torch.empty(*view.shape, ROW_BYTES, dtype=arch.dtype(), device=view.device)
         side.wait_stream(main)
         with torch.cuda.stream(side):
             embedding._xtier_lookup.fill(ids, out)
@@ -338,8 +341,11 @@ def install(registry, hook_type):
         # the Triton sparse MLA over the packed FP8 pages (attention.py; the upstream's kernel below SM90, adapted
         # to this card) and the mHC pre-mix split-K for the 20480 hidden size (upstream's mhc_splitk.py)
         attention.install(registry, hook_type)
-        from xtier.packs.deepseek_v4 import mhc_splitk
-        registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
+        if supported((8, 0), 'the TileLang split-K of the mHC pre-mix (deepseek_v4)'):
+            # the TileLang kernel needs the tensor cores of sm_80 and newer: below them the MHC's pre-mix runs in
+            # PyTorch (the TileLang switches above are off), so the split-K rebuild has nothing to serve
+            from xtier.packs.deepseek_v4 import mhc_splitk
+            registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
     dtypes.install(registry, hook_type)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)

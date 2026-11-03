@@ -1,13 +1,13 @@
-"""DeepSeek V4.1's block FP8 projections below SM89 (Turing, the RTX 30 series): FP8 weights x BF16 activations.
+"""DeepSeek V4.1's block FP8 projections below SM89 (Turing, the RTX 30 series): FP8 weights x 16-bit activations.
 
 SGLang serves 32 x 32 block FP8 linears off SM90 with its Triton W8A8 kernel (the activations quantized to FP8,
 float8e4nv: SM89 and newer). Below SM89 its FP8 linear method takes Marlin's weight-only kernel instead, whose FP8
 variants exist for per-channel scales and 128-wide groups only: a 32-wide group finds no thread config (the first
 forward fails). Here such layers keep SGLang's own layout (no Marlin repacking, the checkpoint's format untouched)
 and run weight-only: up to wo_a.MAX_T rows on the pack's FP8 einsum (wo_a.py with one group: the FP8 x block scale
-formed in BF16, the FP32 accumulation), the larger calls on the weight dequantized into a reused BF16 buffer and
-cuBLAS. The FP8 bytes decode exactly (xtier.backend.fp4.e4m3_f32) and the activations stay BF16, where production
-quantizes them to FP8.
+formed in the activations' dtype, the FP32 accumulation), the larger calls on the weight dequantized into a reused
+buffer of that dtype and cuBLAS. The FP8 bytes decode exactly (xtier.backend.fp4.e4m3_f32) and the activations stay
+in the model's dtype (FP16 below sm_80, BF16 from sm_80 on), where production quantizes them to FP8.
 """
 import torch
 
@@ -16,7 +16,7 @@ from xtier.packs.deepseek_v4 import wo_a
 FP8_METHOD = 'sglang.srt.layers.quantization.fp8.Fp8LinearMethod'
 BLOCK_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.triton_w8a8_block_fp8_linear'
 BLOCK = [32, 32]
-_buffers = {}   # device -> the BF16 buffer of the largest dequantized weight so far
+_buffers = {}   # (device, dtype) -> the buffer of the largest dequantized weight so far (the activations' dtype)
 _scales = {}    # (data_ptr, shape) of the non-FP32 block scales -> their FP32 copy
 
 
@@ -44,11 +44,12 @@ def _fp32(scale):
     return _scales[key]
 
 
-def _buffer(device, numel):
-    """The reused BF16 buffer the dequantized weight goes into."""
-    buf = _buffers.get(device)
+def _buffer(device, numel, dtype):
+    """The reused buffer the dequantized weight goes into (the activations' dtype: the dot operands take it)."""
+    key = (device, dtype)
+    buf = _buffers.get(key)
     if buf is None or buf.numel() < numel:
-        buf = _buffers[device] = torch.empty(numel, dtype=torch.bfloat16, device=device)
+        buf = _buffers[key] = torch.empty(numel, dtype=dtype, device=device)
     return buf[:numel]
 
 
@@ -59,7 +60,7 @@ def linear(original, input, weight, block_size, weight_scale, input_scale=None, 
         input_scale is not None
         or list(block_size) != BLOCK
         or weight.dtype != torch.float8_e4m3fn
-        or input.dtype != torch.bfloat16
+        or input.dtype not in (torch.bfloat16, torch.float16)
         or not weight.is_contiguous()
         or n % 32
         or k % 32
@@ -71,7 +72,7 @@ def linear(original, input, weight, block_size, weight_scale, input_scale=None, 
         out = wo_a.einsum(x.unsqueeze(1), weight.view(1, n, k), scale).view(-1, n)
     else:
         out = torch.nn.functional.linear(
-            x, wo_a.dequantize(weight, scale, _buffer(weight.device, n * k).view(n, k))
+            x, wo_a.dequantize(weight, scale, _buffer(weight.device, n * k, x.dtype).view(n, k))
         )
     if bias is not None:
         out = out + bias

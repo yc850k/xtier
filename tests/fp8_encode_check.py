@@ -17,10 +17,17 @@ from xtier import arch  # noqa: E402
 
 
 @triton.jit
-def encode(X, SOFT, HARD, N, B: tl.constexpr):
+def encode(X, SOFT, N, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
     x = tl.load(X + i, mask=i < N)
     tl.store(SOFT + i, arch.e4m3_bits(x), mask=i < N)
+
+
+@triton.jit
+def encode_hardware(X, HARD, N, B: tl.constexpr):
+    """The conversion Triton emits on the GPUs with float8e4nv (SM89 and newer)."""
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    x = tl.load(X + i, mask=i < N)
     tl.store(HARD + i, x.to(tl.float8e4nv).to(tl.uint8, bitcast=True), mask=i < N)
 
 
@@ -38,12 +45,19 @@ if __name__ == '__main__':
     n = x.numel()
     soft = torch.empty(n, dtype=torch.uint8, device=dev)
     hard = torch.empty(n, dtype=torch.uint8, device=dev)
-    encode[(triton.cdiv(n, 1024),)](x, soft, hard, n, 1024)
-    torch.cuda.synchronize()
+    grid = (triton.cdiv(n, 1024),)
+    encode[grid](x, soft, n, 1024)
+    if arch.has_fp8():   # the hardware conversion (SM89 and newer); below it torch's own cast is the reference
+        encode_hardware[grid](x, hard, n, 1024)
+        torch.cuda.synchronize()
+        reference = 'float8e4nv'
+    else:
+        hard = x.to(torch.float8_e4m3fn).view(torch.uint8)
+        reference = "torch.float8_e4m3fn"
     nan = torch.isnan(x)
     bad = (soft != hard) & ~nan
     nan_ok = bool(((soft[nan] & 0x7F) == 0x7F).all() and ((hard[nan] & 0x7F) == 0x7F).all())
-    print(f'{n} FP32 values: {int(bad.sum())} encodings differ from float8e4nv; NaN -> NaN both: {nan_ok}')
+    print(f'{n} FP32 values: {int(bad.sum())} encodings differ from {reference}; NaN -> NaN both: {nan_ok}')
     if bad.any():
         i = bad.nonzero()[:8, 0]
         for v, a, b in zip(x[i].tolist(), soft[i].tolist(), hard[i].tolist()):

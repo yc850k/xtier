@@ -50,16 +50,19 @@ for spec, bf16, tf32, fp8, tma, fp4, mxfp4 in (('7.5', False, False, False, Fals
     check(a.has_blackwell_mxfp4_moe() == mxfp4, f'{spec}: the SM120 MXFP4 fused MoE {mxfp4}')
 
 # the dot products follow the device: FP16 below sm_80 (no BF16 tensor cores), BF16 from sm_80 on; the activations
-# are the model's dtype (BF16 everywhere: a card without BF16 tensor cores emulates it, and the models whose
-# hyper-connection mixes the residual stream need BF16's range)
+# are the model's dtype: the same rule (FP16 below sm_80, where the model itself falls back to FP16; the residual
+# stream that needs BF16's range is kept in FP32 by the pack)
 with_arch('7.5')
 check(arch.dot_dtype() == torch.float16, 'sm_75: the dot products are FP16')
-check(arch.dtype() == torch.bfloat16, 'sm_75: the activations are BF16')
+check(arch.dtype() == torch.float16, 'sm_75: the activations are FP16')
 with_arch('12.0')
 check(arch.dot_dtype() == torch.bfloat16, 'sm_120: the dot products are BF16')
 check(arch.dtype() == torch.bfloat16, 'sm_120: the activations are BF16')
 os.environ['XTIER_DTYPE'] = 'fp16'
 check(arch.dtype() == torch.float16, 'XTIER_DTYPE=fp16: the activations are FP16')
+os.environ['XTIER_DTYPE'] = 'bf16'
+with_arch('7.5')
+check(arch.dtype() == torch.bfloat16, 'XTIER_DTYPE=bf16: the activations are BF16 (emulated on sm_75)')
 del os.environ['XTIER_DTYPE']
 
 # the down projection's precision: TF32 where the GPU has TF32 tensor cores, the 16-bit dot below them

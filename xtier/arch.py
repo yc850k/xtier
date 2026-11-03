@@ -160,12 +160,14 @@ def dot_dtype():
 
 
 def dtype():
-    """The dtype of the activations XTier's GPU kernels compute in: the model's dtype (BF16; a card without BF16
-    tensor cores emulates it, which is exact and only slower). ``XTIER_DTYPE=bf16|fp16|auto`` (default auto)."""
+    """The dtype of the activations XTier's GPU kernels compute in: the model's dtype. From sm_80 on it is BF16;
+    below it (Turing, sm_75) the model runs FP16, the dtype SGLang itself falls back to on a card without BF16
+    tensor cores - the residual stream that needs BF16's range is kept in FP32 by the pack instead.
+    ``XTIER_DTYPE=bf16|fp16|auto`` (default auto: the card's)."""
     import torch
     spec = os.environ.get('XTIER_DTYPE', 'auto').strip().lower()
     if spec in ('', 'auto'):
-        return torch.bfloat16
+        return dot_dtype()
     if spec == 'bf16':
         return torch.bfloat16
     if spec == 'fp16':
@@ -177,8 +179,8 @@ def check_activation_dtype(dtype):
     """The dtype of the activations: BF16 or FP16. The CPU engine keeps its BF16 contract either way: the
     activations are converted when they are staged for it.
 
-    BF16 without BF16 tensor cores (Turing, sm_75) is allowed: the emulation is exact, only slower, and the
-    models whose hyper-connection mixes the residual stream need BF16's range (FP16 overflows at 65504)."""
+    Below sm_80 the card's dtype is FP16 (the model's own fallback), and BF16 is allowed with a warning: the
+    emulation is exact, only slower - the residual stream that needs BF16's range is kept in FP32 by the pack."""
     import torch
     if dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
@@ -222,6 +224,13 @@ HW_FP4 = tl.constexpr(has_fp4_convert())
 HW_FP8 = tl.constexpr(has_fp8())
 
 
+def tl_dtype(dtype):
+    """The Triton dtype of a 16-bit float dtype: the kernels' dot operands (BF16 or FP16). The dtype of the
+    activations, so that a kernel's operands and its accumulator's input always agree."""
+    import torch
+    return tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
+
+
 @triton.jit
 def e2m1_f16(code):
     """E2M1 nibble (the sign in bit 3) -> FP16: the software form of ``cvt.rn.f16x2.e2m1x2``."""
@@ -229,12 +238,16 @@ def e2m1_f16(code):
 
 
 @triton.jit
-def e4m3_f32(code):
-    """The E4M3 byte -> FP32: the hardware conversion where the card has it (sm_89 and newer), the bit math below."""
-    return _e4m3_f32(code, HW=HW_FP8)
+def e4m3_f32(code, HW: tl.constexpr = HW_FP8.value):
+    """The E4M3 byte -> FP32: the hardware conversion where the card has it (sm_89 and newer), the bit math below.
+
+    ``HW`` picks the conversion per call: the default is this card's (the flag above), a kernel that knows better
+    (the Turing path, where the card has no FP8 conversion) passes its own.
+    """
+    return _e4m3_f32(code, HW=HW)
 
 
 @triton.jit
-def e4m3_bits(x):
+def e4m3_bits(x, HW: tl.constexpr = HW_FP8.value):
     """FP32 -> the E4M3 byte, as ``cvt.rn.satfinite.e4m3x2.f32`` gives it: round to nearest even, saturating."""
-    return _e4m3_bits(x, HW=HW_FP8)
+    return _e4m3_bits(x, HW=HW)

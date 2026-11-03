@@ -29,6 +29,8 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
+from xtier import arch
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,7 +97,7 @@ def _dequant_k_cache_v41_fp8_kernel(
     vals = _e4m3_to_fp32(tl.load(buf_uint8_ptr + token_data_base + offs))
     scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
     out = vals * _ue8m0_to_fp32(scale_u8)
-    tl.store(output_ptr + token_id * output_stride_0 + offs, out.to(tl.bfloat16))
+    tl.store(output_ptr + token_id * output_stride_0 + offs, out.to(output_ptr.dtype.element_ty))
 
 
 def dequantize_k_cache_paged_v41(
@@ -105,7 +107,7 @@ def dequantize_k_cache_paged_v41(
     out: torch.Tensor = None,
     layout=KVLayout.V41,
 ):
-    """The V4.1 dequantizer for sm_75: the bytes in, the bf16 K values out."""
+    """The V4.1 dequantizer for sm_75: the bytes in, the K values out (the model's dtype)."""
     layout = KVLayout.parse(layout)
     assert layout is KVLayout.V41, layout
     assert quant_k_cache.is_contiguous()
@@ -122,12 +124,12 @@ def dequantize_k_cache_paged_v41(
     if out is None:
         out = torch.empty(
             (num_tokens, 1, layout.data_bytes),
-            dtype=torch.bfloat16,
+            dtype=arch.dtype(),
             device=quant_k_cache.device,
         )
     else:
         assert out.shape == (num_tokens, 1, layout.data_bytes)
-        assert out.dtype == torch.bfloat16
+        assert out.dtype in (torch.bfloat16, torch.float16), out.dtype
     if num_tokens == 0:
         return out
 
@@ -189,9 +191,10 @@ def _dequant_k_cache_v4_kernel(
     lo = tl.load(buf_uint8_ptr + bf16_off).to(tl.int32)
     hi = tl.load(buf_uint8_ptr + bf16_off + 1).to(tl.int32)
     rope_bits = (lo | (hi << 8)).to(tl.uint16)
+    rope = rope_bits.to(tl.bfloat16, bitcast=True).to(tl.float32)   # the cache's rope half is BF16
     tl.store(
         output_ptr + out_row_base + DIM_NOPE + rope_offs,
-        rope_bits.to(tl.bfloat16, bitcast=True),
+        rope.to(output_ptr.dtype.element_ty),
     )
 
 
@@ -202,7 +205,7 @@ def dequantize_k_cache_paged(
     out: torch.Tensor = None,
     layout=KVLayout.V4,
 ):
-    """The V4 dequantizer for sm_75: the bytes in, the bf16 K values out."""
+    """The V4 dequantizer for sm_75: the bytes in, the K values out (the model's dtype)."""
     layout = KVLayout.parse(layout)
     if layout is KVLayout.V41:
         return dequantize_k_cache_paged_v41(
@@ -220,12 +223,12 @@ def dequantize_k_cache_paged(
     if out is None:
         out = torch.empty(
             (num_tokens, 1, DIM_NOPE + DIM_ROPE),
-            dtype=torch.bfloat16,
+            dtype=arch.dtype(),
             device=quant_k_cache.device,
         )
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
-        assert out.dtype == torch.bfloat16
+        assert out.dtype in (torch.bfloat16, torch.float16), out.dtype
     if num_tokens == 0:
         return out
 

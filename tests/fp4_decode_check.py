@@ -56,9 +56,11 @@ def worker(out):
         cfg, nk = pool.CONFIG, m * k
         pool._gate_up[(nk, I // cfg['gbn'])](x, slot_list, slot_exp, q13, s13, g13, mid, m, H, I, 10.0 if MX else 0.0,
                                              pool.MAX_M, cfg['gbn'], pool._tile_k(H), MX=MX,
+                                             HW4=arch.has_fp4_convert(), HW8=arch.has_fp8(),
                                              num_warps=cfg['gw'], num_stages=cfg['gs'])
         pool._down[(nk, H // cfg['dbn'])](mid, slot_list, slot_exp, q2, s2, g2, part, m, H, I, pool.MAX_M, cfg['dbn'],
-                                          pool._tile_k(I), MX=MX, num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                          pool._tile_k(I), MX=MX, HW4=arch.has_fp4_convert(), HW8=arch.has_fp8(),
+                                          num_warps=cfg['dw'], num_stages=cfg['ds'])
         torch.cuda.synchronize()
         result[name] = (mid[:nk, :m].cpu(), part[:nk, :m].cpu())
     torch.save(result, out)

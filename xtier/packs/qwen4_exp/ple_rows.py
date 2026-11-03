@@ -131,9 +131,10 @@ def gather(self, input_ids, out=None):
     expected = (*input_ids.shape, self.embedding_dim)
     if out is None:
         output = self.allocate_output(expected, input_ids.device)
-    elif tuple(out.shape) != expected or out.dtype != torch.bfloat16 or out.device != input_ids.device:
+    elif tuple(out.shape) != expected or out.dtype not in (torch.bfloat16, torch.float16) \
+            or out.device != input_ids.device:
         raise ValueError(f'invalid PLE output {tuple(out.shape)} {out.dtype} {out.device}, expected {expected} '
-                         f'bfloat16 on {input_ids.device}')
+                         f'a 16-bit float on {input_ids.device}')
     else:
         output = out
     ids = input_ids.reshape(-1)
