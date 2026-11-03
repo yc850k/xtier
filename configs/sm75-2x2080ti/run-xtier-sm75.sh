@@ -57,6 +57,13 @@ ARCH=${XTIER_CUDA_ARCH:-$($PY -c 'import torch;c=torch.cuda.get_device_capabilit
 export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-$ARCH}
 export TVM_FFI_GPU_BACKEND=cuda TVM_FFI_CUDA_ARCH_LIST=${TVM_FFI_CUDA_ARCH_LIST:-$ARCH}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# The MHC's TileLang kernels (the pre-mix, the post-mix) and the DSA indexer's need the tensor cores of sm_80 and
+# newer: they compile for this card and then fail to load. SGLang's own paths take over (the MHC's pre-mix in
+# PyTorch, the indexer in Triton). The pack sets these too, but only in the process that installs the hooks: with
+# TP the model worker is a separate process, so the switches are set here, where every process inherits them.
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=${SGLANG_OPT_USE_TILELANG_MHC_PRE:-0}
+export SGLANG_OPT_USE_TILELANG_MHC_POST=${SGLANG_OPT_USE_TILELANG_MHC_POST:-0}
+export SGLANG_OPT_USE_TILELANG_INDEXER=${SGLANG_OPT_USE_TILELANG_INDEXER:-0}
 export XTIER=${XTIER:-1}
 # Fast load: the experts go straight from the checkpoint files into the CPU engine (still all installed before the
 # server reports ready; the loader's own copy of them is skipped)
@@ -64,7 +71,16 @@ export XTIER_FAST_LOAD=${XTIER_FAST_LOAD:-1}
 # The CPU engine: Broadwell (AVX2 only, no AVX-512 BF16), 2 NUMA nodes of 14 cores
 # The engine's workers take all but a few CPUs: one for the mailbox dispatcher and a few for the process's own
 # threads (the scheduler, torch). All of them would leave the dispatcher without a CPU.
-export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_THREADS=${XTIER_THREADS:-$(( $(nproc) - 4 ))} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
+export XTIER_ISA=${XTIER_ISA:-avx2} XTIER_MAIN_CPUS=${XTIER_MAIN_CPUS:-auto}
+# Tensor parallelism over the two cards (TP=2): each rank holds half of the dense weights, of the KV cache and of
+# the hot experts, and its own CPU engine over its own group of NUMA nodes. The threads are the budget per rank
+# (tools/cpu_budget.py --tp N: the scheduler's CPUs and the ranks' share of the rest).
+TP=${TP:-2}
+if [ -z "${XTIER_THREADS:-}" ]; then
+  XTIER_THREADS=$($PY "$(dirname "$0")/../../tools/cpu_budget.py" --tp $TP)
+fi
+export XTIER_THREADS
+if [ "$TP" -gt 1 ]; then export XTIER_TP_NODES=${XTIER_TP_NODES:-auto}; fi
 export XTIER_SPIN_COUNT=${XTIER_SPIN_COUNT:-1048576}
 # The GPU prefill: the tiles fit Turing's 64 KiB of shared memory (the Blackwell hosts run 128 x 64 with 3 stages)
 export XTIER_GPU_PREFILL_CHUNK=${XTIER_GPU_PREFILL_CHUNK:-4096} XTIER_PREFILL_EXPERT_CHUNK=${XTIER_PREFILL_EXPERT_CHUNK:-8}
@@ -79,7 +95,7 @@ export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-8} XTIER_CACHE_SWAPS=${XTIER_CACHE
 # checkpoint's own files are the store, read with O_DIRECT)
 export XTIER_COLD=${XTIER_COLD:-1} XTIER_COLD_FRACTION=${XTIER_COLD_FRACTION:-0.3} XTIER_COLD_THREADS=${XTIER_COLD_THREADS:-8}
 exec $PY -m sglang.launch_server --model-path $M --served-model-name ${SERVED_NAME:-$(basename $M)} \
-  --host 127.0.0.1 --port $PORT --tp-size 1 --trust-remote-code --skip-server-warmup \
+  --host 127.0.0.1 --port $PORT --tp-size $TP --trust-remote-code --skip-server-warmup \
   --cuda-graph-backend-prefill disabled --dtype float16 --max-running-requests 2 \
   --quantization gguf --load-format gguf \
   --mem-fraction-static ${XTIER_MEM_FRACTION:-0.92} \

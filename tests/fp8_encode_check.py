@@ -1,9 +1,7 @@
-"""The E4M3 (FP8) encode of XTier's kernels: the software path against torch's own float8_e4m3fn cast.
-
-The software path is what a card without FP8 tensor cores takes (Turing, the RTX 30 series): Triton has no
-float8e4nv below sm_89, so a kernel that stores e4m3 bytes rounds them with bit math
-(xtier.backend.fp4.e4m3_bits). The values are the ones cvt.rn.satfinite.e4m3x2.f32 gives: round to nearest even,
-saturating to +-448, NaN to 0x7F with its sign.
+"""FP8 (E4M3) encoding in software (xtier.arch.e4m3_bits, for kernels that store FP8 on RTX 30 series) against the
+conversion Triton emits on GPUs with float8e4nv (SM89 and newer): every FP32 value whose top 20 bits differ (the FP32
+rounding of every halfway point and of its neighbours), random values over the range, and the edge cases (+-0, the
+subnormal steps and their halves, 448, 464, 480, infinities, NaN), bit for bit.
 
   python tests/fp8_encode_check.py
 """
@@ -15,59 +13,41 @@ import torch  # noqa: E402
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-from xtier.backend.fp4 import e4m3_bits  # noqa: E402
-
-DEV = 'cuda'
-torch.manual_seed(20261102)
+from xtier import arch  # noqa: E402
 
 
 @triton.jit
-def encode_bytes(SRC, DST, HW: tl.constexpr):
-    i = tl.arange(0, 1024)
-    tl.store(DST + i, e4m3_bits(tl.load(SRC + i), HW))
-
-
-def main():
-    # the values a kernel would store: the normals, the subnormals, the saturations and the specials
-    g = torch.Generator(device='cpu').manual_seed(20261102)
-    values = [
-        torch.randn(256, generator=g) * 10.0,          # the normals
-        torch.linspace(-0.02, 0.02, 128),               # the subnormals (2^-6 down)
-        torch.tensor([0.0, -0.0, 448.0, -448.0, 449.0, -449.0, 1e30, -1e30, float('inf'), float('-inf'),
-                      float('nan'), -float('nan')]),
-        torch.linspace(-8.0, 8.0, 500),
-    ]
-    src = torch.cat(values).float().to(DEV)
-    out = torch.empty(src.numel(), dtype=torch.uint8, device=DEV)
-    encode_bytes[(1,)](src, out, False)
-
-    # torch's own cast: the reference (it saturates and rounds the same way)
-    want = src.to(torch.float8_e4m3fn).view(torch.uint8)
-    same = out == want
-    # the NaN's sign: torch keeps it, the software path writes 0x7F with the sign
-    nan = torch.isnan(src)
-    same |= nan & (out & 0x7F == 0x7F)
-    bad = int((~same).sum())
-    print(f'the {src.numel()} values: the mismatches {bad} (the NaNs {int(nan.sum())})')
-    if bad:
-        for i in range(src.numel()):
-            if not bool(same[i]):
-                print(f'  the value {src[i].item()}: the software {out[i].item():#04x} the torch {want[i].item():#04x}')
-                break
-
-    hw_ok = None
-    try:
-        hw = torch.empty(src.numel(), dtype=torch.uint8, device=DEV)
-        encode_bytes[(1,)](src, hw, True)
-        hw_ok = int((hw != want).sum())
-        print(f'the hardware encode: the mismatches {hw_ok}')
-    except Exception as exc:  # noqa: BLE001 - no float8e4nv below sm_89
-        print(f'the hardware encode is not available here: {type(exc).__name__}: {exc}')
-
-    ok = bad == 0 and (hw_ok is None or hw_ok == 0)
-    print('OK' if ok else 'FAIL')
-    sys.exit(0 if ok else 1)
+def encode(X, SOFT, HARD, N, B: tl.constexpr):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    x = tl.load(X + i, mask=i < N)
+    tl.store(SOFT + i, arch.e4m3_bits(x), mask=i < N)
+    tl.store(HARD + i, x.to(tl.float8e4nv).to(tl.uint8, bitcast=True), mask=i < N)
 
 
 if __name__ == '__main__':
-    main()
+    dev = torch.device('cuda')
+    # the top 20 bits (sign, exponent, 11 mantissa bits) of every FP32 value, with low bits 0, ...7FF, 800, 801, FFF:
+    # each E4M3 halfway point and the values on both sides of it
+    top = torch.arange(1 << 20, dtype=torch.int64) << 12
+    grid = torch.cat([top, top | 0x7FF, top | 0x800, top | 0x801, top | 0xFFF]).to(torch.int32).view(torch.float32)
+    g = torch.Generator().manual_seed(20261029)
+    rand = (torch.randn(1 << 22, generator=g) * torch.logspace(-6, 3, 1 << 22)).to(torch.float32)
+    edges = torch.tensor([0.0, -0.0, 2.0 ** -9, 2.0 ** -10, 3 * 2.0 ** -10, 2.0 ** -6, 2.0 ** -6 - 2.0 ** -10, 448.0,
+                          449.0, 463.9, 464.0, 464.1, 479.0, 480.0, 1e30, float('inf'), float('-inf'), float('nan')])
+    x = torch.cat([grid, rand, edges, -edges]).to(dev)
+    n = x.numel()
+    soft = torch.empty(n, dtype=torch.uint8, device=dev)
+    hard = torch.empty(n, dtype=torch.uint8, device=dev)
+    encode[(triton.cdiv(n, 1024),)](x, soft, hard, n, 1024)
+    torch.cuda.synchronize()
+    nan = torch.isnan(x)
+    bad = (soft != hard) & ~nan
+    nan_ok = bool(((soft[nan] & 0x7F) == 0x7F).all() and ((hard[nan] & 0x7F) == 0x7F).all())
+    print(f'{n} FP32 values: {int(bad.sum())} encodings differ from float8e4nv; NaN -> NaN both: {nan_ok}')
+    if bad.any():
+        i = bad.nonzero()[:8, 0]
+        for v, a, b in zip(x[i].tolist(), soft[i].tolist(), hard[i].tolist()):
+            print(f'  {v!r}: software 0x{a:02x}, hardware 0x{b:02x}')
+    ok = not bad.any() and nan_ok
+    print('FP8-ENCODE-CHECK', 'PASS' if ok else 'FAIL')
+    raise SystemExit(0 if ok else 1)

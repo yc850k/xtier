@@ -32,14 +32,15 @@ slots (_miss_copy: read over PCIe by the SMs, since copy-engine copies in a CUDA
 the GPU) and computed with the cached ones while the CPU computes the others. Pays off only where PCIe moves an expert
 about as fast as the CPU computes one (few cores, no AVX-512, memory bandwidth to spare). Not on layers with cold
 experts (their RAM slots change during a forward). The cache log's hit counts these experts too.
+Second GPU (XTIER_GPU2_SLOTS, default off; cache/second.py): more hot experts on another GPU, behind the mailbox.
 
-Numerics: GPU routes are W4A16 (hardware FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
+Numerics: GPU routes are W4A16 (FP4->FP16 / UE8M0 x BF16 for MXFP4, FP32 accumulation, BF16 intermediate),
 CPU routes unchanged. Without cached experts the result equals the plain mailbox path except for the FP32 addition of
 a zero GPU part.
 
-On a GPU without the FP4 conversion instruction (below sm_100: Turing, sm_75) the E2M1 values are decoded in
-software (the same values, the same rounding) and the dot products take the model's activation dtype: FP16 where
-the GPU has no BF16 tensor cores.
+The FP4 decode uses the hardware conversion where it exists (SM100 and newer) and integer arithmetic elsewhere,
+e.g. on Turing and the RTX 30 / 40 series GPUs (XTIER_FP4_DECODE=hw|soft|auto); both give the same FP16 bits. The dot
+products take the model's activation dtype: FP16 where the GPU has no BF16 tensor cores.
 """
 import ctypes as C
 import json
@@ -53,7 +54,8 @@ import triton
 import triton.language as tl
 
 from xtier import arch
-from xtier.backend.fp4 import e2m1_f16, e4m3_f32, ue8m0_f32
+from xtier.arch import e2m1_f16, e4m3_f32
+from xtier.backend.fp4 import ue8m0_f32
 from xtier.backend.kernels import Pointer
 
 logger = logging.getLogger(__name__)
@@ -139,23 +141,25 @@ def _commit(RING_P, SEQS, STATE, TABLE, OWNER, E, NR: tl.constexpr):
     experts of newly posted swaps leave it (and `applied` lets the copy stream overwrite their slots).
     Publish before evict: a landed expert may already be the victim of a newer swap (posted after it landed,
     before this window), and must end up out of the table. A swap is always evicted in an earlier window
-    than it is published (its copy waits for `applied`). Table and owner rows both have stride E."""
+    than it is published (its copy waits for `applied`). Table and owner rows both have stride E. Sequence numbers
+    wrap (uint32 on the host, the same bits as int32 here): only their differences count, the low bits index the
+    ring (NR is a power of two)."""
     posted = tl.atomic_add(SEQS, 0, sem='acquire', scope='sys')
     landed = tl.atomic_add(SEQS + 32, 0, sem='acquire', scope='sys')
     done = tl.load(STATE)
     pub = tl.load(STATE + 1)
-    upto = tl.minimum(landed, done)
-    for s in range(pub + 1, upto + 1):
-        i = (s % NR) * 4
+    publish = tl.minimum(landed - pub, done - pub)
+    for j in range(0, publish):
+        i = ((pub + 1 + j) & (NR - 1)) * 4
         layer = tl.load(RING_P + i, volatile=True)
         ein = tl.load(RING_P + i + 1, volatile=True)
         slot = tl.load(RING_P + i + 3, volatile=True)
         if ein >= 0:   # -1: a slot the elastic cache released (cache/elastic.py), nothing to publish
             tl.store(TABLE + layer * E + ein, slot)
         tl.store(OWNER + layer * E + slot, ein)
-    tl.store(STATE + 1, upto)
-    for s in range(done + 1, posted + 1):
-        i = (s % NR) * 4
+    tl.store(STATE + 1, pub + publish)
+    for j in range(0, posted - done):
+        i = ((done + 1 + j) & (NR - 1)) * 4
         layer = tl.load(RING_P + i, volatile=True)
         out = tl.load(RING_P + i + 2, volatile=True)
         if out >= 0:
@@ -491,6 +495,10 @@ class LayerPool:
                 if mailbox.lib.xtier_mailbox_pool_ring(C.cast(ptr, C.c_void_p)) < 0:
                     raise RuntimeError(mailbox.error())
                 _glob['ring'], _glob['seqs'] = ptr[0], ptr[1]
+                first_seq = C.cast(ptr[1], C.POINTER(C.c_int32))[0]
+                if first_seq:   # test only
+                    logger.warning('xtier cache: XTIER_DEBUG_SEQ_START: sequence numbers start at %d', first_seq)
+                    _glob['state'].fill_(first_seq)
             if _glob['E'] != E:
                 raise ValueError('xtier cache: every partly cached layer needs the same expert count')
             self.index = _glob['rows']
@@ -508,6 +516,8 @@ class LayerPool:
         self.miss = None   # XTIER_DECODE_MISS_GPU: _miss_layer at the fill (the staging slots now)
         _miss_stage(self)
         self._pool_on = False
+        self.second = None   # XTIER_GPU2_SLOTS: cache/second.py
+        self.tp_size = 1     # set by the MoE method
         LayerPool.layers.append(self)
 
     def bytes(self):
@@ -608,6 +618,8 @@ class LayerPool:
             if self.mailbox.lib.xtier_mailbox_pool_enable(self.mailbox.bridge, 1) < 0:
                 raise RuntimeError(self.mailbox.error())
             self._pool_on = True
+        if self.second is not None:
+            self.second.ensure(m, k)
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
         if self.miss is not None:   # before the CPU reads the routes
@@ -700,6 +712,8 @@ def fill_all():
                                              C.cast(arena, C.c_void_p), C.cast(res, C.c_void_p)) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
+        from xtier.cache import second
+        second.attach(partial)
         stretch = [p for p in partial if p.S > p.base]
         if stretch:
             from xtier.cache import elastic
@@ -718,6 +732,8 @@ def fill_all():
                                    host=torch.zeros((rows, stride), dtype=torch.float32, pin_memory=True))
             logger.info('xtier cache: prompt warm-up on: a prompt\'s routes as %s decode windows (old counts x %s), '
                         'then %d rounds of up to %d swaps', windows, keep, rounds, swaps)
+    elif partial and os.environ.get('XTIER_GPU2_SLOTS', '') not in ('', '0'):
+        logger.warning('xtier cache: XTIER_GPU2_SLOTS needs XTIER_CACHE_ADAPT=1: the second GPU stays unused')
     gib = sum(p.bytes() for p in todo) / 2**30
     full = [p.layer_id for p in todo if p.full]
     logger.info('xtier cache: %d layers (%d with every expert: %s), %.1f GiB, %d experts loaded from %s in %.1f s',

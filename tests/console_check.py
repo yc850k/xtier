@@ -8,6 +8,7 @@ renders, and the standalone server answers (its POST guard included).
 import itertools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +20,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from xtier.console import __main__ as server, core, ui  # noqa: E402
+
+# runner=auto: systemd only where a user scope starts (a chroot's systemctl answers 0, its systemd-run cannot reach a bus)
+def _fake_run(returncode):
+    def run(argv, **kwargs):
+        assert argv[:3] == ['systemd-run', '--user', '--scope'], argv
+        return subprocess.CompletedProcess(argv, returncode, b'', b'Failed to connect to bus' if returncode else b'')
+    return run
+
+
+_which, _run = core.shutil.which, core.subprocess.run
+try:
+    core.shutil.which = lambda name: f'/usr/bin/{name}'
+    core.subprocess.run = _fake_run(1)
+    assert core._user_systemd() is False
+    core.subprocess.run = _fake_run(0)
+    assert core._user_systemd() is True
+    core.shutil.which = lambda name: None
+    assert core._user_systemd() is False
+finally:
+    core.shutil.which, core.subprocess.run = _which, _run
 
 models = core.load_models()
 assert list(models)[:3] == ['qwen38', 'glm53', 'ds41'], list(models)
@@ -165,4 +186,14 @@ assert sizes == sorted(sizes) and all(b['model'] == 'Some-Model' and b['max_toke
                                      and 0 < b['top_p'] < 1 and b['temperature'] > 0 for _, b in seen), seen
 assert 'HTTP Error 500' in core.warm_up(fake.server_address[1], 'Some-Model', deadline)
 fake.shutdown()
+# a warm-up that takes the server down (out of memory, a crash) is not a server that is ready
+alive = iter((True, False))
+console.active = lambda state: next(alive)
+health, warm = core.health, core.warm_up
+core.health, core.warm_up = (lambda port: True), (lambda *a: 'the connection dropped')
+log = Path(tempfile.mkdtemp(prefix='xtier-console-')) / 'server.log'
+log.write_text('mem_guard: killing\n')
+ok, why = console.wait_ready(dict(port=1, served='Some-Model', log=str(log)), 60)
+core.health, core.warm_up = health, warm
+assert not ok and '预热' in why, (ok, why)
 print(f'console ok: {len(models)} models, {combos} option combinations built, warm-up requests checked')

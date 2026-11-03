@@ -208,3 +208,33 @@ def shared_memory_kb():
                 return value // 1024
     cap = capability()
     return 64 if cap is None or cap[0] <= 7 else 228
+
+# The codecs the kernels use: the E2M1 and E4M3 values in software (xtier/backend/fp4.py holds the bit math; the HW
+# parameter picks the hardware conversion where the card has one). Upstream's below-SM89 / SM90 work calls them as
+# ``arch.e4m3_f32(byte)``; the flags are decided once, when this module is first imported, in the process that runs
+# the kernels.
+import triton
+import triton.language as tl  # noqa: E402
+
+from xtier.backend.fp4 import e2m1_f16 as _e2m1_f16, e4m3_bits as _e4m3_bits, e4m3_f32 as _e4m3_f32  # noqa: E402
+
+HW_FP4 = tl.constexpr(has_fp4_convert())
+HW_FP8 = tl.constexpr(has_fp8())
+
+
+@triton.jit
+def e2m1_f16(code):
+    """E2M1 nibble (the sign in bit 3) -> FP16: the software form of ``cvt.rn.f16x2.e2m1x2``."""
+    return _e2m1_f16(code)
+
+
+@triton.jit
+def e4m3_f32(code):
+    """The E4M3 byte -> FP32: the hardware conversion where the card has it (sm_89 and newer), the bit math below."""
+    return _e4m3_f32(code, HW=HW_FP8)
+
+
+@triton.jit
+def e4m3_bits(x):
+    """FP32 -> the E4M3 byte, as ``cvt.rn.satfinite.e4m3x2.f32`` gives it: round to nearest even, saturating."""
+    return _e4m3_bits(x, HW=HW_FP8)

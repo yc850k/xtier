@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xtier"
-version = "0.0.1"
+version = "0.1.1"
 description = "Cross-tier CPU/GPU hybrid MoE inference for SGLang"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,4 +23,4 @@ include = ["xtier*"]
 
 [tool.setuptools.package-data]
 # the libraries built by tools/build_engine.sh and the DeepSeek pack's tuned GEMM configs
-xtier = ["engine/lib/*.so", "packs/deepseek_v4/fp8_configs/*.json"]
+xtier = ["engine/lib/*.so", "packs/deepseek_v4/fp8_configs/*.json", "env_names.txt"]

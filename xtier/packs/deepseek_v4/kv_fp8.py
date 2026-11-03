@@ -248,14 +248,30 @@ def dequantize_k_cache_paged(
 
 
 def install():
-    """Replace SGLang's dequantizers with the sm_75 ones."""
+    """Replace SGLang's dequantizers with the sm_75 ones.
+
+    The module attribute is not enough: the attention backend imports the dequantizer by name
+    (``from ...dequant_k_cache import dequantize_k_cache_paged``), so the name in every module that imported it
+    before the patch has to be rebound too (with TP the worker imports them earlier than the scheduler).
+    """
+    import sys
+
     from sglang.kernels.ops.attention.dsv4 import dequant_k_cache
 
     if getattr(dequant_k_cache, '_xtier_sm75', False):
         return False
     dequant_k_cache._xtier_sm75 = True
+    original_v41 = dequant_k_cache.dequantize_k_cache_paged_v41
+    original = dequant_k_cache.dequantize_k_cache_paged
     dequant_k_cache.dequantize_k_cache_paged_v41 = dequantize_k_cache_paged_v41
     dequant_k_cache.dequantize_k_cache_paged = dequantize_k_cache_paged
+    for module in list(sys.modules.values()):
+        if module is None or module is dequant_k_cache:
+            continue
+        if getattr(module, 'dequantize_k_cache_paged_v41', None) is original_v41:
+            module.dequantize_k_cache_paged_v41 = dequantize_k_cache_paged_v41
+        if getattr(module, 'dequantize_k_cache_paged', None) is original:
+            module.dequantize_k_cache_paged = dequantize_k_cache_paged
     logger.info(
         'xtier: the DeepSeek V4.1 FP8 KV cache runs on sm_75 '
         '(the e4m3 bytes are converted with bit math)'

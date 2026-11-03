@@ -43,6 +43,9 @@ def install(registry, hook_type):
     class KTEPWrapperMethod(original):
         def __new__(cls, gpu_method, kt_config, *args, **kwargs):
             if isinstance(kt_config, LayerConfig):   # not an instance of cls: __init__ is skipped
+                if gpu_method is None:   # a layer its quantization config excludes: FusedMoE without KT takes this
+                    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+                    gpu_method = UnquantizedFusedMoEMethod()
                 return xtier_method(gpu_method, kt_config)
             return super().__new__(cls)
 
@@ -55,7 +58,9 @@ def install(registry, hook_type):
 
     def after_load(result, model_runner, *args, **kwargs):
         from xtier.backend import direct
+        from xtier.cache import cold
         direct.close()   # XTIER_FAST_LOAD: every layer's reads done and checked, then the readers go
+        cold.save_ranges()
         check(model_runner)
         return result
 

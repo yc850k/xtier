@@ -39,10 +39,18 @@
   and selects with torch.topk. Nothing on the paged path is SM90-only; see paged_indexer.py. RTX PRO 5000, DSpark,
   16K context: the indexer's kernels 1.08 -> 0.33 ms per decode step, the main stream's work 15.4 -> 13.7 ms;
   agent_bench long responses 33.0 -> 32.5 ms per step.
-- Prompts tokenized as DeepSeek's deepseek-recipe does (``XTIER_DS_RECIPE_TOKENS``, default on; the 1017 pipeline's
-  DS41_PLAIN_CONTENT_TOKENS): added-token spellings in message content stay plain text, only the template's control
-  tokens are special, and the prompt is encoded in regions instead of one string (a 568K-token prompt 1.3 -> 0.18 s,
-  every turn). Hooks of the serving process, not the schedulers; see recipe_tokens.py.
+- (Until SGLang main e22a530 of 2026-10-23 prompts were tokenized here as DeepSeek's deepseek-recipe does; SGLang now
+  renders V4 / V4.1 chat prompts with deepseek-recipe itself.)
+- Attention below SM90 (sparse_mla.py; RTX 30 / 40 series): off SM120 SGLang serves every DeepSeek V4 attention call
+  through FlashMLA, built for SM90 / SM100 only; a Triton sparse MLA over the same FP8 pages takes the backend's calls,
+  prefill included (it stays on the paged caches, as on SM120).
+- mHC pre-mix below SM90 (mhc_splitk.py): SGLang's TileLang split-K GEMM, which serves it without DeepGEMM, has no
+  hidden block for V4.1 Flash's 20480 in its table; the same kernel with V4 Pro's block.
+- FP8 below SM89 (RTX 30 series), where Triton has no float8e4nv: the 32 x 32 block FP8 projections weight-only
+  (w8a16.py; Marlin, SGLang's choice there, has no 32-wide groups), Engram rows (engram_gather.py; SGLang's gather
+  with the payload's bytes decoded in software) and the E4M3 rounding of the compressed KV's FP4 block scales
+  (fake_quant_fp8.py; SGLang's kernel rebuilt with the round trip in software). The DSpark draft's FP8 LM head
+  (torch._scaled_mm, SM89 and newer) stays BF16 there.
 - Decoder replay tail without graphs: with --enable-decoder-swa-bounded-replay SGLang runs the late layers of a
   prefill from row-bucket CUDA graphs captured while serving (up to SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = 2048
   rows). Their MoE calls of hundreds to thousands of rows cannot go through XTier's capturable decode path (mailbox
@@ -67,6 +75,8 @@ INDEXER = 'sglang.srt.layers.attention.dsv4.v41_indexer.make_candidate_indexer'
 FP8_CONFIGS = 'sglang.kernels.ops.gemm.fp8_kernel.get_w8a8_block_fp8_configs'
 REPLAY_TAIL = 'sglang.srt.models.deepseek_v4_replay_tail.DecoderReplayTail.maybe_create'
 MXFP8_LINEAR = 'sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_blockscaled_linear'
+FLASH_MLA = 'sglang.kernels.ops.attention.flash_mla_interface.flash_mla_with_kvcache'
+SPARSE_PREFILL = 'sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend._use_sparse_prefill'
 FP8_CONFIG_DIR = Path(__file__).with_name('fp8_configs')
 ENGRAM_LAYERS = 2   # DeepSeek V4.1 Flash has two Engram layers (1 and 14); the cache budget is split over them
 ROW_BYTES, SCALE_BYTES, BLOCK = 256, 8, 32   # an FP8 E4M3 row of 256 with one E8M0 scale per 32
@@ -126,7 +136,8 @@ def _check_rows(self, param, loaded_weight):
 
 
 def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, **kwargs):
-    from sglang.srt.layers.engram import shard_range
+    from sglang.srt.arg_groups import engram_config   # its EngramLookup, not this module's
+    from sglang.srt.layers.engram import resolve_engram_config, shard_range
     from sglang.srt.runtime_context import get_parallel
 
     if dim != ROW_BYTES:
@@ -137,6 +148,14 @@ def _init(original, self, num_embeddings, dim, layer_id, column_bounds, *args, *
     self.row_start, row_end = shard_range(num_embeddings, column_bounds, get_parallel().tp_rank, self.tp_size)
     self.rows = row_end - self.row_start
     self.host_table = None
+    # what SGLang's __init__ sets for its peer reads, host table and DP lookups; none of them serves rows on NVMe, so
+    # forward() comes to _lookup and the rows to _owned_rows (replaced below); a peer read falls back to the all-reduce
+    self._sort_host_reads = False
+    self.staged_by_scheduler = False
+    self.peer = None
+    lookup, kinds = resolve_engram_config(len(column_bounds) - 1).lookup, engram_config.EngramLookup
+    self.lookup = kinds.ALL_REDUCE if lookup == kinds.PEER_READ else lookup
+    self._cols_per_rank = engram_config.cols_per_rank(len(column_bounds) - 1, self.tp_size)
     cache = int(float(os.environ.get('XTIER_ENGRAM_CACHE_GIB', '4')) * 2**30) // ENGRAM_LAYERS
     store = open_table(model_dir(), layer_id, cache, (self.row_start, row_end))
     if store.rows != num_embeddings:
@@ -315,9 +334,12 @@ def install(registry, hook_type):
     if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache'):
         kv_fp8.install()
         fp4_rope.install(registry, hook_type)
-        w8a16.install(registry, hook_type)
     if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1'):
+        # the Triton sparse MLA over the packed FP8 pages (attention.py; the upstream's kernel below SM90, adapted
+        # to this card) and the mHC pre-mix split-K for the 20480 hidden size (upstream's mhc_splitk.py)
         attention.install(registry, hook_type)
+        from xtier.packs.deepseek_v4 import mhc_splitk
+        registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
     dtypes.install(registry, hook_type)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
@@ -328,6 +350,13 @@ def install(registry, hook_type):
                                                                       '(deepseek_v4)'):
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
+    from xtier.arch import HW_FP8
+    if not HW_FP8:   # a card without the FP8 conversion: the FP8 weights in software (upstream's block)
+        from xtier.packs.deepseek_v4 import engram_gather, fake_quant_fp8, w8a16
+        registry.register(f'{w8a16.FP8_METHOD}.__init__', w8a16.no_marlin, hook_type.AFTER)
+        registry.register(w8a16.BLOCK_LINEAR, w8a16.linear, hook_type.AROUND)
+        registry.register(engram_gather.ENGRAM_GATHER, engram_gather.replace, hook_type.AROUND)
+        registry.register(fake_quant_fp8.LAUNCHER, fake_quant_fp8.launcher, hook_type.AROUND)
     if os.environ.get('XTIER_ENGRAM_ROWS', '') == 'nvme':
         registry.register(f'{ENGRAM}.__init__', _init, hook_type.AROUND)
         registry.register(f'{ENGRAM}._owned_rows', _owned_rows, hook_type.REPLACE)
@@ -338,10 +367,3 @@ def install(registry, hook_type):
                                                                           '(deepseek_v4)'):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)
-
-
-def install_serving(registry, hook_type):
-    """Hooks of the process that serves the API: prompts tokenized as deepseek-recipe does (recipe_tokens)."""
-    from xtier.packs.deepseek_v4 import recipe_tokens
-
-    return recipe_tokens.install_serving(registry, hook_type)

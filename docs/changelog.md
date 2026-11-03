@@ -38,6 +38,34 @@
 - 2026-10-29：Turing（sm_75）适配，分支 `feat/sm75`：GPU 内核按显卡的算力等级取 dtype 与实现（Turing 没有 BF16
   张量核，模型以 FP16 跑，下投影用 16 位点积；没有 FP4 转换指令，热专家缓存用软件解码 E2M1），加速包里的 FP8/TMA/FP4
   功能按等级关闭，tile 按 64 KiB 共享内存缩小；新增 2× RTX 2080 Ti 的配置。详见[文档](sm75.md)。
+- 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
+  经 `flash_mla_interface` 调 FlashMLA，XTier 10-30 跟进 6162b07 后，`packs/deepseek_v4` 的钩子还挂在旧入口上；旧入口还在，所以启动检查查不出
+  （iounstone 发现，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。修复后在 RTX PRO 5000 上模拟 SM86 跑整模型：照抄 0 错，NLL 1.19735（升级前 1.19867）。真卡还要等他确认。
+  发布前清单加了模拟 SM86 这一步。
+- 2026-11-01（v0.1.0）：全面代码审计后的修复。稳定性：DeepSeek 的 CUTLASS 内核在加载权重前编译（不再在第一个请求里现编、被内存守护杀掉）；换槽序号回绕；split
+  prefill、混合 prefill、冷专家写盘的线程报错不再被吞；专家没加载全、钩子没生效、调度入口改名都在启动时报错；未知的 `XTIER_*` 启动时警告；测试 FAIL 一律非零退出，加
+  `tools/repo_check.py` 和 CI。查明同一提示词重算 logprob 摆动来自 top-k 输出顺序，不是 bug；几项换槽参数和提示词预热 A/B 没有收益，默认不变。详见[文档](reports/2026-11-01-audit-fixes.md)。
+  冷专家：池子换到 4 块 PCIe 5.0 盘，DeepSeek 卸载 10 / 20 / 30 / 40 / 50% 时 decode 每步 31.6 / 34.4 / 37.9 / 44.5 / 53.5 ms（不卸载 30.0）；`tools/cold_punch.py` 让大模型的专家只存一份
+  （逐字节核对后在模型文件里打洞，DeepSeek 的副本 290 → 21 GiB，`--restore` 写回）。详见[文档](reports/2026-11-01-cold-pcie5.md)。
+  文档：新增[文档目录](README.md)、[快速开始](quickstart.md)（从空机器到第一次请求，新环境实跑过）、[支持情况](support.md)（实际验证到什么程度）、[常见问题](faq.md)、[发布前检查清单](release-checklist.md)和英文版 [README](README.en.md)、[快速开始](quickstart.en.md)；
+  `constraints.txt` 固定依赖版本，`tools/check_sglang.py --strict`；测速表的“官方 main”改叫“基线”，它带着 XTier 的混合推理，不是原版 SGLang。
+- 2026-10-31：第二张卡可以不放模型、纯当热专家池（可选，`XTIER_GPU2_SLOTS=N|auto`，默认关；`TP=1`），给显存或速度不一样的两张卡用：
+  主卡不变，信箱调度线程把主卡没命中、第二张卡有的专家交给它，结果经内存加回 CPU 输出，每次调用分给它多少专家自动调整。双 RTX 4090
+  模拟 24 + 16 GiB：Qwen3.8 decode 57.3 / 55.9 tok/s（32K / 120K），同样配置的 TP 51.1 / 49.4，单卡 41.0 / 43.6；第二张卡约慢 1.2 倍时
+  54.5 / 54.2。同样的专家放第二张卡和放主卡，单层结果逐位相同（Qwen3.8、GLM-5.3、DeepSeek V4.1）。真实异构卡还没测过。功能关时
+  三个模型的照抄、PPL、长上下文与上次一致，dsh 连续 15 分钟无错。详见[文档](reports/2026-10-31-second-gpu-pool.md)。
+- 2026-10-30（下午）：跟进官方 SGLang main `6162b07199`（10-22 的 `8cd3c494` 之后 592 个提交）。XTier 跟着改了 Engram 行放
+  NVMe、MoE 方法的 top-k、Qwen PLE 分段 prefill；DeepSeek 的 prompt 改由上游用 deepseek-recipe 编码，删掉 `recipe_tokens`。测试过的
+  提交写进安装步骤和 `xtier.SGLANG_COMMIT`，装的版本不同时启动会警告，`tools/check_sglang.py` 核对钩子目标与 import。三个模型照抄、
+  PPL 与旧版一致，512K 不 OOM，dsh 连续 15 分钟无错。另外：快速加载支持 MoE 张量并行（双 RTX 4090 实测通过：分片与普通加载逐字节相同）；英伟达官方
+  GLM NVFP4 检查点（NextN 层是 BF16）开 MTP 不再崩溃，草稿层的专家加载时转成 NVFP4 交给 CPU 引擎；启动台在 chroot 等没有用户
+  systemd 的环境里退回 setsid。详见[文档](reports/2026-10-30-sglang-6162b07.md)。
+- 2026-10-30：双卡张量并行（`TP=2`）实测通过：双 RTX 3090 上 Qwen3.8 decode +42–48%、120K 首字 −35%，照抄 0 错；修了
+  `~/.cache` 是软链接时 SGLang 的 JIT 内核每次启动都重编（30 系单卡启动省约 5 分钟）。详见[文档](reports/2026-10-30-tp.md)。
+- 2026-10-29（晚）：支持 RTX 30 系（SM86）：没有 FP8 硬件，FP8 一律读时软件解码（与硬件逐位相同），DeepSeek 的 FP8
+  投影只量化权重；RTX 3090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](reports/2026-10-29-rtx30.md)。
+- 2026-10-29：支持 RTX 40 系（SM89）：FP4 读时软件解码（与硬件逐位相同，不增加精度损失），三个模型的加速包补上 SM90
+  以下的内核；RTX 4090 实测 Qwen3.8 整模型照抄 0 错、120K 上下文。详见[文档](reports/2026-10-29-rtx40.md)。
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](reports/2026-10-28-decode-miss-gpu.md)。
 - 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好

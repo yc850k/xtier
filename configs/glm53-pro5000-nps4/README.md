@@ -1,6 +1,6 @@
 # GLM-5.3 Flash NVFP4 on RTX PRO 5000 72GB + 2x EPYC 9334 (NPS4)
 
-`run-glm-xtier.sh`: upstream SGLang main + XTier, 42 MoE layers on XTier with 60 hot slots each (production profile and
+`run-glm-xtier.sh`: upstream SGLang main + XTier, 42 MoE layers on XTier with 58 hot slots each (production profile and
 GPU prefill switches), 16K prefill chunks and BF16 SSM states as in production, a KV pool of one 512K context.
 Arguments of the README measurement (2026-10-23, EAGLE with the NextN draft on XTier):
 
@@ -10,6 +10,11 @@ Arguments of the README measurement (2026-10-23, EAGLE with the NextN draft on X
       --speculative-adaptive --speculative-adaptive-config <lsglang_glm5.3>/launch/adaptive-steps-1to5.json \
       --speculative-token-map <lsglang_glm5.3>/lkqmoe/draft-token-map-49152.pt --speculative-use-rejection-sampling
 
+- Checkpoint: LibertAIDAI/GLM-5.3-Flash-NVFP4, whose NextN experts are NVFP4. NVIDIA's ModelOpt checkpoint
+  (nv-community/GLM-5.3-Flash-NVFP4) keeps the NextN layer in BF16, excluded from its quantization: with `XTIER_DRAFT=1`
+  the draft's 288 BF16 experts (13.5 GiB) are quantized to NVFP4 at load for the CPU engine instead of filling the GPU
+  (`xtier/backend/formats.py` Bf16AsNvFp4). That changes the draft's precision only: the target model verifies every
+  token the draft proposes.
 - TileLang DSA backends: SGLang's FlashInfer sparse MLA decode does not support GLM-5.3's kpool (index_kpool > 1).
 - `--speculative-use-rejection-sampling` (as production) needs the speculative pack: SGLang alone requires the draft vocab
   to equal the target vocab (token map 49152). The pack scatters the draft distribution into the target vocab, drafts at

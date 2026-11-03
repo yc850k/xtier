@@ -1,5 +1,4 @@
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1).
 // Independent NVFP4 CPU MoE, generic over the model: hidden size H and expert
 // intermediate size I (both multiples of 64), 10..512 experts, top-k<=10, optional
 // SwiGLU clamp limit, set per plan at creation. Qwen3.8 (2560/640), DeepSeek V4.1
@@ -23,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -237,6 +237,36 @@ bool read_text(const std::string &path,std::string &out) {
     FILE *f=std::fopen(path.c_str(),"r");if(!f)return false;
     char buf[4096];size_t n=std::fread(buf,1,sizeof buf-1,f);std::fclose(f);buf[n]=0;out=buf;return true;
 }
+// CPUs of this process's cgroup cpuset, sorted; empty when none is found (no limit). cgroup v2: cpuset.cpus.effective
+// of the process's cgroup or the nearest ancestor that has the file (the root always does); v1: the cpuset hierarchy.
+std::vector<int> cgroup_cpus() {
+    std::string self,list;
+    if(!read_text("/proc/self/cgroup",self))return {};
+    std::vector<std::string> files;
+    size_t start=0;
+    while(start<self.size()) {
+        size_t end=self.find('\n',start);if(end==std::string::npos)end=self.size();
+        std::string line=self.substr(start,end-start);start=end+1;
+        size_t a=line.find(':'),b=a==std::string::npos?a:line.find(':',a+1);
+        if(b==std::string::npos)continue;
+        std::string controllers=line.substr(a+1,b-a-1),path=line.substr(b+1);
+        bool v2=controllers.empty(),v1=(","+controllers+",").find(",cpuset,")!=std::string::npos;
+        if(!v2&&!v1)continue;
+        for(;;) {   // the cgroup, then its ancestors
+            std::string dir=(v2?"/sys/fs/cgroup":"/sys/fs/cgroup/cpuset")+(path=="/"?std::string():path);
+            if(v2)files.push_back(dir+"/cpuset.cpus.effective");
+            else {files.push_back(dir+"/cpuset.effective_cpus");files.push_back(dir+"/cpuset.cpus");}
+            if(path.empty()||path=="/")break;
+            size_t slash=path.rfind('/');path=slash==0||slash==std::string::npos?"/":path.substr(0,slash);
+        }
+    }
+    for(const std::string &f:files)
+        if(read_text(f,list)) {
+            std::vector<int> cpus=parse_cpulist(list);
+            if(!cpus.empty()){std::sort(cpus.begin(),cpus.end());return cpus;}
+        }
+    return {};
+}
 Topology detect_topology() {
     Topology t;
     std::string online;
@@ -247,6 +277,11 @@ Topology detect_topology() {
         only=parse_cpulist(s);
         if(only.empty())throw std::runtime_error("Invalid XTIER_NODES");
     }
+    // The CPUs of this process's cgroup cpuset (a container's): sysfs lists the host's, and binding a worker outside the
+    // cpuset fails. Not the thread's affinity mask, which the host process narrows (XTIER_MAIN_CPUS) before children
+    // start: workers may bind anywhere in the cpuset.
+    const std::vector<int> own=cgroup_cpus();
+    auto usable=[&](int c){return own.empty()||std::binary_search(own.begin(),own.end(),c);};
     if(read_text("/sys/devices/system/node/online",online)) {
         std::vector<int> nodes=parse_cpulist(online);
         for(int node:only)
@@ -257,13 +292,15 @@ Topology detect_topology() {
             std::string list;
             if(!read_text("/sys/devices/system/node/node"+std::to_string(node)+"/cpulist",list))continue;
             std::vector<int> cpus=parse_cpulist(list);
-            if(cpus.empty())continue;   // memory-only node (e.g. CXL): no workers
+            cpus.erase(std::remove_if(cpus.begin(),cpus.end(),[&](int c){return !usable(c);}),cpus.end());
+            if(cpus.empty())continue;   // memory-only node (e.g. CXL), or none of its CPUs ours: no workers
             if(t.nodes==MAX_NODES)throw std::runtime_error("Too many NUMA nodes");
             int v=t.nodes++;t.memory[v]=node;
             for(int c:cpus) {
                 std::string sib;std::vector<int> group{c};
                 if(read_text("/sys/devices/system/cpu/cpu"+std::to_string(c)+"/topology/thread_siblings_list",sib))group=parse_cpulist(sib);
-                if(group.empty()||*std::min_element(group.begin(),group.end())!=c)continue;   // not the first thread of its core
+                group.erase(std::remove_if(group.begin(),group.end(),[&](int g){return !usable(g);}),group.end());
+                if(group.empty()||*std::min_element(group.begin(),group.end())!=c)continue;   // not the first (usable) thread of its core
                 t.cores[v].push_back(c);
                 for(int g:group)if(g!=c){t.siblings[v].push_back(g);break;}
             }
@@ -336,8 +373,13 @@ Bytes alloc(size_t n,int node) {
     // Override an inherited process-wide interleave policy for these weights only.
     // Preferred, not bound: under memory pressure on this node (e.g. page cache from model
     // loading) pages spill to another node instead of invoking the OOM killer.
-    if(syscall(SYS_mbind,p,bytes,MPOL_PREFERRED,&mask,sizeof(mask)*8,0))
-        throw std::runtime_error("Binding weight shard to its NUMA node failed");
+    if(syscall(SYS_mbind,p,bytes,MPOL_PREFERRED,&mask,sizeof(mask)*8,0)) {
+        // A container whose seccomp profile denies mbind (Docker's default without CAP_SYS_NICE, e.g. rented
+        // GPU machines): the owning workers' first touch still puts the pages on their node.
+        if(errno!=EPERM)throw std::runtime_error("Binding weight shard to its NUMA node failed");
+        static std::once_flag warned;
+        std::call_once(warned,[]{std::fprintf(stderr,"[xtier] mbind not permitted: weight shards placed by the workers' first touch\n");});
+    }
 #if XTIER_HUGEPAGES
     // Advisory only: THP "madvise" policy; failure keeps 4KiB pages and identical math.
     // XTIER_THP=0 skips it: with defrag=madvise every huge-page fault may compact memory
@@ -1952,11 +1994,6 @@ int XTIER_API(xtier_slot_pieces)(void *plan,int slot,int node,void **pointers,si
     int rc=static_cast<Handle*>(plan)->plan->slot_pieces(slot,node,pointers,bytes);
     if(rc<0)last_error="Invalid slot or node";
     return rc;
-}
-void *XTIER_API(xtier_create2)(int hidden,int inter,int experts,int threads,float limit,
-                    const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
-                    const float *g13,const float *g2) {
-    return XTIER_API(xtier_create3)(hidden,inter,experts,threads,limit,0,w13,w2,s13,s2,g13,g2);
 }
 int XTIER_API(xtier_set_swiglu)(void *plan,float alpha,float beta) {
     if(!plan||!(alpha>0.f)){last_error="Invalid SwiGLU parameters";return -1;}

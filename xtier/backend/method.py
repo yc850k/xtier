@@ -74,12 +74,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
     _active = None       # int32 [DECODE_ROWS] token flags of the decode path (active_flags)
     _localized = False
     _registered = 0      # layers whose shards are pinned and caches filled
+    _copy_noted = False  # a layer XTIER_FAST_LOAD could not read was logged
 
     def __init__(self, gpu_method, layer_config: LayerConfig):
         self.gpu_method = gpu_method
         self.cfg = layer_config
-        self.format = formats.detect(gpu_method)
-        self.gsq = False
+        self.format = formats.detect(gpu_method, draft=layer_config.draft)
+        self.gsq = self.format.name == 'gsq'   # the IQ-quantized experts of a Maya GGUF pack
         self.plan = None
         self.prefill = None
         self.mailbox = None
@@ -111,6 +112,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             # The experts stay in the mapped checkpoint file (the engine reads them there): the GPU method's expert
             # parameters are not created, so the loader skips the expert tensors and the GPU never holds them.
             self.gsq = True
+            self._missing = {}   # no expert tensors come through the loader: the engine reads them from the file
             XTierMoEMethod.layers.append(self)   # the layer registers itself: its cache is filled with the others'
             return
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
@@ -159,32 +161,49 @@ class XTierMoEMethod(FusedMoEMethodBase):
             return False   # global scales: through the loader
         if self._source is None:
             self._source = self._choose_source(layer)
+        lp = self._cold_plan
+        if lp is not None and None not in lp.reads[-1:]:   # where it lies: cold.save_ranges (a tensor not in a file ends it)
+            lp.reads.append(self._locate(layer, name, w, shard, expert))
         if self._source == 'store':
             return True
         if self._source != 'direct':
             return False
-        read = direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
-                             self.format.name)
+        read = self._locate(layer, name, w, shard, expert)
         if read is None:
             if self._reads:   # the reads' [gate; up] rows and a loader's [up; gate] rows must not mix in one layer
                 raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: {name} of expert {expert} ({shard}) cannot be '
                                    'read as it is after other expert tensors were (XTIER_FAST_LOAD=0 loads them)')
+            if not XTierMoEMethod._copy_noted:
+                XTierMoEMethod._copy_noted = True
+                logger.warning('xtier: XTIER_FAST_LOAD=1, but layer %d loads by copy: %s of expert %s is %s %s, not '
+                               'bytes the CPU engine keeps (further layers like it are not logged)', self.cfg.layer_id,
+                               name, expert, tuple(w.shape), w.dtype)
             self._source = 'copy'
             return False
         self._reads.append(read)
         return True
 
+    def _locate(self, layer, name, w, shard, expert):
+        return direct.locate(self.format.bulk.index(name), shard, expert, w, self.hidden, self.inter, self.experts,
+                             self.format.name, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
+
     def _choose_source(self, layer):
         from xtier.cache import cold
+        source = self._pick_source(cold)
+        if source != 'store' and not self.cfg.draft:
+            cold.require_checkpoint(self.cfg.layer_id)
+        return source
+
+    def _pick_source(self, cold):
         if os.environ.get('XTIER_PREFILL_FROM_SHARDS', '1') != '1':
             return 'copy'   # the prefill copies the inputs then
         if cold.enabled() and not self.cfg.draft and 0 < self.cfg.cache_slots < self.experts:
-            lp = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
-            if cold.load_enabled() and cold.loadable(lp, self.hidden, self.inter, self.format.name, self.cfg.threads):
-                self._cold_plan = lp
+            self._cold_plan = cold.LayerPlan(self.cfg.layer_id, self.experts, self.cfg.cache_slots)
+            if cold.load_enabled() and cold.loadable(self._cold_plan, self.hidden, self.inter, self.format.name,
+                                                     self.cfg.threads):
                 return 'store'
             return 'copy'   # attach writes or checks the records from the loaded experts
-        if direct.enabled() and getattr(layer, 'moe_tp_size', 1) == 1:
+        if direct.enabled():
             return 'direct'
         return 'copy'
 
@@ -265,6 +284,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if slots > 0:   # allocated now, so the KV cache is sized after it
             from xtier.cache.pool import LayerPool
             self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id, dtype=self.dtype)
+            self.pool.tp_size = getattr(layer, 'moe_tp_size', 1)
             if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
         self.plan.pool = self.pool   # read by the prefill (residency of the FP4 path)
@@ -295,11 +315,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # it are decoded and only its columns are used). SGLang adds the ranks' partial outputs up.
         rank = int(getattr(layer, 'moe_tp_rank', 0) or 0)
         size = int(getattr(layer, 'moe_tp_size', 1) or 1)
-        full = self.inter
-        if size > 1 and full % size:
-            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: the intermediate size {full} does not divide over the '
-                               f'{size} tensor-parallel ranks')
-        part = full // size
+        part = self.inter   # this rank's intermediate size (SGLang splits the intermediate over the ranks)
+        full = part * size  # the expert's whole intermediate (the tensor as the checkpoint has it)
+        if full % 256:
+            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: the intermediate size {full} is not a multiple of '
+                               f"the IQ block's 256 values")
         self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=part,
                             swiglu_limit=self.swiglu_limit, scale_format='gsq',
                             swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
@@ -325,12 +345,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
 
     def process_weights_after_loading(self, layer):
-        if self.plan is None:   # some expert tensor never came through the loader
-            if not self.gsq:   # the GSQ experts are read from the file: nothing to wait for
+        if self.plan is None:   # some expert tensor never came through the loader: those weights would be garbage
+            missing = {n: c for n, c in self._missing.items() if c}
+            if self.gsq:   # the GSQ experts are read from the checkpoint file: nothing to wait for
                 logger.warning('xtier: layer %d: loading did not complete (experts missing per parameter: %s); '
-                               'handing the experts over now', self.cfg.layer_id,
-                               {n: c for n, c in self._missing.items() if c})
-            self._hand_off(layer)
+                               'handing the experts over now', self.cfg.layer_id, missing)
+                self._hand_off(layer)
+            else:
+                raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: loading did not complete (experts missing per '
+                                   f'parameter: {missing}); is the checkpoint complete?')
 
     def _upload_from_cache(self, slot, e0, e1, stream, up_first=False):
         """Staged prefill of a fully cached layer (XTIER_CACHE_PREFILL=staged): device copies of slots e0..e1 (filled
@@ -346,9 +369,12 @@ class XTierMoEMethod(FusedMoEMethodBase):
     # -- forward ----------------------------------------------------------------------------------------------------
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
         topk = dispatch_output.topk_output
+        if TopKOutputChecker.format_is_bypassed(topk):   # routing left to the MoE kernel: the standard ids, as KT's
+            topk = topk.to_standard()
         m = x.shape[0]
         if m == 0:
             return StandardCombineInput(hidden_states=x.new_zeros(x.shape))
@@ -524,16 +550,19 @@ class XTierMoEMethod(FusedMoEMethodBase):
         w_h.copy_(torch.where(gpu, 0.0, weights), non_blocking=True)
         staged = torch.cuda.Event()
         staged.record()
-        timing, batch = {}, config.cpu_prefill_batch()
+        timing, errors, batch = {}, [], config.cpu_prefill_batch()
 
         def cpu_part():
-            staged.synchronize()
-            t0 = time.perf_counter()
-            for start in range(0, m, batch):
-                n = min(batch, m - start)
-                self.plan.forward(n, k, x_h.data_ptr() + start * H * 2, ids_h.data_ptr() + start * k * 4,
-                                  w_h.data_ptr() + start * k * 4, out_c.data_ptr() + start * H * 4)
-            timing['cpu'] = time.perf_counter() - t0
+            try:
+                staged.synchronize()
+                t0 = time.perf_counter()
+                for start in range(0, m, batch):
+                    n = min(batch, m - start)
+                    self.plan.forward(n, k, x_h.data_ptr() + start * H * 2, ids_h.data_ptr() + start * k * 4,
+                                      w_h.data_ptr() + start * k * 4, out_c.data_ptr() + start * H * 4)
+                timing['cpu'] = time.perf_counter() - t0
+            except BaseException as e:   # re-raised after the join: out_c is not complete
+                errors.append(e)
 
         worker = threading.Thread(target=cpu_part, name='xtier-split-cpu')
         worker.start()
@@ -545,12 +574,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
             gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
         finally:
             worker.join()
+        if errors:
+            raise errors[0]
         out = out_g + out_c.to(x.device, non_blocking=True)
         cost = XTierMoEMethod._split_cost
-        if 'cpu' in timing:
-            cost['cpu_ms'] = 0.8 * cost['cpu_ms'] + 0.2 * timing['cpu'] * 1e3 / ((E - g) * m)
+        cost['cpu_ms'] = 0.8 * cost['cpu_ms'] + 0.2 * timing['cpu'] * 1e3 / ((E - g) * m)
         cost['gpu_ms'] = 0.8 * cost['gpu_ms'] + 0.2 * gpu_s * 1e3 / g
-        self.last_split = dict(m=m, gpu_experts=g, cpu_ms=round(timing.get('cpu', 0) * 1e3, 1),
+        self.last_split = dict(m=m, gpu_experts=g, cpu_ms=round(timing['cpu'] * 1e3, 1),
                                gpu_ms=round(gpu_s * 1e3, 1))
         return out
 

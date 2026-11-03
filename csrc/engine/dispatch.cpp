@@ -1,5 +1,4 @@
-// Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
-// renamed only, so the kernels compile to the same code.
+// Ported from lkqmoe 0.5.6 (commit 93edcc1).
 // One libxtier.so for hosts with and without AVX512: src/xtier.cpp is built twice, into
 // libxtier_avx512.so (AVX512 BF16/VBMI) and libxtier_avx2.so (AVX2/FMA), with prefixed API names
 // (avx512_ / avx2_). This file, compiled for baseline x86-64, exports the public xtier_* API and
@@ -19,7 +18,6 @@ struct Impl {
     const char *(*last_error)();
     const char *(*isa)();
     void *(*create3)(int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
-    void *(*create2)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
     void *(*create5)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,
                      const uint8_t*,float,float,long,long,long,long,long);
     int (*gsq_decode)(int,const uint8_t*,float*,int);
@@ -50,11 +48,18 @@ Impl impl_storage;
 std::string error;
 
 // Must match the compile flags of the two builds (CMakeLists.txt XTIER_AVX512_FLAGS /
-// XTIER_AVX2_FLAGS).
-bool has_avx512() {
-    return __builtin_cpu_supports("x86-64-v4")&&__builtin_cpu_supports("avx512bf16")&&__builtin_cpu_supports("avx512vbmi");
+// XTIER_AVX2_FLAGS). Feature by feature: GCC 11 has no x86-64-v3 / -v4 names here (the levels' F16C,
+// LZCNT and MOVBE come with every AVX2 + FMA + BMI2 CPU).
+bool has_avx2() {
+    return __builtin_cpu_supports("avx2")&&__builtin_cpu_supports("fma")&&__builtin_cpu_supports("bmi")&&
+           __builtin_cpu_supports("bmi2");
 }
-bool has_avx2() {return __builtin_cpu_supports("x86-64-v3");}
+bool has_avx512() {
+    return has_avx2()&&__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw")&&
+           __builtin_cpu_supports("avx512cd")&&__builtin_cpu_supports("avx512dq")&&
+           __builtin_cpu_supports("avx512vl")&&__builtin_cpu_supports("avx512bf16")&&
+           __builtin_cpu_supports("avx512vbmi");
+}
 
 std::string own_directory() {
     Dl_info info{};
@@ -77,7 +82,7 @@ const Impl *load(const char *isa) {
     if(!h){const char *e=dlerror();error="xtier: cannot load "+path+": "+(e?e:"?");return nullptr;}
     Impl &m=impl_storage;std::string p=std::string(isa)+"_";
     bool ok=bind(h,p,"xtier_last_error",m.last_error)&&bind(h,p,"xtier_isa",m.isa)&&
-            bind(h,p,"xtier_create3",m.create3)&&bind(h,p,"xtier_create2",m.create2)&&
+            bind(h,p,"xtier_create3",m.create3)&&
             bind(h,p,"xtier_set_swiglu",m.set_swiglu)&&bind(h,p,"xtier_shape",m.shape)&&bind(h,p,"xtier_read_probe",m.read_probe)&&
             bind(h,p,"xtier_forward",m.forward)&&bind(h,p,"xtier_retain",m.retain)&&
             bind(h,p,"xtier_destroy",m.destroy)&&bind(h,p,"xtier_last_timings",m.last_timings)&&
@@ -123,11 +128,6 @@ void *xtier_create3(int h,int i,int e,int t,float l,int f,
                      const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                      const float *g13,const float *g2) {
     auto p=impl();return p?p->create3(h,i,e,t,l,f,w13,w2,s13,s2,g13,g2):nullptr;
-}
-void *xtier_create2(int hidden,int inter,int experts,int threads,float swiglu_limit,
-                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
-                     const float *g13,const float *g2) {
-    auto p=impl();return p?p->create2(hidden,inter,experts,threads,swiglu_limit,w13,w2,s13,s2,g13,g2):nullptr;
 }
 // The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values as FP32.
 int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n) {
