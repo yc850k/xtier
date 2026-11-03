@@ -31,9 +31,9 @@ import torch
 import triton
 
 from xtier import arch, config
-from xtier.backend.gsq_gpu import down, gate_up, tables
+from xtier.backend.gsq_gpu import down, down_tiles, gate_up, gate_up_tiles, tables
 from xtier.backend.kernels import Pointer
-from xtier.backend.prefill import _check, _runtime
+from xtier.backend.prefill import _check, _reduce, _runtime
 from xtier.engine import _P
 from xtier.cache.pool import (BLOCK, MAX_LAYERS, MAX_M, RING, _commit, _combine, _glob, _pack, _scratch,
                           _tl_dtype, _unpack)
@@ -241,9 +241,105 @@ class GsqPool:
                                                    m * self.H, BLOCK)
 
 
+def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
+    """The prefill of a partly cached layer: the routes to the cached experts on the GPU (their IQ blocks decoded in
+    the tile kernels), the others at the same time on the CPU engine (FP32); the two partial sums are added in FP32.
+
+    x: the activations [m, H] in the model's dtype, ids: int32 [m, k], weights: FP32 [m, k] (device tensors, current
+    stream) -> FP32 [m, H]. The residency is read once at the start (the swaps are applied by the decode windows,
+    which do not run meanwhile).
+
+    The batched prefill is where the hot experts pay off: their bytes are in the VRAM (the upload happened once, at
+    the load), so the GPU decodes them for every route of the batch and the CPU engine only sees the routes of the
+    experts that are not cached.
+    """
+    import threading
+
+    H, I, E = pool.H, pool.I, pool.E
+    m, k = ids.shape
+    if pool.full:
+        raise ValueError('xtier cache: the GSQ prefill is for a partly cached layer')
+    if pool.tables is None:
+        pool.tables = tables(torch.device('cuda', torch.cuda.current_device()))
+    t = pool.tables
+    # the routes of the cached experts (the slot of the expert, -1 if it is not in the VRAM)
+    di = ids.reshape(-1)
+    on_gpu = pool.table[di] >= 0
+    order = torch.argsort(di, stable=True)          # the routes sorted by the expert
+    gpu_order = order[on_gpu[order]]                 # the cached experts' routes, in that order
+    n_gpu = int(gpu_order.numel())
+    # the CPU part: the routes of the experts that are not in the VRAM (the engine skips the others, the id -1)
+    x_h = torch.empty((m, H), dtype=torch.bfloat16, pin_memory=True)
+    ids_h = torch.empty((m, k), dtype=torch.int32, pin_memory=True)
+    w_h = torch.empty((m, k), dtype=torch.float32, pin_memory=True)
+    out_h = torch.empty((m, H), dtype=torch.float32, pin_memory=True)
+    x_h.copy_(x, non_blocking=True)
+    ids_h.copy_(torch.where(on_gpu.reshape(m, k), -1, ids).to(torch.int32), non_blocking=True)
+    w_h.copy_(weights, non_blocking=True)
+    errors = []
+    cpu_done = []
+
+    def cpu_part():
+        try:
+            for s0 in range(0, m, cpu_batch):
+                n = min(cpu_batch, m - s0)
+                plan.forward(n, k, x_h.data_ptr() + s0 * H * 2, ids_h.data_ptr() + s0 * k * 4,
+                             w_h.data_ptr() + s0 * k * 4, out_h.data_ptr() + s0 * H * 4)
+        except BaseException as e:   # re-raised by the caller after the join
+            errors.append(e)
+        cpu_done.append(_time.perf_counter())
+
+    import time as _time
+    worker = threading.Thread(target=cpu_part, name='xtier-gsq-prefill')
+    worker.start()
+    _t0 = _time.perf_counter()
+    try:
+        out_g = torch.zeros((m, H), dtype=torch.float32, device=x.device)
+        if n_gpu:
+            # the tiles of the cached experts: the routes of one expert, BM at a time
+            bm = int(os.environ.get('XTIER_GSQ_PREFILL_TILE_M', '32'))
+            bn = int(os.environ.get('XTIER_GSQ_PREFILL_TILE_N', '16'))
+            counts = torch.bincount(di[on_gpu], minlength=E).cpu().tolist()
+            slots = pool.table.cpu().tolist()
+            tiles, offset = [], 0
+            for e in range(E):
+                c = counts[e]
+                if not c or slots[e] < 0:
+                    continue
+                for q in range(0, c, bm):
+                    tiles.append((e, slots[e], offset + q, offset + c))
+                offset += c
+            meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
+            mid = torch.empty((n_gpu, I), dtype=pool.dtype, device=x.device)
+            routes = torch.zeros((m * k, H), dtype=torch.float32, device=x.device)
+            nt = len(tiles)
+            gate_up_tiles[(nt, I // bn)](
+                x, gpu_order, meta[0], meta[1], meta[2], meta[3], pool.arena, pool.arena16, pool.types, pool.offs,
+                mid, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
+                bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
+            down_tiles[(nt, H // bn)](
+                mid, gpu_order, meta[0], meta[1], meta[2], meta[3], pool.arena, pool.arena16, pool.types, pool.offs,
+                routes, H, I, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
+                bm, bn, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
+            # the per-token sum of the GPU's routes (the CPU's routes have no partial)
+            w_gpu = torch.where(on_gpu.reshape(m, k), weights, 0.0).reshape(-1)
+            _reduce[(m, triton.cdiv(H, 256))](routes, w_gpu, out_g, k, 256, H)
+        _t_gpu = _time.perf_counter()
+    finally:   # before the caller may run this layer again (elastic cache): the CPU plan takes one caller
+        worker.join()
+    if os.environ.get('XTIER_TIMING', '0') == '1':
+        logger.info('xtier: the GSQ prefill of layer %d: %d tokens, %d of %d routes on the GPU (%d experts in the '
+                    'VRAM, %d of the %d the routes hit): the GPU part %.1f ms, the CPU part %.1f ms', pool.layer_id, m,
+                    n_gpu, m * k, int((pool.table >= 0).sum()), int(torch.unique(di).numel()), E,
+                    (_t_gpu - _t0) * 1e3, ((cpu_done[0] - _t0) * 1e3 if cpu_done else 0.0))
+    if errors:
+        raise errors[0]
+    return out_g + out_h.to(x.device, non_blocking=True)
+
+
 def fill_all():
     """Fill the GSQ pools' slots with the hot experts (the pack's usage profile's ranking) and let the adaptive
-    policy follow the routes (the swaps copy the experts from the engine's RAM slots)."""
+    policy follow the routes (the swaps copy the experts from the engine's RAM shards)."""
     todo = [p for p in GsqPool.layers if not p.filled]
     if not todo:
         return 0

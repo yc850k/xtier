@@ -260,3 +260,81 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
         w = _iq_vals(td, ARENA, ARENA16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
         acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
+
+
+@triton.jit
+def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, MID, K: tl.constexpr,
+                  H: tl.constexpr, I: tl.constexpr, LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
+                  ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16):
+    """The gate and the up of a cached expert for the routes of one tile (a batched prefill).
+
+    Program (tile, row tile): the rows n of the expert's gate and up (I rows of H values, a run of 256-value blocks a
+    row) for the routes of the tile (the tokens that chose the expert). The intermediate (SiLU(gate) * up) goes to
+    MID[route, n]. The IQ blocks are decoded in FP32 and the dot takes them in FP16, as the decode kernels do.
+    """
+    tile = tl.program_id(0)
+    e = tl.load(TILE_E + tile).to(tl.int64)
+    slot = tl.load(TILE_S + tile).to(tl.int64)
+    base = slot * STRIDE
+    tg = tl.load(TYPES + e * 3)
+    tu = tl.load(TYPES + e * 3 + 1)
+    og = tl.load(OFFS + e * 3).to(tl.int64)
+    ou = tl.load(OFFS + e * 3 + 1).to(tl.int64)
+    bg = _block_bytes(tg).to(tl.int64)
+    bu = _block_bytes(tu).to(tl.int64)
+    rg = (H // 256) * bg     # the bytes of a gate row
+    ru = (H // 256) * bu     # the bytes of an up row
+    r = tl.load(TILE_START + tile) + tl.arange(0, BM)
+    rm = r < tl.load(TILE_END + tile)
+    tok = (tl.load(ORDER + r, rm, 0) // K).to(tl.int64)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    accg = tl.zeros((BM, BN), dtype=tl.float32)
+    accu = tl.zeros((BM, BN), dtype=tl.float32)
+    for kb in range(H // 256):
+        ke = kb * 256 + tl.arange(0, 256)
+        xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
+        wg = _iq_vals(tg, ARENA, ARENA16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
+        wu = _iq_vals(tu, ARENA, ARENA16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
+        accg = tl.dot(xe, tl.trans(wg), accg)
+        accu = tl.dot(xe, tl.trans(wu), accu)
+    g = accg
+    u = accu
+    if LIMIT > 0:
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+        g = tl.minimum(g, LIMIT)
+    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+        val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
+    else:
+        val = g / (1.0 + tl.exp(-g)) * u
+    tl.store(MID + r[:, None].to(tl.int64) * I + n[None, :], val.to(DT), mask=rm[:, None])
+
+
+@triton.jit
+def down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, ROUTES,
+               H: tl.constexpr, I: tl.constexpr, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
+               DT: tl.constexpr = tl.float16):
+    """The down of a cached expert for the routes of one tile (a batched prefill).
+
+    Program (tile, row tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row)
+    for the routes of the tile. The partial output goes to ROUTES[route, h] (FP32), the per-token sum of the routes
+    is the caller's.
+    """
+    tile = tl.program_id(0)
+    e = tl.load(TILE_E + tile).to(tl.int64)
+    slot = tl.load(TILE_S + tile).to(tl.int64)
+    base = slot * STRIDE
+    td = tl.load(TYPES + e * 3 + 2)
+    od = tl.load(OFFS + e * 3 + 2).to(tl.int64)
+    bd = _block_bytes(td).to(tl.int64)
+    rd = (I // 256) * bd     # the bytes of a down row
+    r = tl.load(TILE_START + tile) + tl.arange(0, BM)
+    rm = r < tl.load(TILE_END + tile)
+    route = tl.load(ORDER + r, rm, 0).to(tl.int64)
+    h = tl.program_id(1) * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for kb in range(I // 256):
+        ke = kb * 256 + tl.arange(0, 256)
+        ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
+        w = _iq_vals(td, ARENA, ARENA16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
+        acc = tl.dot(ae, tl.trans(w), acc)
+    tl.store(ROUTES + route[:, None] * H + h[None, :], acc, mask=rm[:, None])

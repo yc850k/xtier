@@ -410,10 +410,16 @@ class XTierMoEMethod(FusedMoEMethodBase):
             out = self._decode(x, ids, weights, m, k)
             self.calls['decode'] += 1
         elif self.gsq:
-            # The experts are in the checkpoint file: the CPU engine does everything (the GPU prefill and the hot
-            # expert cache need the packed weights, which the GPU cannot decode).
-            out = self._cpu_prefill(x, ids, weights, m, k)
-            self.calls['cpu_prefill'] += 1
+            # The experts are in the checkpoint file: the CPU engine reads the ones that are not in the VRAM, and the
+            # GPU decodes the cached ones from their IQ blocks (the hot experts' bytes are in the VRAM, so a batched
+            # prefill costs no PCIe transfer at all).
+            if self.pool is not None and not self.pool.full:
+                from xtier.cache.gsq_pool import prefill as gsq_prefill
+                out = gsq_prefill(self.pool, self.plan, x, ids, weights, config.cpu_prefill_batch())
+                self.calls['hybrid_prefill'] += 1
+            else:
+                out = self._cpu_prefill(x, ids, weights, m, k)
+                self.calls['cpu_prefill'] += 1
         elif self.pool is not None and self.pool.full and config.resident_prefill():
             from xtier.cache.prefill import resident_prefill
             out = resident_prefill(self.prefill, self.pool.arena, x, ids, weights)

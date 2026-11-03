@@ -32,7 +32,7 @@ MODEL = {
               'title': '文本请求（81 token 提示、64 token 输出，TP=2，2026-11-03）：DEC = decode 的 tok/s（0.24→0.44，'
                        '随上下文增长），PRE = 冷 prefill 的 tok/s（热的时候 0.4）；瓶颈是 CPU 引擎的 MoE 与读盘，'
                        '不是显存（两张卡都用满：各 20.9/22.5 GB）'},
-    'options': common_options('DSpark', threads=('24', '16', '12'), contexts=('32768', '16384', '8192')) + [
+    'options': common_options('DSpark', threads=('24', '16', '12'), contexts=('1024', '512', '256')) + [
         miss_option(),
     ],
     'notes': [
