@@ -103,7 +103,8 @@ _glob = {}             # table [MAX_LAYERS, E], owner [MAX_LAYERS, E], state [2]
 
 @triton.jit
 def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT, SLOT_LIST, SLOT_EXP, OWNER,
-          NX, NK, K: tl.constexpr, S, HAS_ACT: tl.constexpr, SP: tl.constexpr, B: tl.constexpr):
+          NX, NK, K: tl.constexpr, S, HAS_ACT: tl.constexpr, SP: tl.constexpr, B: tl.constexpr,
+          UPLOAD, HOT: tl.constexpr = 0, SU: tl.constexpr = 0):
     i = tl.program_id(0) * B + tl.arange(0, B)
     # the engine reads BF16 (its contract): the activations are converted here, as on a BF16 host the round trip is
     # exact (on an FP16 host the model runs in FP16 and the engine still wants BF16)
@@ -115,6 +116,10 @@ def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT,
         if HAS_ACT:  # skipped tokens (truncated verify): -1 on both halves
             ids = tl.where(tl.load(ACT + j // K, mk, other=1) != 0, ids, -1)
         slot = tl.load(TABLE + ids, mk & (ids >= 0), other=-1)
+        if HOT > 0:
+            # the experts uploaded for this call (their slots are after the hot ones) also go to the GPU
+            up = tl.load(UPLOAD + ids, mk & (ids >= 0), other=-1)
+            slot = tl.where(slot >= 0, slot, tl.where(up >= 0, up + HOT, -1))
         tl.store(SIDS + j, tl.where(slot >= 0, -1, ids), mk)
         tl.store(SORIG + j, ids, mk)
         tl.store(SROUTE + j, tl.load(ROUTE + j, mk), mk)
@@ -125,11 +130,14 @@ def _pack(X, IDS, ROUTE, ACT, TABLE, SX, SIDS, SROUTE, SORIG, USED, RANK, RSLOT,
         tl.debug_barrier()
         tl.store(USED + slot, 1, mask=mk & (slot >= 0))
         tl.debug_barrier()
-        used = tl.load(USED + s, mask=s < S, other=0)
+        # the slot space: the hot experts and the ones a call uploaded (SU slots); the FP4 pool has only the hot ones
+        space: tl.constexpr = SU if SU > 0 else S
+        used = tl.load(USED + s, mask=s < space, other=0)
         rank = tl.cumsum(used, 0) - 1
-        tl.store(RANK + s, rank, mask=s < S)
-        tl.store(SLOT_LIST + rank, s, mask=(s < S) & (used > 0))
-        tl.store(SLOT_EXP + rank, tl.load(OWNER + s, mask=(s < S) & (used > 0), other=0), mask=(s < S) & (used > 0))
+        tl.store(RANK + s, rank, mask=s < space)
+        tl.store(SLOT_LIST + rank, s, mask=(s < space) & (used > 0))
+        tl.store(SLOT_EXP + rank, tl.load(OWNER + s, mask=(s < space) & (used > 0), other=0),
+                 mask=(s < space) & (used > 0))
         tl.debug_barrier()
         r = tl.load(RANK + slot, mask=mk & (slot >= 0), other=-1)
         tl.store(RSLOT + j, tl.where(slot >= 0, r, -1), mk)
@@ -602,7 +610,7 @@ class LayerPool:
             Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.bfloat16), Pointer(sids, torch.int32),
             Pointer(sroute, torch.int32), Pointer(sorig, torch.int32), self.used, self.rank, sc['rslot'],
             sc['slot_list'], sc['slot_exp'], self.owner, m * H, nk, k, self.S, bool(act),
-            triton.next_power_of_2(S), BLOCK)
+            triton.next_power_of_2(S), BLOCK, Pointer(self.table.data_ptr(), torch.int32), 0, 0)
 
     def decode(self, stream, m, k, x, ids, routing, out, act=0, dtype=None):
         """One decode call of up to 8 tokens on the current stream (device addresses; out: FP32 [m, H])."""

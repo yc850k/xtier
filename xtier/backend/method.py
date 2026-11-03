@@ -477,7 +477,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
             act = active.data_ptr() + start * 4 if active is not None else 0
             if self.pool is not None:
-                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act, x.dtype)
+                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act, x.dtype,
+                                 ids_tensor=ids[start:start + n])
                 continue
             slot = self.mailbox.slot(stream, n, k)
             kernels.pack(slot, n, k, xs, ids_s, ws, H, act, dtype=x.dtype)

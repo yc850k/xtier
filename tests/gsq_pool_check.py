@@ -175,19 +175,19 @@ ids_d = torch.from_numpy(ids).int().cuda()
 rw_d = torch.from_numpy(rw).float().cuda()
 gpu = torch.empty((M, H), dtype=torch.float32, device='cuda')
 pool.decode(torch.cuda.current_stream().cuda_stream, M, K, xd.data_ptr(), ids_d.data_ptr(), rw_d.data_ptr(),
-            gpu.data_ptr())
+            gpu.data_ptr(), ids_tensor=ids_d)
 torch.cuda.synchronize()
 got = gpu.cpu().numpy()
 
 errs = [rel(got[t], ref[t]) for t in range(len(CACHED))]
-err_cpu = max(rel(got[t], ref[t]) for t in range(len(CACHED), M))
+err_cpu = max(rel(got[t], ref[t]) for t in range(len(CACHED), M))   # the routes the GPU took (uploaded)
 err_ref = max(rel(got[t], want[t]) for t in range(len(CACHED)))
 print('xtier: the GPU\'s experts against the engine\'s: relative L2 ' +
       ', '.join(f'{int(types[e])}/{int(types_down[e])}: {err:.2e}' for e, err in zip(CACHED, errs)) +
       f' (the engine against the FP32 reference: {rel(ref[0], want[0]):.2e})')
 check(max(errs) < TOL, f'the GPU\'s experts against the engine\'s (relative L2 {max(errs):.2e}, tolerance {TOL:.0e})')
 check(err_ref < TOL, f'the GPU\'s experts against the FP32 reference (relative L2 {err_ref:.2e})')
-check(err_cpu == 0.0, f'the CPU\'s routes through the pool are the engine\'s own (relative L2 {err_cpu:.2e})')
+check(err_cpu < TOL, f'the routes the pool uploaded and computed (relative L2 {err_cpu:.2e}, tolerance {TOL:.0e})')
 
 box.close()
 plan.close()

@@ -183,7 +183,8 @@ def _block_bytes(TYPE):
 @triton.jit
 def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.constexpr, I: tl.constexpr,
             LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
-            ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16):
+            ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16,
+            HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None):
     """The gate and the up of a cached expert: its IQ blocks decoded and multiplied by the tokens.
 
     Program (route, tile): the rows n of the expert's gate and up (I rows of H values, a run of 256-value blocks a
@@ -200,7 +201,15 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.c
         return
     row = p
     e = tl.load(SLOT_EXP + p).to(tl.int64)
-    base = slot.to(tl.int64) * STRIDE
+    # the hot experts live in the pool's arena, the ones uploaded for this call in the scratch arena
+    arena = ARENA
+    arena16 = ARENA16
+    row_off = slot.to(tl.int64)
+    if HOT > 0 and slot >= HOT:
+        arena = ARENA2
+        arena16 = ARENA16_2
+        row_off = row_off - HOT
+    base = row_off * STRIDE
     tg = tl.load(TYPES + e * 3)
     tu = tl.load(TYPES + e * 3 + 1)
     og = tl.load(OFFS + e * 3).to(tl.int64)
@@ -216,8 +225,8 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.c
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
-        wg = _iq_vals(tg, ARENA, ARENA16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
-        wu = _iq_vals(tu, ARENA, ARENA16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
+        wg = _iq_vals(tg, arena, arena16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
+        wu = _iq_vals(tu, arena, arena16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
         accg = tl.dot(xe, tl.trans(wg), accg)
         accu = tl.dot(xe, tl.trans(wu), accu)
     g = accg
@@ -234,7 +243,8 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.c
 
 @triton.jit
 def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.constexpr, I: tl.constexpr,
-         STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr, DT: tl.constexpr = tl.float16):
+         STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr, DT: tl.constexpr = tl.float16,
+         HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None):
     """The down of a cached expert: its IQ blocks decoded and multiplied by the intermediate.
 
     Program (route, tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row) for
@@ -246,7 +256,14 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
         return
     row = p
     e = tl.load(SLOT_EXP + p).to(tl.int64)
-    base = slot.to(tl.int64) * STRIDE
+    arena = ARENA
+    arena16 = ARENA16
+    row_off = slot.to(tl.int64)
+    if HOT > 0 and slot >= HOT:
+        arena = ARENA2
+        arena16 = ARENA16_2
+        row_off = row_off - HOT
+    base = row_off * STRIDE
     td = tl.load(TYPES + e * 3 + 2)
     od = tl.load(OFFS + e * 3 + 2).to(tl.int64)
     bd = _block_bytes(td).to(tl.int64)
@@ -257,7 +274,7 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
     for kb in range(I // 256):
         ke = kb * 256 + tl.arange(0, 256)
         ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
-        w = _iq_vals(td, ARENA, ARENA16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
+        w = _iq_vals(td, arena, arena16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
         acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
 
@@ -276,6 +293,8 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
     e = tl.load(TILE_E + tile).to(tl.int64)
     slot = tl.load(TILE_S + tile).to(tl.int64)
     base = slot * STRIDE
+    arena = ARENA
+    arena16 = ARENA16
     tg = tl.load(TYPES + e * 3)
     tu = tl.load(TYPES + e * 3 + 1)
     og = tl.load(OFFS + e * 3).to(tl.int64)
@@ -293,8 +312,8 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
-        wg = _iq_vals(tg, ARENA, ARENA16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
-        wu = _iq_vals(tu, ARENA, ARENA16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
+        wg = _iq_vals(tg, arena, arena16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
+        wu = _iq_vals(tu, arena, arena16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
         accg = tl.dot(xe, tl.trans(wg), accg)
         accu = tl.dot(xe, tl.trans(wu), accu)
     g = accg
@@ -323,6 +342,8 @@ def down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16,
     e = tl.load(TILE_E + tile).to(tl.int64)
     slot = tl.load(TILE_S + tile).to(tl.int64)
     base = slot * STRIDE
+    arena = ARENA
+    arena16 = ARENA16
     td = tl.load(TYPES + e * 3 + 2)
     od = tl.load(OFFS + e * 3 + 2).to(tl.int64)
     bd = _block_bytes(td).to(tl.int64)
@@ -335,6 +356,6 @@ def down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16,
     for kb in range(I // 256):
         ke = kb * 256 + tl.arange(0, 256)
         ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
-        w = _iq_vals(td, ARENA, ARENA16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
+        w = _iq_vals(td, arena, arena16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
         acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(ROUTES + route[:, None] * H + h[None, :], acc, mask=rm[:, None])

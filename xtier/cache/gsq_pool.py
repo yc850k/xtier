@@ -121,13 +121,17 @@ class GsqPool:
             raise ValueError('xtier cache: too many layers')
         _glob['rows'] += 1
         self.table = _glob['table'][self.index]     # expert -> slot
-        self.owner = _glob['owner'][self.index]     # slot -> expert
-        self.used = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
-        self.rank = torch.empty(max(self.S, 1), dtype=torch.int32, device=dev)
+        self.owner = _glob['owner'][self.index]     # slot -> expert (the uploaded slots follow the hot ones)
+        # the slot space: the hot experts and the ones a call uploads (their slots are after the hot ones)
+        self.upload_slots = int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64'))
+        self.used = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
+        self.rank = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
         self.filled = False
         self.scratch = _scratch(self.H, self.I, self.dtype, dev)
         self.pinned = []          # the RAM slots registered with CUDA (pin_slots)
+        self.uploaded = torch.full((self.E,), -1, dtype=torch.int32,
+                                   device=dev)   # the experts uploaded for the current call (their slot)
         self.tables = None
         self._pool_on = False
         GsqPool.layers.append(self)
@@ -184,7 +188,8 @@ class GsqPool:
             Pointer(act or ids, torch.int32), self.table, Pointer(sx, torch.bfloat16), Pointer(sids, torch.int32),
             Pointer(sroute, torch.int32), Pointer(sorig, torch.int32), self.used, self.rank, sc['rslot'],
             sc['slot_list'], sc['slot_exp'], self.owner, m * self.H, nk, k, self.S, bool(act),
-            triton.next_power_of_2(max(self.S, 1)), BLOCK)
+            triton.next_power_of_2(max(self.S + self.upload_slots, 1)), BLOCK,
+            self.uploaded, self.S, self.S + self.upload_slots)
 
     def _kernels(self, m, k, x, routing, gout):
         """The GPU part: the gate/up and the down over the used slots, then the per-token sum of the GPU routes."""
@@ -194,18 +199,52 @@ class GsqPool:
         sc = self.scratch
         H, I = self.H, self.I
         nk = m * k
+        scratch = _scratch_arena(self, int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64')))
+        arena2 = scratch if scratch is not None else self.arena
+        arena16_2 = arena2.view(torch.uint16)
         gate_up[(nk, I // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
             sc['mid'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
-            MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2)
+            MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2,
+            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2)
         down[(nk, H // BN)](
             sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs, sc['part'],
             m, H, I, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'], MAX_M, BN,
-            DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2)
+            DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2,
+            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2)
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout, H, k,
                                             MAX_M, 1024)
 
-    def decode(self, stream, m, k, x, ids, routing, out, act=0, dtype=None):
+    def _upload_routed(self, ids):
+        """The experts this call routes to that are not in the VRAM: uploaded over PCIe into the scratch arena, so
+        the GPU decodes them and the engine does not see them.
+
+        The bytes come from the engine's RAM (the cold pool's resident set) when the expert is there, else from the
+        checkpoint's files. The upload is what makes the decode GPU-first: the card decodes the IQ blocks about a
+        hundred times faster than the engine's AVX2 kernels.
+        """
+        self.uploaded.fill_(-1)
+        flat = ids.reshape(-1)
+        flat = flat[flat >= 0]
+        if flat.numel() == 0:
+            return 0
+        uniq = torch.unique(flat)
+        want = uniq[self.table[uniq] < 0]         # the ones not in the VRAM
+        if want.numel() == 0:
+            return 0
+        slots = int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64'))
+        arena = _scratch_arena(self, slots)
+        if arena is None:
+            return 0
+        take = min(int(want.numel()), int(arena.shape[0]))
+        experts = want[:take].tolist()
+        _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
+        self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
+        # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
+        self.owner[self.S:self.S + take] = want[:take]
+        return take
+
+    def decode(self, stream, m, k, x, ids, routing, out, act=0, dtype=None, ids_tensor=None):
         """One decode call of up to 8 tokens on the current stream (device addresses; out: FP32 [m, H]).
 
         The routes of the cached experts go to the CPU with the id -1 (the engine skips them) and are computed here;
@@ -220,6 +259,8 @@ class GsqPool:
             if self.mailbox.lib.xtier_mailbox_pool_enable(self.mailbox.bridge, 1) < 0:
                 raise RuntimeError(self.mailbox.error())
             self._pool_on = True
+        if ids_tensor is not None:
+            self._upload_routed(ids_tensor)
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
         if config.debug():
