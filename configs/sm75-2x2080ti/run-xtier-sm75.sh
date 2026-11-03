@@ -94,6 +94,9 @@ export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFIL
 # The dense weights alone take 73% of a card (16.4 GB), so the KV cache (the context here is a few hundred tokens)
 # and the hot experts share what is left.
 export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-14} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-500}
+# The adaptive residency: the counts decay slowly and the gain bar is low, so the slots follow the routes the decode
+# really makes (the profile's ranking is the production traffic's, a different traffic needs the swaps).
+export XTIER_CACHE_DECAY=${XTIER_CACHE_DECAY:-0.95} XTIER_CACHE_MIN_GAIN=${XTIER_CACHE_MIN_GAIN:-1.05}
 # The batched prefill uploads the experts the batch routes to (the ones that are not in the VRAM) over PCIe and
 # decodes them on the GPU: the scratch arena they go into (shared by the layers) is this many slots.
 # The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 128 slots are 1 GB.
