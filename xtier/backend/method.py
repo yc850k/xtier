@@ -340,7 +340,12 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
         # drive). The routed experts that are not in RAM are read from there when a forward needs them.
         if gsq_cold.enabled():
-            gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0)
+            resident = gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0)
+            if self.pool is not None:
+                # the engine's RAM slots registered with CUDA: the GPU reads them at the full PCIe speed (the
+                # upload of a batched prefill copies the experts' bytes from there)
+                from xtier.cache.gsq_pool import pin_slots
+                pin_slots(self.pool, self.plan, resident)
         logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
 

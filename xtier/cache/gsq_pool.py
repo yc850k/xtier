@@ -127,6 +127,7 @@ class GsqPool:
         self.resident = [-1] * self.S
         self.filled = False
         self.scratch = _scratch(self.H, self.I, self.dtype, dev)
+        self.pinned = []          # the RAM slots registered with CUDA (pin_slots)
         self.tables = None
         self._pool_on = False
         GsqPool.layers.append(self)
@@ -309,6 +310,44 @@ def _upload(pool, plan, experts, arena, stream):
             finally:
                 if ram >= 0:
                     lib.xtier_slot_unpin(handle, ram)
+
+
+def pin_slots(pool, plan, count):
+    """The engine's RAM slots registered with CUDA: the pages stay where they are (no swap) and the GPU can read
+    them at the full PCIe speed.
+
+    The upload of a batched prefill copies the experts' bytes from there (the cold pool's RAM), and a pageable copy
+    goes through the driver's staging buffer at a tenth of the bandwidth. The FP4 path does the same for its shards
+    (backend/prefill.py: ensure_registered).
+
+    count: the engine's RAM slots of this layer (the cold pool's resident experts).
+    """
+    if os.environ.get('XTIER_GSQ_PIN', '1') == '0':
+        return 0
+    cudart = _runtime()
+    cudart.cudaHostRegister.argtypes = [C.c_void_p, C.c_size_t, C.c_uint]
+    cudart.cudaHostRegister.restype = C.c_int
+    cudart.cudaHostUnregister.argtypes = [C.c_void_p]
+    cudart.cudaHostUnregister.restype = C.c_int
+    lib = plan.lib
+    ptrs = (C.c_void_p * 3)()
+    sizes = (C.c_size_t * 3)()
+    done = 0
+    for slot in range(int(count)):
+        if lib.xtier_gsq_slot_pieces(plan.plan, slot, C.cast(ptrs, C.c_void_p), C.cast(sizes, C.c_void_p)) != 0:
+            break
+        base = ptrs[0]
+        total = int(sizes[0]) + int(sizes[1]) + int(sizes[2])
+        if cudart.cudaHostRegister(C.c_void_p(base), C.c_size_t(total), 0) != 0:
+            logger.warning('xtier cache: the RAM slots of layer %d could not be registered with CUDA (the upload '
+                           'stays pageable)', pool.layer_id)
+            break
+        pool.pinned.append(base)
+        done += total
+    if done:
+        logger.info('xtier cache: layer %d: %.1f GiB of the engine\'s RAM registered with CUDA (the GPU reads it '
+                    'at the full PCIe speed)', pool.layer_id, done / 2 ** 30)
+    return done
 
 
 def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
