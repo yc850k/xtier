@@ -327,7 +327,8 @@ class GsqPool:
         take = min(int(want.numel()), int(arena.shape[0]))
         experts = want[:take].tolist()
         if config.timing():
-            self.sync_ms += (time.perf_counter() - t_sync) * 1e3
+            t_ids = time.perf_counter()
+            self.sync_ms += (t_ids - t_sync) * 1e3
         # The cold pool: the experts this call routes to are read into the engine's RAM (the coldest resident
         # leaves), so the upload reads their bytes from the pinned RAM instead of the checkpoint's files, and the
         # RAM's contents follow the routes the GPU is really asked for.
@@ -341,7 +342,7 @@ class GsqPool:
                 self.cold_ms += (time.perf_counter() - t_cold) * 1e3
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
         if config.timing():
-            self.copy_ms += (time.perf_counter() - t_sync) * 1e3 - self.sync_ms
+            self.copy_ms += (time.perf_counter() - t_ids) * 1e3
         self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
         # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
         self.owner[self.S:self.S + take] = want[:take]

@@ -111,22 +111,25 @@ export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-128}
 export XTIER_GSQ_PREFILL_TILE_M=${XTIER_GSQ_PREFILL_TILE_M:-8}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
-# RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,
-# 27.7 GB a rank), 0.3 would ask for 195 GB and the cgroup would throttle the load (it never finishes).
+# RAM, so with two ranks the pool needs twice as much memory.
 export XTIER_COLD=${XTIER_COLD:-1} XTIER_COLD_THREADS=${XTIER_COLD_THREADS:-8}
+# The cold pool's share of the experts that are NOT in RAM: the RAM holds the rest, and the GPU's traffic touches
+# 116-125 experts of a layer, so the pool needs a bit more than that to stop its LRU from churning (the reads from the
+# drive are 1.8 ms a layer call at 0.55, 2.9 ms at 0.65). The slices make the slots two thirds of the bytes, so the
+# pool's RAM is 71 GB of the unit's 141 (the page cache keeps the rest). With one rank the whole set fits in the RAM.
+if [ -z "${XTIER_COLD_FRACTION:-}" ]; then
+  if [ "$TP" -gt 1 ]; then export XTIER_COLD_FRACTION=0.55; else export XTIER_COLD_FRACTION=0; fi
+fi
 # The cold pool's RAM holds the hot experts (the engine reads them there), the rest are read from the Optane drive
 # when a forward routes to them (the store's own files, O_DIRECT).
 #
 # The budget, measured: the whole expert set is 118.9 GB (384 experts x 40 layers x 7.74 MB) and the host has 141 GB
 # of RAM. Each rank holds its own copy of the experts it computes, so the RAM holds the set as many times as there are
 # ranks that compute the same experts: with one rank the whole set fits (the cold fraction 0: nothing on the drive but
-# the store's copy), with two ranks (TP=2, no expert split) each rank holds a share of it. The fraction 0.65 (115 of
-# 384 experts a layer, 36 GB a rank, 71 GB for the two) leaves room for the engine's own buffers and the page cache:
-# the fraction 0.54 measured 135 GB of the 141 GB, and 0.3 (269 experts a rank, 167 GB for the two) took the server
-# with the OOM killer.
-if [ -z "${XTIER_COLD_FRACTION:-}" ]; then
-  if [ "$TP" -gt 1 ]; then export XTIER_COLD_FRACTION=0.65; else export XTIER_COLD_FRACTION=0; fi
-fi
+# the store's copy), with two ranks (TP=2) each rank holds a share of it. The slots hold the rank's slice of an expert
+# (5.2 MB), so the fraction 0.55 (173 of 384 experts a layer, 36 GB a rank, 71 GB for the two) leaves room for the
+# engine's own buffers and the page cache (37 GB on this host): the fraction 0.3 (269 experts a rank, 167 GB for the
+# two) took the server with the OOM killer.
 # The engine's RAM registered with CUDA (the upload of a batched prefill copies the experts' bytes from there): the
 # pages are locked, so the limit has to allow for them. 18.5 GB is the default here; the whole set needs more.
 ulimit -l unlimited 2>/dev/null || true
