@@ -350,7 +350,11 @@ class GsqPool:
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
         if config.timing():
             self.copy_ms += (time.perf_counter() - t_ids) * 1e3
-        self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
+        # a scatter and not an indexed assignment: the assignment with a tensor index makes the framework look for
+        # the non-zero entries of the index first, and that is a device sync - the CPU would wait for the whole
+        # queue of the card, and the card waits for the CPU. The experts are unique (torch.unique), so the scatter
+        # writes the same slots.
+        self.uploaded.scatter_(0, want[:take], torch.arange(take, dtype=torch.int32, device=ids.device))
         # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
         self.owner[self.S:self.S + take] = want[:take]
         # the counters of the residency: the uploaded experts and the bytes they cost
