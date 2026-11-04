@@ -62,11 +62,17 @@ def _base(ROW0, ROW_STRIDE, BLK, BLOCK_BYTES, BN: tl.constexpr):
 @triton.jit
 def _iq2_xxs(B8, B16, BASE, G3, KS, BN: tl.constexpr):
     """IQ2_XXS (66 bytes a block): the fp16 d, then 8 groups of 32 values (two u32 each). A group's magnitudes come
-    from the iq2xxs grid (the byte at 8*index + j) and its signs from the sign masks."""
-    v = tl.arange(0, 256)
-    ib = (v // 32).to(tl.int64)          # the group of 32 values
-    ln = ((v % 32) // 8).to(tl.int64)    # the lane of 8 values in the group
-    j = (v % 8).to(tl.int64)             # the value in the lane
+    from the iq2xxs grid (the byte at 8*index + j) and its signs from the sign masks.
+
+    The values are decoded in three dimensions (the row, the group of eight values, the value in the group): the
+    group's codes and scales are the same for the eight values of a group, so they are loaded once for the group
+    instead of once for every value (the loads are what the kernel spends its time on: seven per value against
+    one and a half here).
+    """
+    g = tl.arange(0, 32)                    # the groups of eight values (the four lanes of the eight groups of 32)
+    ib = (g // 4).to(tl.int64)              # the group of 32 values
+    ln = (g % 4).to(tl.int64)               # the lane of 8 values in the group
+    j = tl.arange(0, 8)                     # the value in the lane
     # the group's u32s: aux32[0] at +2, aux32[1] at +6 (u16 loads: the addresses are even)
     i0 = BASE[:, None] // 2 + 1 + 4 * ib[None, :]
     a0 = tl.load(B16 + i0).to(tl.int32) | (tl.load(B16 + i0 + 1).to(tl.int32) << 16)
@@ -76,10 +82,10 @@ def _iq2_xxs(B8, B16, BASE, G3, KS, BN: tl.constexpr):
     db = d * (0.5 + (a1.to(tl.uint32) >> 28).to(tl.float32)) * 0.25
     # the group's four grid indices: the bytes of aux32[0]
     idx = (a0 >> (8 * ln[None, :])) & 0xFF
-    mag = tl.load(G3 + idx.to(tl.int64) * 8 + j[None, :]).to(tl.float32)
+    mag = tl.load(G3 + idx.to(tl.int64)[:, :, None] * 8 + j[None, None, :]).to(tl.float32)
     signs = tl.load(KS + ((a1 >> (7 * ln[None, :])) & 127)).to(tl.int32)
-    sign = tl.where(((signs >> j[None, :]) & 1) != 0, -1.0, 1.0)
-    return db * mag * sign
+    sign = tl.where(((signs[:, :, None] >> j[None, None, :]) & 1) != 0, -1.0, 1.0)
+    return tl.reshape(db[:, :, None] * mag * sign, (BN, 256))
 
 
 @triton.jit
