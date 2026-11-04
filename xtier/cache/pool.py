@@ -356,6 +356,8 @@ def _scratch(H, I, dtype, dev):
     if key not in _shared:
         _shared[key] = dict(
             mid=torch.empty((MAX_ROUTES, MAX_M, I), dtype=dtype, device=dev),
+            # the gate's values (FP32) between the two launches of the GSQ gate/up (see gsq_gpu.gate_up)
+            gate=torch.empty((MAX_ROUTES, MAX_M, I), dtype=torch.float32, device=dev),
             part=torch.empty((MAX_ROUTES, MAX_M, H), dtype=torch.float32, device=dev),
             gout=torch.empty((8, H), dtype=torch.float32, device=dev),
             rslot=torch.empty(MAX_ROUTES, dtype=torch.int32, device=dev),

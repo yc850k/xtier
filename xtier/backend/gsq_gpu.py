@@ -181,14 +181,17 @@ def _block_bytes(TYPE):
 
 
 @triton.jit
-def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.constexpr, I: tl.constexpr,
+def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H: tl.constexpr, I: tl.constexpr,
             LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16,
-            HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None):
-    """The gate and the up of a cached expert: its IQ blocks decoded and multiplied by the tokens.
+            HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, ROLE: tl.constexpr = 0):
+    """The gate (ROLE 0) or the up (ROLE 1) of a cached expert: its IQ blocks decoded and multiplied by the tokens.
 
-    Program (route, tile): the rows n of the expert's gate and up (I rows of H values, a run of 256-value blocks a
-    row) for the tokens of the call. The intermediate (SiLU(gate) * up) goes to MID[route, token, n].
+    Program (route, tile): the rows n of the expert's gate or up (I rows of H values, a run of 256-value blocks a
+    row) for the tokens of the call. The two roles are **two launches**: the decoded tiles of one role are
+    [BN, 256] FP32 (16 KB a tile), and both roles live at once do not fit in the registers (the kernel spilled
+    522 of them and ran six times slower). The gate's launch writes its FP32 values to GATE and the up's launch
+    reads them, so the intermediate is the one of a single launch: SiLU(gate) * up in FP32.
 
     ARENA/ARENA16: the slots' bytes (the uint8 and the uint16 view of them). TYPES: the type of every expert per role
     (the gate, the up, the down), OFFS: where an expert's three tensors start in its slot, STRIDE: the bytes of a
@@ -210,35 +213,31 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, M, H: tl.c
         arena16 = ARENA16_2
         row_off = row_off - HOT
     base = row_off * STRIDE
-    tg = tl.load(TYPES + e * 3)
-    tu = tl.load(TYPES + e * 3 + 1)
-    og = tl.load(OFFS + e * 3).to(tl.int64)
-    ou = tl.load(OFFS + e * 3 + 1).to(tl.int64)
-    bg = _block_bytes(tg).to(tl.int64)
-    bu = _block_bytes(tu).to(tl.int64)
-    rg = (H // 256) * bg     # the bytes of a gate row
-    ru = (H // 256) * bu     # the bytes of an up row
+    ty = tl.load(TYPES + e * 3 + ROLE)
+    o = tl.load(OFFS + e * 3 + ROLE).to(tl.int64)
+    b = _block_bytes(ty).to(tl.int64)
+    r = (H // 256) * b     # the bytes of a row
     tok = tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
-    accg = tl.zeros((BM, BN), dtype=tl.float32)
-    accu = tl.zeros((BM, BN), dtype=tl.float32)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
-        wg = _iq_vals(tg, arena, arena16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
-        wu = _iq_vals(tu, arena, arena16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
-        accg = tl.dot(xe, tl.trans(wg), accg)
-        accu = tl.dot(xe, tl.trans(wu), accu)
-    g = accg
-    u = accu
-    if LIMIT > 0:
-        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
-        g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
-        val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
+        w = _iq_vals(ty, arena, arena16, base + o + n.to(tl.int64) * r + kb * b, G1, G2, G3, KS, BN).to(tl.float16)
+        acc = tl.dot(xe, tl.trans(w), acc)
+    if ROLE == 0:
+        # the gate: its values (FP32) for the up's launch
+        tl.store(GATE + (row * BM + tok[:, None]) * I + n[None, :], acc, mask=tok[:, None] < M)
     else:
-        val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(DT), mask=tok[:, None] < M)
+        g = tl.load(GATE + (row * BM + tok[:, None]) * I + n[None, :], mask=tok[:, None] < M, other=0.0)
+        if LIMIT > 0:
+            g = tl.minimum(g, LIMIT)
+            acc = tl.minimum(tl.maximum(acc, -LIMIT), LIMIT)
+        if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+            val = g / (1.0 + tl.exp(-ALPHA * g)) * (acc + BETA)
+        else:
+            val = g / (1.0 + tl.exp(-g)) * acc
+        tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(DT), mask=tok[:, None] < M)
 
 
 @triton.jit
@@ -280,14 +279,17 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
 
 
 @triton.jit
-def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, MID, K: tl.constexpr,
-                  H: tl.constexpr, I: tl.constexpr, LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
-                  ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16):
-    """The gate and the up of a cached expert for the routes of one tile (a batched prefill).
+def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, MID, GATE,
+                  K: tl.constexpr, H: tl.constexpr, I: tl.constexpr, LIMIT, STRIDE, G1, G2, G3, KS,
+                  BM: tl.constexpr, BN: tl.constexpr, ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0,
+                  DT: tl.constexpr = tl.float16, ROLE: tl.constexpr = 0):
+    """The gate (ROLE 0) or the up (ROLE 1) of a cached expert for the routes of one tile (a batched prefill).
 
-    Program (tile, row tile): the rows n of the expert's gate and up (I rows of H values, a run of 256-value blocks a
-    row) for the routes of the tile (the tokens that chose the expert). The intermediate (SiLU(gate) * up) goes to
-    MID[route, n]. The IQ blocks are decoded in FP32 and the dot takes them in FP16, as the decode kernels do.
+    Program (tile, row tile): the rows n of the expert's gate or up (I rows of H values, a run of 256-value blocks a
+    row) for the routes of the tile. The two roles are **two launches** (the decoded tiles of both roles do not fit
+    in the registers at once: the kernel spills hundreds of them and runs several times slower). The gate's launch
+    writes its FP32 values to GATE and the up's launch reads them, so the intermediate is the one of a single launch:
+    SiLU(gate) * up in FP32.
     """
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
@@ -295,37 +297,33 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
     base = slot * STRIDE
     arena = ARENA
     arena16 = ARENA16
-    tg = tl.load(TYPES + e * 3)
-    tu = tl.load(TYPES + e * 3 + 1)
-    og = tl.load(OFFS + e * 3).to(tl.int64)
-    ou = tl.load(OFFS + e * 3 + 1).to(tl.int64)
-    bg = _block_bytes(tg).to(tl.int64)
-    bu = _block_bytes(tu).to(tl.int64)
-    rg = (H // 256) * bg     # the bytes of a gate row
-    ru = (H // 256) * bu     # the bytes of an up row
-    r = tl.load(TILE_START + tile) + tl.arange(0, BM)
-    rm = r < tl.load(TILE_END + tile)
-    tok = (tl.load(ORDER + r, rm, 0) // K).to(tl.int64)
+    ty = tl.load(TYPES + e * 3 + ROLE)
+    o = tl.load(OFFS + e * 3 + ROLE).to(tl.int64)
+    b = _block_bytes(ty).to(tl.int64)
+    r = (H // 256) * b     # the bytes of a row
+    rows = tl.load(TILE_START + tile) + tl.arange(0, BM)
+    rm = rows < tl.load(TILE_END + tile)
+    tok = (tl.load(ORDER + rows, rm, 0) // K).to(tl.int64)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
-    accg = tl.zeros((BM, BN), dtype=tl.float32)
-    accu = tl.zeros((BM, BN), dtype=tl.float32)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
-        wg = _iq_vals(tg, arena, arena16, base + og + n.to(tl.int64) * rg + kb * bg, G1, G2, G3, KS, BN).to(tl.float16)
-        wu = _iq_vals(tu, arena, arena16, base + ou + n.to(tl.int64) * ru + kb * bu, G1, G2, G3, KS, BN).to(tl.float16)
-        accg = tl.dot(xe, tl.trans(wg), accg)
-        accu = tl.dot(xe, tl.trans(wu), accu)
-    g = accg
-    u = accu
-    if LIMIT > 0:
-        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
-        g = tl.minimum(g, LIMIT)
-    if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
-        val = g / (1.0 + tl.exp(-ALPHA * g)) * (u + BETA)
+        w = _iq_vals(ty, arena, arena16, base + o + n.to(tl.int64) * r + kb * b, G1, G2, G3, KS, BN).to(tl.float16)
+        acc = tl.dot(xe, tl.trans(w), acc)
+    if ROLE == 0:
+        # the gate: its values (FP32) for the up's launch
+        tl.store(GATE + rows[:, None].to(tl.int64) * I + n[None, :], acc, mask=rm[:, None])
     else:
-        val = g / (1.0 + tl.exp(-g)) * u
-    tl.store(MID + r[:, None].to(tl.int64) * I + n[None, :], val.to(DT), mask=rm[:, None])
+        g = tl.load(GATE + rows[:, None].to(tl.int64) * I + n[None, :], mask=rm[:, None], other=0.0)
+        if LIMIT > 0:
+            g = tl.minimum(g, LIMIT)
+            acc = tl.minimum(tl.maximum(acc, -LIMIT), LIMIT)
+        if ALPHA != 1.0 or BETA != 0.0:   # GPT-OSS SwiGLU (MiniMax M3)
+            val = g / (1.0 + tl.exp(-ALPHA * g)) * (acc + BETA)
+        else:
+            val = g / (1.0 + tl.exp(-g)) * acc
+        tl.store(MID + rows[:, None].to(tl.int64) * I + n[None, :], val.to(DT), mask=rm[:, None])
 
 
 @triton.jit

@@ -23,6 +23,7 @@ tests/gsq_pool_check.py). Like the FP4 pool, the decode is per route: the routes
 GPU's part of a call costs about one expert's decode.
 """
 
+import collections
 import ctypes as C
 import logging
 import os
@@ -128,7 +129,8 @@ class GsqPool:
         self.rank = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
         self.stat = [0, 0, 0, 0]    # the residency counters (routed, hits, uploaded, bytes)
-        self.bytes = [0, 0]          # the uploaded bytes: the pinned RAM and the checkpoint's files
+        self.upload_bytes = [0, 0]  # the uploaded bytes: the pinned RAM and the checkpoint's files
+        self.routes = collections.Counter()   # the routed experts (the diagnostic)
         self.calls = 0                # this layer's decode calls (the residency log)
         self.filled = False
         self.scratch = _scratch(self.H, self.I, self.dtype, dev)
@@ -190,9 +192,16 @@ class GsqPool:
                         '(%.1f MiB over PCIe: %.1f from the pinned RAM, %.1f from the files)',
                         self.layer_id, int((self.table >= 0).sum()), self.E, self.calls,
                         self.table[self.table >= 0][:6].tolist(), self.calls - 1, self.stat[0], self.stat[1],
-                        self.stat[2], self.stat[3] / 2 ** 20, self.bytes[0] / 2 ** 20, self.bytes[1] / 2 ** 20)
+                        self.stat[2], self.stat[3] / 2 ** 20, self.upload_bytes[0] / 2 ** 20, self.upload_bytes[1] / 2 ** 20)
             self.stat = [0, 0, 0, 0]
-            self.bytes = [0, 0]
+            self.upload_bytes = [0, 0]
+        if os.environ.get('XTIER_ROUTE_STATS') and self.calls % 16 == 0:
+            counts = sorted(self.routes.values(), reverse=True)
+            total = sum(counts)
+            top = sum(counts[:64])
+            logger.info('xtier routes: layer %d: %d distinct experts, %d routes, the top 64 take %.1f%%, '
+                        'the top 14 take %.1f%%', self.layer_id, len(counts), total,
+                        100.0 * top / max(total, 1), 100.0 * sum(counts[:14]) / max(total, 1))
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
@@ -219,9 +228,14 @@ class GsqPool:
         arena16_2 = arena2.view(torch.uint16)
         gate_up[(nk, I // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
-            sc['mid'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'],
-            MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2,
-            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2)
+            sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
+            t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=0)
+        gate_up[(nk, I // BN)](
+            Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
+            sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
+            t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=1)
         down[(nk, H // BN)](
             sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs, sc['part'],
             m, H, I, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'], MAX_M, BN,
@@ -245,6 +259,12 @@ class GsqPool:
             return 0
         uniq = torch.unique(flat)
         want = uniq[self.table[uniq] < 0]         # the ones not in the VRAM
+        if os.environ.get('XTIER_ROUTE_STATS'):
+            self.routes.update(uniq.tolist())
+            if self.calls == 16:
+                import json
+                with open(f'/tmp/routes_{os.environ["XTIER_ROUTE_STATS"]}_{self.layer_id}.json', 'w') as f:
+                    json.dump(sorted(self.routes), f)
         self.stat[0] += int(uniq.numel())
         self.stat[1] += int(uniq.numel()) - int(want.numel())
         if want.numel() == 0:
@@ -376,7 +396,7 @@ def _upload(pool, plan, experts, arena, stream):
                                          f'{role}, the layout says {want}')
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
                     pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
-                    pool.bytes[0 if pinned else 1] += size
+                    pool.upload_bytes[0 if pinned else 1] += size
                     try:
                         if pinned:
                             # the RAM slot is registered with CUDA: the driver copies it straight to the card
@@ -562,12 +582,18 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
                     continue
                 meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
                 mid = torch.empty((int(order_part.numel()), I), dtype=pool.dtype, device=x.device)
+                gate_buf = torch.empty((int(order_part.numel()), I), dtype=torch.float32, device=x.device)
                 nt = len(tiles)
                 gate_up_tiles[(nt, I // bn)](
                     x, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
-                    pool.types, pool.offs, mid, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
+                    pool.types, pool.offs, mid, gate_buf, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
                     t['iq2xxs'], t['ksigns'], bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype),
-                    num_warps=4, num_stages=2)
+                    num_warps=4, num_stages=2, ROLE=0)
+                gate_up_tiles[(nt, I // bn)](
+                    x, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
+                    pool.types, pool.offs, mid, gate_buf, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
+                    t['iq2xxs'], t['ksigns'], bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype),
+                    num_warps=4, num_stages=2, ROLE=1)
                 down_tiles[(nt, H // bn)](
                     mid, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
                     pool.types, pool.offs, routes, H, I, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
