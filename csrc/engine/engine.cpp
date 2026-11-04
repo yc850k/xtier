@@ -1760,6 +1760,21 @@ public:
         // per expert and role ([e*3+role]): where the expert's tensor is in the store
         gsq_cold_file.assign(files,files+size_t(experts)*3);gsq_cold_off.assign(offsets,offsets+size_t(experts)*3);
         for(int e=0;e<experts;e++)if(gsq_cold_file[size_t(e)*3]<0)return -1;   // every expert is in the store
+        // The RAM slots hold the rank's slice of the expert: the rows of the gate and the up (the intermediate's
+        // rows, a contiguous range inside the tensor) and the whole down (its columns are strided inside a row, so a
+        // slice of it is not a range). The engine reads the slot's rows (the split's row offset is 0) and the down's
+        // columns (the split's column offset). The slots are then two thirds of the bytes, so the same RAM holds one
+        // and a half times the experts: the pool's working set fits and the drive is read once, not every call.
+        gsq_gate_size.assign(experts,0);gsq_up_size.assign(experts,0);gsq_down_size.assign(experts,0);
+        gsq_role_bytes.assign(3,0);
+        for(int e=0;e<experts;e++) {
+            gsq_gate_size[e]=gsq_gate_row[e]*size_t(gsq_row_count);
+            gsq_up_size[e]=gsq_up_row[e]*size_t(gsq_row_count);
+            gsq_down_size[e]=gsq_down_row[e]*size_t(hidden);
+            gsq_role_bytes[0]=std::max(gsq_role_bytes[0],gsq_gate_size[e]);
+            gsq_role_bytes[1]=std::max(gsq_role_bytes[1],gsq_up_size[e]);
+            gsq_role_bytes[2]=std::max(gsq_role_bytes[2],gsq_down_size[e]);
+        }
         // the RAM slots: the resident experts (the profile's ranking), the rest are read when they are routed to
         gsq_slot_reg.assign(3,0);
         size_t at=0;

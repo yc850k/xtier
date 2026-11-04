@@ -320,11 +320,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if full % 256:
             raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: the intermediate size {full} is not a multiple of '
                                f"the IQ block's 256 values")
+        # The split: the engine reads the RAM slots, which hold the rank's slice (the rows of the gate and the up, the
+        # whole down). The rows are at 0 in the slot (the slice starts there) and the down's columns at their own
+        # place (the down is whole in the slot).
+        sliced = gsq_cold.enabled()
         self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=part,
                             swiglu_limit=self.swiglu_limit, scale_format='gsq',
                             swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
                             gsq_types=(types_gate, types_up, types_down),
-                            gsq_split=(rank * part, part, rank * part, part, full))
+                            gsq_split=(0 if sliced else rank * part, part, rank * part, part, full))
         self.gsq_pack = pack
         self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file
         self.mailbox = Mailbox(self.plan)
@@ -340,7 +344,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
         # drive). The routed experts that are not in RAM are read from there when a forward needs them.
         if gsq_cold.enabled():
-            resident = gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0)
+            resident = gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0,
+                                       rank=rank, part=part)
             if self.pool is not None:
                 # the engine's RAM slots registered with CUDA: the GPU reads them at the full PCIe speed (the
                 # upload of a batched prefill copies the experts' bytes from there)

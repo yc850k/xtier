@@ -275,13 +275,14 @@ public:
             } else if(L.gsq_src.size()==size_t(L.E)*3) {
                 for(int r=0;r<3;r++)ptr[r]=const_cast<void*>(static_cast<const void*>(L.gsq_src[size_t(expert)*3+r]));
             } else return;   // no source: the slot keeps its old expert
-            // the rank's slice of each tensor starts inside it (the rows of the gate and the up)
+            // The rank's slice of each tensor starts inside it (the rows of the gate and the up): the checkpoint's
+            // files hold the whole tensor, the engine's RAM slot holds the slice already (the slot starts at the
+            // rank's first row).
             const int64_t *cut=L.gsq_src_off.size()==size_t(L.E)*3?L.gsq_src_off.data():nullptr;
             if(from_ram) {
                 for(int r=0;r<3;r++) {
                     char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
-                    const char *src=static_cast<const char*>(ptr[r])+(cut?cut[size_t(expert)*3+r]:0);
-                    check(cudaMemcpyAsync(dst,src,L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,stream));
+                    check(cudaMemcpyAsync(dst,ptr[r],L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,stream));
                 }
                 return;
             }

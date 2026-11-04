@@ -507,14 +507,18 @@ def _upload(pool, plan, experts, arena, stream):
             try:
                 for ri, (role, off, want) in enumerate(zip(ROLES, pool.offsets[e], pool.sizes[e])):
                     if sources is not None:
+                        # the engine's RAM slot: it holds the rank's slice (the slot starts at the rank's first row)
                         address, size = sources[ri]
+                        if size != want:
+                            raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} '
+                                             f'bytes of {role} in the RAM, the layout says {want}')
                     else:
+                        # the checkpoint's files: the whole tensor (the rank's slice starts inside it)
                         address, size, _ = pool.pack.expert_bytes(role, pool.layer_id, e)
-                    if size != pool.tensor_sizes[e][ri]:
-                        raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes of '
-                                         f'{role}, the layout says {pool.tensor_sizes[e][ri]}')
-                    # the rank's slice of the tensor (the rows of the gate and the up)
-                    address += pool.slice_off[e][ri]
+                        if size != pool.tensor_sizes[e][ri]:
+                            raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} '
+                                             f'bytes of {role}, the layout says {pool.tensor_sizes[e][ri]}')
+                        address += pool.slice_off[e][ri]
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
                     pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
                     pool.upload_bytes[0 if pinned else 1] += want
