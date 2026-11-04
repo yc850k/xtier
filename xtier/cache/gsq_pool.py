@@ -517,11 +517,13 @@ def _upload(pool, plan, experts, arena, stream):
             try:
                 for ri, (role, off, want) in enumerate(zip(ROLES, pool.offsets[e], pool.sizes[e])):
                     if sources is not None:
-                        # the engine's RAM slot: it holds the rank's slice (the slot starts at the rank's first row)
+                        # the engine's RAM slot: it holds the rank's slice (the slot starts at the rank's first row).
+                        # The slot's region is sized for the largest expert of the layer, so it can be bigger than
+                        # this expert's slice (the experts of a layer do not always share their type).
                         address, size = sources[ri]
-                        if size != want:
+                        if size < want:
                             raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} '
-                                             f'bytes of {role} in the RAM, the layout says {want}')
+                                             f'bytes of {role} in the RAM, the layout wants {want}')
                     else:
                         # the checkpoint's files: the whole tensor (the rank's slice starts inside it)
                         address, size, _ = pool.pack.expert_bytes(role, pool.layer_id, e)

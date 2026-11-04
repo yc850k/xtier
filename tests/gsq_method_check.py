@@ -175,7 +175,9 @@ with tempfile.TemporaryDirectory() as tmp:
     got = run(128)    # more than the decode path takes (XTIER_DECODE_MAX): the prefill branch
     check(np.isfinite(got).all() and np.abs(got).sum() > 0,
           f'the prefill through apply() (the CPU engine does it all, {got.shape[0]} tokens)')
-    check(method.calls['decode'] > 0 and method.calls['cpu_prefill'] > 0,
+    # the prefill branch: the CPU engine does it all on a plain layer, the GSQ pool takes the routes it can and the
+    # engine the rest (the counter says hybrid_prefill)
+    check(method.calls['decode'] > 0 and (method.calls['cpu_prefill'] > 0 or method.calls['hybrid_prefill'] > 0),
           f'the calls were counted ({method.calls})')
 
     # the adaptive residency: the GPU cache's set follows the routes. The expert below is in the engine's RAM (the
