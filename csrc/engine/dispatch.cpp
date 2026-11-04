@@ -31,6 +31,7 @@ struct Impl {
     int (*cold_attach_gsq)(void*,void*,void*,const int32_t*,const long long*,const int32_t*,int,const float*,float);
     int (*slot_pin)(void*,int);
     int (*cold_resident)(void*,int,int,const int32_t*);
+    int (*cold_prefetch)(void*,int);
     void (*slot_unpin)(void*,int);
     void (*cold_plan_stats)(void*,double*);
     int (*set_swiglu)(void*,float,float);
@@ -94,7 +95,7 @@ const Impl *load(const char *isa) {
             bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&bind(h,p,"xtier_gsq_slot_pieces",m.gsq_slot_pieces)&&
             bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_gsq_cold_attach",m.cold_attach_gsq)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
             bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats)&&
-            bind(h,p,"xtier_gsq_cold_resident",m.cold_resident);
+            bind(h,p,"xtier_gsq_cold_resident",m.cold_resident)&&bind(h,p,"xtier_gsq_cold_prefetch",m.cold_prefetch);
     if(!ok)return nullptr;
     m.name=isa;
     return &m;
@@ -167,6 +168,9 @@ int xtier_gsq_cold_attach(void *plan,void *store,const int32_t *files,const long
 int xtier_slot_pin(void *plan,int expert){auto p=impl();return p?p->slot_pin(plan,expert):-1;}
 int xtier_gsq_cold_resident(void *plan,int tokens,int k,const int32_t *ids) {
     auto p=impl();return p?p->cold_resident(plan,tokens,k,ids):-1;
+}
+int xtier_gsq_cold_prefetch(void *plan,int n) {
+    auto p=impl();return p?p->cold_prefetch(plan,n):-1;
 }
 void xtier_slot_unpin(void *plan,int slot){if(auto p=impl())p->slot_unpin(plan,slot);}
 void xtier_cold_plan_stats(void *plan,double *out){if(auto p=impl())p->cold_plan_stats(plan,out);}

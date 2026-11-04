@@ -74,6 +74,9 @@ def engine() -> C.CDLL:
         if hasattr(lib, 'xtier_gsq_cold_resident'):  # the GSQ cold pool: make the routed experts resident in RAM
             lib.xtier_gsq_cold_resident.argtypes = [_P, _I, _I, _P]
             lib.xtier_gsq_cold_resident.restype = _I
+        if hasattr(lib, 'xtier_gsq_cold_prefetch'):  # the GSQ cold pool: read the most routed experts in the background
+            lib.xtier_gsq_cold_prefetch.argtypes = [_P, _I]
+            lib.xtier_gsq_cold_prefetch.restype = _I
         _engine = lib
     return _engine
 
