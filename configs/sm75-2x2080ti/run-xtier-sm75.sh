@@ -105,6 +105,10 @@ export XTIER_CACHE_DECAY=${XTIER_CACHE_DECAY:-0.95} XTIER_CACHE_MIN_GAIN=${XTIER
 # The card's VRAM after the weights (12.1 GB) and the KV cache (3.3 GB at the minimum mem-fraction) is about 6 GB:
 # 26 hot slots a layer (5.4 GB) and the scratch (0.7 GB) fit in it, the rest is the CUDA context.
 export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-128}
+# The prefill's tiles: the routes of one expert at a time (the tile's rows of routes). A small tile keeps the kernel's
+# registers low (the decoded tile of 32 routes and 16 rows does not fit), which is worth twice the prefill's speed here
+# (the time to the first token: 47 s -> 26 s).
+export XTIER_GSQ_PREFILL_TILE_M=${XTIER_GSQ_PREFILL_TILE_M:-8}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
 # RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,

@@ -23,7 +23,8 @@
      那个让位），RAM 里于是就是 GPU 真正要的专家，上传从已 pin 的槽拷（满速 PCIe），**稳态下 checkpoint 的文件一次都
      不读了**（上传里来自文件的字节：每层每 192 次调用 748 MiB -> 0）。这一项把 decode 从 2.2 抬到 2.5-2.9 tok/s；
   6. **prefill 的 CPU 那半没了**：`XTIER_GSQ_PREFILL_UPLOAD=128`（暂存 arena 的槽数），批次路由到的专家全部由 GPU
-     算，CPU 引擎每层只剩 1-20 ms（原来 200-660 ms）；
+     算，CPU 引擎每层只剩 1-20 ms（原来 200-660 ms）；prefill 的 tile 也调小了（`XTIER_GSQ_PREFILL_TILE_M=8`：32 个
+     路由 × 16 行的 tile 寄存器放不下，decode 的内核已经用满 255 个），**首 token 的时间从 47 s 降到 26 s**；
   7. **15 tok/s 在这张卡上放不下**：decode 的 67 ms/token 预算，光是 GPU 上把路由到的专家的 IQ 块解开就要
      **85-130 ms/token**（1.4 G 个值，卡上 44 G 值/s），稠密权重本身又是 12.1 GB/卡（27 ms/token）。能压的是周围的
      等待，实测压到了 2.5-2.9 tok/s，剩下的时间是 PCIe 上那些显存里放不下的专家的字节（现在走内存，不再走盘）和每层
