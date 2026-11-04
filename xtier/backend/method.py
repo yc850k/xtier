@@ -428,13 +428,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if m <= config.decode_max() or capturing:
             if not capturing:   # short prompts never reach a prefill branch: the policy must start here too
                 self._cache_start()
-            t_apply = time.perf_counter() if config.timing() else 0.0
+            t_apply = time.thread_time() if config.timing() else 0.0
             out = self._decode(x, ids, weights, m, k)
             if config.timing():
-                XTierMoEMethod.py_ms += (time.perf_counter() - t_apply) * 1e3
+                XTierMoEMethod.py_ms += (time.thread_time() - t_apply) * 1e3
                 XTierMoEMethod.py_calls += 1
                 if XTierMoEMethod.py_calls % 64 == 0:
-                    logger.info('xtier timing: the decode path: the Python %.2f ms a call (the upload and the '
+                    logger.info('xtier timing: the decode path: the Python %.2f ms of CPU a call (the upload and the '
                                 'kernels)', XTierMoEMethod.py_ms / 64)
                     XTierMoEMethod.py_ms = 0.0
             self.calls['decode'] += 1
