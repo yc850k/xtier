@@ -191,7 +191,7 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
             LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16,
             HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, ROLE: tl.constexpr = 0,
-            IOFF: tl.constexpr = 0, IP: tl.constexpr = 0):
+            IOFF: tl.constexpr = 0, IP: tl.constexpr = 0, FMA: tl.constexpr = 0):
     """The gate (ROLE 0) or the up (ROLE 1) of a cached expert: its IQ blocks decoded and multiplied by the tokens.
 
     Program (route, tile): the rows n of the expert's gate or up (I rows of H values, a run of 256-value blocks a
@@ -236,7 +236,12 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
         ke = kb * 256 + tl.arange(0, 256)
         xe = tl.load(X + tok[:, None] * H + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
         w = _iq_vals(ty, arena, arena16, base + o + n.to(tl.int64) * r + kb * b, G1, G2, G3, KS, BN).to(tl.float16)
-        acc = tl.dot(xe, tl.trans(w), acc)
+        if FMA:
+            # One token: the tensor cores' M is 16, so their dot would do sixteen times the work. The plain product is
+            # that many times cheaper (and it keeps the values in FP32).
+            acc += tl.sum(xe.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], axis=2)
+        else:
+            acc = tl.dot(xe, tl.trans(w), acc)
     if ROLE == 0:
         # the gate: its values (FP32) for the up's launch
         tl.store(GATE + (row * BM + tok[:, None]) * IP + n[None, :], acc, mask=tok[:, None] < M)
@@ -255,7 +260,8 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
 @triton.jit
 def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.constexpr, I: tl.constexpr,
          STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr, DT: tl.constexpr = tl.float16,
-         HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, IOFF: tl.constexpr = 0, IP: tl.constexpr = 0):
+         HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, IOFF: tl.constexpr = 0, IP: tl.constexpr = 0,
+         FMA: tl.constexpr = 0):
     """The down of a cached expert: its IQ blocks decoded and multiplied by the intermediate.
 
     Program (route, tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row) for
@@ -294,7 +300,10 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
         ae = tl.load(MID + (row * BM + tok[:, None]) * IP + ke[None, :],
                      mask=km[None, :] & (tok[:, None] < M), other=0.0).to(tl.float16)
         w = _iq_vals(td, arena, arena16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
-        acc = tl.dot(ae, tl.trans(w), acc)
+        if FMA:
+            acc += tl.sum(ae.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :], axis=2)
+        else:
+            acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
 
 

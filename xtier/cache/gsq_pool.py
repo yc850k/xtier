@@ -275,21 +275,26 @@ class GsqPool:
         scratch = _scratch_arena(self, int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64')))
         arena2 = scratch if scratch is not None else self.arena
         arena16_2 = arena2.view(torch.uint16)
+        # One token a call: the tensor cores' M is 16, so their dot would do sixteen times the work. The plain
+        # product (the FMA path) is that many times cheaper.
+        bm = 1 if m == 1 else MAX_M
         gate_up[(nk, self.IP // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
             sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
-            t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
-            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=0, IOFF=self.ioff, IP=self.IP)
+            t['ksigns'], bm, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=0, IOFF=self.ioff, IP=self.IP,
+            FMA=(m == 1))
         gate_up[(nk, self.IP // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
             sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
-            t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
-            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=1, IOFF=self.ioff, IP=self.IP)
+            t['ksigns'], bm, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=1, IOFF=self.ioff, IP=self.IP,
+            FMA=(m == 1))
         down[(nk, H // BN)](
             sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs, sc['part'],
-            m, H, I, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'], MAX_M, BN,
+            m, H, I, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'], bm, BN,
             DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2,
-            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, IOFF=self.ioff, IP=self.IP)
+            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, IOFF=self.ioff, IP=self.IP, FMA=(m == 1))
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout, H, k,
                                             MAX_M, 1024)
 
