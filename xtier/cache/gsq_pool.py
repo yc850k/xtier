@@ -127,6 +127,7 @@ class GsqPool:
         self.used = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
         self.rank = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
+        self.stat = [0, 0, 0, 0]    # the residency counters (routed, hits, uploaded, bytes)
         self.filled = False
         self.scratch = _scratch(self.H, self.I, self.dtype, dev)
         self.pinned = []          # the RAM slots registered with CUDA (pin_slots)
@@ -184,6 +185,11 @@ class GsqPool:
             logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d, the table %s)',
                         self.layer_id, int((self.table >= 0).sum()), self.E, _calls[0],
                         self.table[self.table >= 0][:6].tolist())
+        if _calls[0] % 256 == 1:
+            logger.info('xtier cache: layer %d: the residency of the last %d calls: %d routed experts, %d in the '
+                        'VRAM, %d uploaded (%.1f MiB over PCIe)',
+                        self.layer_id, 256, self.stat[0], self.stat[1], self.stat[2], self.stat[3] / 2 ** 20)
+            self.stat = [0, 0, 0, 0]
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
@@ -236,6 +242,8 @@ class GsqPool:
             return 0
         uniq = torch.unique(flat)
         want = uniq[self.table[uniq] < 0]         # the ones not in the VRAM
+        self.stat[0] += int(uniq.numel())
+        self.stat[1] += int(uniq.numel()) - int(want.numel())
         if want.numel() == 0:
             return 0
         slots = int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64'))
@@ -248,6 +256,9 @@ class GsqPool:
         self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
         # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
         self.owner[self.S:self.S + take] = want[:take]
+        # the counters of the residency: the uploaded experts and the bytes they cost
+        self.stat[2] += take
+        self.stat[3] += sum(self.sizes[e][r] for e in experts for r in range(3))
         return take
 
     def decode(self, stream, m, k, x, ids, routing, out, act=0, dtype=None, ids_tensor=None):
