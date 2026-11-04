@@ -71,6 +71,9 @@ def engine() -> C.CDLL:
         if hasattr(lib, 'xtier_gsq_slot_pieces'):   # a RAM slot's three regions (where a GPU upload reads them)
             lib.xtier_gsq_slot_pieces.argtypes = [_P, _I, _P, _P]
             lib.xtier_gsq_slot_pieces.restype = _I
+        if hasattr(lib, 'xtier_gsq_cold_resident'):  # the GSQ cold pool: make the routed experts resident in RAM
+            lib.xtier_gsq_cold_resident.argtypes = [_P, _I, _I, _P]
+            lib.xtier_gsq_cold_resident.restype = _I
         _engine = lib
     return _engine
 

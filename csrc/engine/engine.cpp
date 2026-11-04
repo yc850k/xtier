@@ -603,6 +603,10 @@ struct PlanBase {
     virtual int attach_cold_gsq(void *store,const ColdIO *io,const int32_t *files,const long long *offsets,
                                 const int32_t *resident,int count,const float *scores,float half_life)=0;
     virtual int pin(int expert)=0;
+    // The GSQ cold pool: make the experts a call routes to resident in RAM (the ones that are not are read from
+    // the store, the coldest resident leaves). The GPU's hot cache calls it: the pool's traffic then decides what
+    // the RAM holds, and the upload reads the bytes from the RAM (fast) instead of the files.
+    virtual int cold_resident(int tokens,int k,const int32_t *ids)=0;
     virtual void unpin(int slot)=0;
     virtual void cold_stats(double *out)=0;
 };
@@ -1657,6 +1661,15 @@ public:
         cold_loads+=(long long)cold_miss.size();cold_seconds+=spent;
         if(tokens<=8){cold_small_loads+=(long long)cold_miss.size();cold_small_seconds+=spent;}
     }
+    int cold_resident(int tokens,int k,const int32_t *ids) override {
+        if constexpr(!GSQ)return -1;
+        if(!cold_store)return 0;   // no cold pool: nothing to make resident
+        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
+        if(!guard.owns_lock())return -3;   // an engine call is running: the caller reads the files itself
+        void *reads=ensure_resident_gsq(tokens,k,ids);
+        if(reads)finish_reads(reads,tokens);
+        return 0;
+    }
     // The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files, on the
     // drive). The slot's layout: the three tensors of one expert (the gate, the up and the down) as the checkpoint
     // has them, each at its region's start; the region's size is the largest of the layer's experts, so every
@@ -1975,6 +1988,12 @@ int XTIER_API(xtier_gsq_slot_pieces)(void *plan,int slot,void **pointers,size_t 
     return static_cast<Handle*>(plan)->plan->gsq_slot_pieces(slot,pointers,bytes);
 }
 int XTIER_API(xtier_slot_pin)(void *plan,int expert) {return plan?static_cast<Handle*>(plan)->plan->pin(expert):-1;}
+// The GSQ cold pool: make the experts a call routes to resident in RAM (the ones that are not are read from the
+// store). The GPU's hot cache calls it before its upload: the RAM then holds what the GPU is asked for, and the
+// upload copies the bytes from the RAM (the pinned slots) instead of the checkpoint's files.
+int XTIER_API(xtier_gsq_cold_resident)(void *plan,int tokens,int k,const int32_t *ids) {
+    return plan?static_cast<Handle*>(plan)->plan->cold_resident(tokens,k,ids):-1;
+}
 void XTIER_API(xtier_slot_unpin)(void *plan,int slot) {if(plan)static_cast<Handle*>(plan)->plan->unpin(slot);}
 void XTIER_API(xtier_cold_plan_stats)(void *plan,double *out) {if(plan&&out)static_cast<Handle*>(plan)->plan->cold_stats(out);}
 int XTIER_API(xtier_place)(void *plan,int expert,int slot) {

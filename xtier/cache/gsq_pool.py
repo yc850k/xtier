@@ -326,6 +326,14 @@ class GsqPool:
         experts = want[:take].tolist()
         if config.timing():
             self.sync_ms += (time.perf_counter() - t_sync) * 1e3
+        # The cold pool: the experts this call routes to are read into the engine's RAM (the coldest resident
+        # leaves), so the upload reads their bytes from the pinned RAM instead of the checkpoint's files, and the
+        # RAM's contents follow the routes the GPU is really asked for.
+        plan = self.mailbox.plan
+        lib = getattr(plan, 'lib', None)
+        if lib is not None and hasattr(lib, 'xtier_gsq_cold_resident'):
+            wanted = (C.c_int32 * len(experts))(*experts)
+            lib.xtier_gsq_cold_resident(plan.plan, 1, len(experts), wanted)
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
         if config.timing():
             self.copy_ms += (time.perf_counter() - t_sync) * 1e3 - self.sync_ms
