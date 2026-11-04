@@ -187,6 +187,7 @@ public:
     int every=4,budget=16;float decay=0.7f,min_gain=1.5f;
     bool running=false,quit=false;
     long windows=0,round_at=0,swaps=0,rounds=0;
+    long swaps_picked=0,swaps_posted=0,swaps_no_ram=0;
     // Prompt warm-up (XTIER_CACHE_PROMPT, pool.py record_prompt): a prefill's route counts, scaled to warm_windows
     // decode windows' worth, blend into the counts (the old ones x warm_keep), and the next warm_rounds rounds run
     // at once (from the next decode window) with up to warm_budget swaps each: the decode that follows finds the
@@ -345,11 +346,13 @@ public:
             auto *L=layers[s.layer].get();
             // the RAM slot the copy reads, kept until it lands; an expert not in RAM (cold experts) is not swapped in
             const int ram=xtier_slot_pin(L->bridge->plan,s.in);
-            if(ram<0)continue;
+            if(ram<0){swaps_no_ram++;continue;}
             const uint32_t seq=post(*L,s.in,s.slot);
+            swaps_posted++;
             todo.push_back({L,s.in,s.slot,ram,seq});
             pins.push_back({seq,L->bridge->plan,ram});
         }
+        swaps_picked+=long(swaps_round.size());
         {std::lock_guard<std::mutex> lock(mu);for(auto &L:layers)if(L)for(auto &v:L->usage)v*=decay;}
         swaps+=long(swaps_round.size());rounds++;
         copy_after_applied(todo);
@@ -619,8 +622,8 @@ void CUDART_CB execute(void *p) noexcept {
             auto &pm=pool_manager();
             char slots[48]="";
             for(auto &L:pm.layers)if(L&&L->elastic){std::snprintf(slots,sizeof slots,", +%d of +%d slots",L->active.load()-L->base,L->S-L->base);break;}
-            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far, %ld prompts%s\n",
-                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.prompts,slots);
+            std::fprintf(stderr,"[xtier] XTier cache: %ld windows, hit %.3f, %.1f distinct experts and %.0f us CPU per layer call; %ld swaps in %ld rounds so far (%ld picked, %ld posted, %ld without a RAM slot), %ld prompts%s\n",
+                         every,win_hit/std::max(win_n,1.0),win_n/std::max(win_calls,1.0),win_wall/std::max(win_calls,1.0),pm.swaps,pm.rounds,pm.swaps_picked,pm.swaps_posted,pm.swaps_no_ram,pm.prompts,slots);
             win_n=win_hit=win_wall=win_calls=0;
             auto &G=g2_state();
             if(G.device>=0&&G.n>0) {
