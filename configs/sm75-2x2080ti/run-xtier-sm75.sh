@@ -90,19 +90,21 @@ export XTIER_GATE_BN=${XTIER_GATE_BN:-64} XTIER_GATE_BK=${XTIER_GATE_BK:-64} XTI
 export XTIER_DOWN_BN=${XTIER_DOWN_BN:-64} XTIER_DOWN_BK=${XTIER_DOWN_BK:-32} XTIER_DOWN_LAUNCH=${XTIER_DOWN_LAUNCH:-4,2}
 export XTIER_CPU_PREFILL_BATCH=${XTIER_CPU_PREFILL_BATCH:-1024} XTIER_GPU_PREFILL_MIN=${XTIER_GPU_PREFILL_MIN:-1024}
 # The hot experts in the VRAM: as many as fit, the KV cache takes the rest (the context on this host is short).
-# A GSQ expert is ~10 MB of IQ bytes, so a slot per layer costs 10 MB x the layers: 12 slots a layer are 4.8 GB.
-# The dense weights alone take 73% of a card (16.4 GB), so the KV cache (the context here is a few hundred tokens)
-# and the hot experts share what is left.
-export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-14} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-16}
+# A rank's slice of a GSQ expert (the rows of the gate and the up it owns, the down whole) is 5.2 MB of IQ bytes, so
+# a slot per layer costs 5.2 MB x the layers: 26 slots a layer are 5.4 GB. The dense weights take 12.1 GB of the
+# 22.5 GB of a card (measured at the load), so the KV cache (the context here is a few hundred tokens) and the hot
+# experts share what is left.
+export XTIER_CACHE_SLOTS=${XTIER_CACHE_SLOTS:-26} XTIER_CACHE_SWAPS=${XTIER_CACHE_SWAPS:-8} XTIER_CACHE_LOG=${XTIER_CACHE_LOG:-16}
 # The adaptive residency: the counts decay slowly and the gain bar is low, so the slots follow the routes the decode
 # really makes (the profile's ranking is the production traffic's, a different traffic needs the swaps).
 export XTIER_CACHE_DECAY=${XTIER_CACHE_DECAY:-0.95} XTIER_CACHE_MIN_GAIN=${XTIER_CACHE_MIN_GAIN:-1.05}
 # The batched prefill uploads the experts the batch routes to (the ones that are not in the VRAM) over PCIe and
 # decodes them on the GPU: the scratch arena they go into (shared by the layers) is this many slots.
-# The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 128 slots are 1 GB.
-# The card's VRAM after the weights (12.9 GB) and the KV cache (2.7 GB at the minimum mem-fraction) is about 5 GB:
-# 10 hot slots a layer (3.1 GB) and the scratch (1 GB) fit in it, the rest is the CUDA context.
-export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-64}
+# The scratch arena the batched prefill uploads the routed experts into (shared by the layers): 128 slots of a rank's
+# slice (5.2 MB) are 660 MB.
+# The card's VRAM after the weights (12.1 GB) and the KV cache (3.3 GB at the minimum mem-fraction) is about 6 GB:
+# 26 hot slots a layer (5.4 GB) and the scratch (0.7 GB) fit in it, the rest is the CUDA context.
+export XTIER_GSQ_PREFILL_UPLOAD=${XTIER_GSQ_PREFILL_UPLOAD:-128}
 # The cold pool: the experts of the RAM slots, the rest read from the Optane drive when they are routed to (the
 # checkpoint's own files are the store, read with O_DIRECT). Each rank keeps its own copy of the experts it holds in
 # RAM, so with two ranks the pool needs twice as much memory: 0.8 fits the unit's 141 GB (77 of 384 experts a layer,

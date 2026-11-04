@@ -184,7 +184,8 @@ def _block_bytes(TYPE):
 def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H: tl.constexpr, I: tl.constexpr,
             LIMIT, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
             ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0, DT: tl.constexpr = tl.float16,
-            HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, ROLE: tl.constexpr = 0):
+            HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, ROLE: tl.constexpr = 0,
+            IOFF: tl.constexpr = 0, IP: tl.constexpr = 0):
     """The gate (ROLE 0) or the up (ROLE 1) of a cached expert: its IQ blocks decoded and multiplied by the tokens.
 
     Program (route, tile): the rows n of the expert's gate or up (I rows of H values, a run of 256-value blocks a
@@ -197,6 +198,11 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
     (the gate, the up, the down), OFFS: where an expert's three tensors start in its slot, STRIDE: the bytes of a
     slot. The blocks are decoded in FP32 (the scales are FP16 and the index arithmetic must not round) and the dot
     takes them in FP16 (the tensor cores of the card), with an FP32 accumulator.
+
+    The tensor-parallel split: the rank computes the rows IOFF..IOFF+IP of the intermediate (IP its own width, the
+    expert's whole intermediate is I). The rows of the gate and the up are the intermediate's, so the rank's rows
+    are the ones at IOFF; the intermediate it keeps (MID, GATE) is IP wide. The ranks' partial outputs are added by
+    SGLang, so each rank computes its own slice of every expert.
     """
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
@@ -218,7 +224,7 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
     b = _block_bytes(ty).to(tl.int64)
     r = (H // 256) * b     # the bytes of a row
     tok = tl.arange(0, BM)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)      # the rank's own rows of the intermediate
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
@@ -227,9 +233,9 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
         acc = tl.dot(xe, tl.trans(w), acc)
     if ROLE == 0:
         # the gate: its values (FP32) for the up's launch
-        tl.store(GATE + (row * BM + tok[:, None]) * I + n[None, :], acc, mask=tok[:, None] < M)
+        tl.store(GATE + (row * BM + tok[:, None]) * IP + n[None, :], acc, mask=tok[:, None] < M)
     else:
-        g = tl.load(GATE + (row * BM + tok[:, None]) * I + n[None, :], mask=tok[:, None] < M, other=0.0)
+        g = tl.load(GATE + (row * BM + tok[:, None]) * IP + n[None, :], mask=tok[:, None] < M, other=0.0)
         if LIMIT > 0:
             g = tl.minimum(g, LIMIT)
             acc = tl.minimum(tl.maximum(acc, -LIMIT), LIMIT)
@@ -237,17 +243,22 @@ def gate_up(X, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, MID, GATE, M, H
             val = g / (1.0 + tl.exp(-ALPHA * g)) * (acc + BETA)
         else:
             val = g / (1.0 + tl.exp(-g)) * acc
-        tl.store(MID + (row * BM + tok[:, None]) * I + n[None, :], val.to(DT), mask=tok[:, None] < M)
+        tl.store(MID + (row * BM + tok[:, None]) * IP + n[None, :], val.to(DT), mask=tok[:, None] < M)
 
 
 @triton.jit
 def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.constexpr, I: tl.constexpr,
          STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr, DT: tl.constexpr = tl.float16,
-         HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None):
+         HOT: tl.constexpr = 0, ARENA2=None, ARENA16_2=None, IOFF: tl.constexpr = 0, IP: tl.constexpr = 0):
     """The down of a cached expert: its IQ blocks decoded and multiplied by the intermediate.
 
     Program (route, tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row) for
     the tokens of the call. The partial output goes to PART[route, token, h] (FP32).
+
+    The tensor-parallel split: the rank owns the columns IOFF..IOFF+IP of the intermediate, so it decodes the
+    blocks of the down that overlap them (the block that straddles the boundary is decoded whole and its columns
+    outside the rank's range are dropped: the intermediate's are zero, so they add nothing to the dot). The
+    intermediate the rank keeps (MID) is IP wide.
     """
     p = tl.program_id(0)
     slot = tl.load(SLOT_LIST + p)
@@ -270,9 +281,12 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
     tok = tl.arange(0, BM)
     h = tl.program_id(1) * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for kb in range(I // 256):
-        ke = kb * 256 + tl.arange(0, 256)
-        ae = tl.load(MID + (row * BM + tok[:, None]) * I + ke[None, :], mask=tok[:, None] < M, other=0.0).to(tl.float16)
+    # the blocks of the down that hold the rank's columns of the intermediate
+    for kb in range(IOFF // 256, (IOFF + IP - 1) // 256 + 1):
+        ke = kb * 256 + tl.arange(0, 256) - IOFF    # the rank's own columns of the block
+        km = (ke >= 0) & (ke < IP)
+        ae = tl.load(MID + (row * BM + tok[:, None]) * IP + ke[None, :],
+                     mask=km[None, :] & (tok[:, None] < M), other=0.0).to(tl.float16)
         w = _iq_vals(td, arena, arena16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
         acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(PART + (row * BM + tok[:, None]) * H + h[None, :], acc, mask=tok[:, None] < M)
@@ -282,7 +296,8 @@ def down(MID, SLOT_LIST, SLOT_EXP, ARENA, ARENA16, TYPES, OFFS, PART, M, H: tl.c
 def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, MID, GATE,
                   K: tl.constexpr, H: tl.constexpr, I: tl.constexpr, LIMIT, STRIDE, G1, G2, G3, KS,
                   BM: tl.constexpr, BN: tl.constexpr, ALPHA: tl.constexpr = 1.0, BETA: tl.constexpr = 0.0,
-                  DT: tl.constexpr = tl.float16, ROLE: tl.constexpr = 0):
+                  DT: tl.constexpr = tl.float16, ROLE: tl.constexpr = 0, IOFF: tl.constexpr = 0,
+                  IP: tl.constexpr = 0):
     """The gate (ROLE 0) or the up (ROLE 1) of a cached expert for the routes of one tile (a batched prefill).
 
     Program (tile, row tile): the rows n of the expert's gate or up (I rows of H values, a run of 256-value blocks a
@@ -304,7 +319,7 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
     rows = tl.load(TILE_START + tile) + tl.arange(0, BM)
     rm = rows < tl.load(TILE_END + tile)
     tok = (tl.load(ORDER + rows, rm, 0) // K).to(tl.int64)
-    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)      # the rank's own rows of the intermediate
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for kb in range(H // 256):
         ke = kb * 256 + tl.arange(0, 256)
@@ -313,9 +328,9 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
         acc = tl.dot(xe, tl.trans(w), acc)
     if ROLE == 0:
         # the gate: its values (FP32) for the up's launch
-        tl.store(GATE + rows[:, None].to(tl.int64) * I + n[None, :], acc, mask=rm[:, None])
+        tl.store(GATE + rows[:, None].to(tl.int64) * IP + n[None, :], acc, mask=rm[:, None])
     else:
-        g = tl.load(GATE + rows[:, None].to(tl.int64) * I + n[None, :], mask=rm[:, None], other=0.0)
+        g = tl.load(GATE + rows[:, None].to(tl.int64) * IP + n[None, :], mask=rm[:, None], other=0.0)
         if LIMIT > 0:
             g = tl.minimum(g, LIMIT)
             acc = tl.minimum(tl.maximum(acc, -LIMIT), LIMIT)
@@ -323,18 +338,20 @@ def gate_up_tiles(X, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16
             val = g / (1.0 + tl.exp(-ALPHA * g)) * (acc + BETA)
         else:
             val = g / (1.0 + tl.exp(-g)) * acc
-        tl.store(MID + rows[:, None].to(tl.int64) * I + n[None, :], val.to(DT), mask=rm[:, None])
+        tl.store(MID + rows[:, None].to(tl.int64) * IP + n[None, :], val.to(DT), mask=rm[:, None])
 
 
 @triton.jit
 def down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16, TYPES, OFFS, ROUTES,
                H: tl.constexpr, I: tl.constexpr, STRIDE, G1, G2, G3, KS, BM: tl.constexpr, BN: tl.constexpr,
-               DT: tl.constexpr = tl.float16):
+               DT: tl.constexpr = tl.float16, IOFF: tl.constexpr = 0, IP: tl.constexpr = 0):
     """The down of a cached expert for the routes of one tile (a batched prefill).
 
     Program (tile, row tile): the rows h of the expert's down (H rows of I values, a run of 256-value blocks a row)
     for the routes of the tile. The partial output goes to ROUTES[route, h] (FP32), the per-token sum of the routes
     is the caller's.
+
+    The tensor-parallel split: the rank owns the columns IOFF..IOFF+IP of the intermediate (see the down kernel).
     """
     tile = tl.program_id(0)
     e = tl.load(TILE_E + tile).to(tl.int64)
@@ -351,9 +368,12 @@ def down_tiles(MID, ORDER, TILE_E, TILE_S, TILE_START, TILE_END, ARENA, ARENA16,
     route = tl.load(ORDER + r, rm, 0).to(tl.int64)
     h = tl.program_id(1) * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for kb in range(I // 256):
-        ke = kb * 256 + tl.arange(0, 256)
-        ae = tl.load(MID + r[:, None].to(tl.int64) * I + ke[None, :], mask=rm[:, None], other=0.0).to(tl.float16)
+    # the blocks of the down that hold the rank's columns of the intermediate
+    for kb in range(IOFF // 256, (IOFF + IP - 1) // 256 + 1):
+        ke = kb * 256 + tl.arange(0, 256) - IOFF    # the rank's own columns of the block
+        km = (ke >= 0) & (ke < IP)
+        ae = tl.load(MID + r[:, None].to(tl.int64) * IP + ke[None, :],
+                     mask=km[None, :] & rm[:, None], other=0.0).to(tl.float16)
         w = _iq_vals(td, arena, arena16, base + od + h.to(tl.int64) * rd + kb * bd, G1, G2, G3, KS, BN).to(tl.float16)
         acc = tl.dot(ae, tl.trans(w), acc)
     tl.store(ROUTES + route[:, None] * H + h[None, :], acc, mask=rm[:, None])

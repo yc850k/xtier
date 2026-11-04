@@ -27,6 +27,7 @@ import collections
 import ctypes as C
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 ROLES = ('w1', 'w3', 'w2')     # the gate, the up, the down (the pack's names)
 IQ_TYPES = (16, 17, 19, 29)   # the IQ formats the engine and the GPU decode (csrc/engine/gsq.h)
+BLOCK_BYTES = {16: 66, 17: 74, 19: 50, 29: 56}   # the bytes of a 256-value block (gsq_gpu._block_bytes)
 ALIGN = 256                  # the tensors start at a 256-byte boundary in the slot (the uint16 view stays aligned)
 BN = 16                      # the rows of a tensor a program decodes (the gate/up tile and the down tile)
 
@@ -64,9 +66,15 @@ class GsqPool:
     layers = []
 
     def __init__(self, pack, layer_id, slots, mailbox, dtype=None, swiglu_limit=0.0, swiglu_alpha=1.0,
-                 swiglu_beta=0.0):
+                 swiglu_beta=0.0, tp_rank=0, tp_part=0):
         self.pack, self.layer_id, self.mailbox = pack, int(layer_id), mailbox
         self.E, self.H, self.I = int(pack.experts), int(pack.hidden), int(pack.inter)
+        # The tensor-parallel split: the rank computes its own slice of the intermediate (the rows of the gate and
+        # the up, the columns of the down) and SGLang adds the ranks' partial outputs up. The expert's bytes stay
+        # whole in the VRAM (the kernels read the rank's part of them).
+        self.part = int(tp_part) if tp_part else self.I
+        self.ioff = int(tp_rank) * self.part
+        self.IP = self.part             # the width of the intermediate the rank keeps
         self.S = min(int(slots), self.E)
         self.full = self.S >= self.E   # every expert of the layer is in the VRAM (the FP4 pool's flag)
         self.dtype = dtype if dtype is not None else arch.dtype()
@@ -75,15 +83,18 @@ class GsqPool:
         if self.H % 256 or self.I % 256:
             raise ValueError(f'xtier cache: the GSQ layer {self.layer_id} has H={self.H} and I={self.I}, which are not '
                              'multiples of 256 (the values of an IQ block)')
-        if self.H % BN or self.I % BN:
+        if self.H % BN or self.I % BN or self.part % BN:
             raise ValueError(f'xtier cache: the GSQ layer {self.layer_id} has H={self.H} and I={self.I}, which are not '
                              f'multiples of the tile ({BN})')
+        if self.ioff + self.part > self.I:
+            raise ValueError(f'xtier cache: the GSQ layer {self.layer_id}: the rank {tp_rank} takes the rows '
+                             f'{self.ioff}..{self.ioff + self.part} of an intermediate of {self.I}')
         # the layout of the experts' bytes: the three tensors of an expert in its slot, and the slot's stride
         locations = pack.expert_locations(self.layer_id)
         if len(locations) != self.E:
             raise ValueError(f'xtier cache: the pack has {len(locations)} experts of the layer {self.layer_id}, '
                              f'not {self.E}')
-        types, offsets, sizes = [], [], []
+        types, offsets, sizes, tensor_sizes, slice_off = [], [], [], [], []
         stride = 0
         for roles in locations:
             size = [int(roles[r][2]) for r in ROLES]
@@ -91,11 +102,19 @@ class GsqPool:
             if any(k not in IQ_TYPES for k in kind):
                 raise ValueError(f'xtier cache: the layer {self.layer_id} has an expert in a format the GPU cannot '
                                  f'decide ({kind})')
-            off = [0, _align(size[0]), _align(size[0] + size[1])]
+            # The rank's slice of the intermediate: the rows of the gate and the up (the intermediate's rows, a
+            # contiguous range inside the tensor), so only those rows travel to the card. The down's columns are
+            # strided inside a row, so the whole down travels.
+            row_bytes = [(self.H // 256) * BLOCK_BYTES[k] for k in kind]
+            cut = [self.ioff * row_bytes[0], self.ioff * row_bytes[1], 0]
+            part = [self.IP * row_bytes[0], self.IP * row_bytes[1], size[2]]
+            off = [0, _align(part[0]), _align(part[0] + part[1])]
             types.append(kind)
             offsets.append(off)
-            sizes.append(size)
-            stride = max(stride, off[2] + size[2])
+            sizes.append(part)
+            tensor_sizes.append(size)
+            slice_off.append(cut)
+            stride = max(stride, off[2] + part[2])
         self.slot_bytes = _align(stride)
         dev = torch.device('cuda', torch.cuda.current_device())
         self.arena = torch.empty((self.S, self.slot_bytes), dtype=torch.uint8, device=dev)
@@ -103,7 +122,9 @@ class GsqPool:
         self.types = torch.tensor(types, dtype=torch.int32, device=dev)
         self.offsets = offsets                       # the host copy (the uploads)
         self.offs = torch.tensor(offsets, dtype=torch.int32, device=dev)
-        self.sizes = sizes                           # the bytes of every expert's three tensors
+        self.sizes = sizes                           # the bytes of every expert's three tensors (the rank's slice)
+        self.tensor_sizes = tensor_sizes             # the bytes of the whole tensors (the checkpoint's)
+        self.slice_off = slice_off                   # where the slice starts inside each tensor
         # The residency tables are rows of the global ones (the FP4 pool's): the adaptive policy's swaps are applied
         # to them by the commit kernel (the ring's commands name the row).
         if not _glob:
@@ -132,8 +153,17 @@ class GsqPool:
         self.upload_bytes = [0, 0]  # the uploaded bytes: the pinned RAM and the checkpoint's files
         self.routes = collections.Counter()   # the routed experts (the diagnostic)
         self.calls = 0                # this layer's decode calls (the residency log)
+        self.gpu_ms = 0.0             # the GPU's kernel time (XTIER_TIMING)
+        self.wall_ms = 0.0            # the wall time of the calls (XTIER_TIMING)
+        self.up_ms = 0.0              # the uploads' wall time (XTIER_TIMING)
+        self.sync_ms = 0.0            # the wait for the routed ids (XTIER_TIMING)
+        self.copy_ms = 0.0            # the copies themselves (XTIER_TIMING)
+        self.pre_ms = 0.0             # the routed experts' selection (XTIER_TIMING)
+        self.window_calls = 0         # the calls in the timing window (XTIER_TIMING)
+        self._pending = []            # the events of the calls (the GPU's kernel time, read at the log point)
+        self.last_call = time.perf_counter()
         self.filled = False
-        self.scratch = _scratch(self.H, self.I, self.dtype, dev)
+        self.scratch = _scratch(self.H, self.IP, self.dtype, dev)
         self.pinned = []          # the RAM slots registered with CUDA (pin_slots)
         self.uploaded = torch.full((self.E,), -1, dtype=torch.int32,
                                    device=dev)   # the experts uploaded for the current call (their slot)
@@ -156,13 +186,14 @@ class GsqPool:
         cudart.cudaMemcpyAsync.restype = C.c_int
         with torch.cuda.stream(stream):
             for j, e in enumerate(experts):
-                for role, off, want in zip(ROLES, self.offsets[e], self.sizes[e]):
+                for ri, (role, off, want) in enumerate(zip(ROLES, self.offsets[e], self.sizes[e])):
                     address, size, _ = self.pack.expert_bytes(role, self.layer_id, e)
-                    if size != want:
+                    if size != self.tensor_sizes[e][ri]:
                         raise ValueError(f'xtier cache: the expert {e} of the layer {self.layer_id} has {size} bytes '
-                                         f'of {role}, the layout says {want}')
+                                         f'of {role}, the layout says {self.tensor_sizes[e][ri]}')
+                    address += self.slice_off[e][ri]   # the rank's slice of the tensor
                     dst = self.arena.data_ptr() + j * self.slot_bytes + off
-                    _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
+                    _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(want), 1,
                                                  C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
         table = torch.full((self.E,), -1, dtype=torch.int32)
         owner = torch.zeros((self.E,), dtype=torch.int32)   # the global row: slot -> expert (E entries)
@@ -186,6 +217,7 @@ class GsqPool:
         _glob['captured'] = True
         _calls[0] += 1
         self.calls += 1
+        self.window_calls += 1
         if self.calls % 64 == 1:
             logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d, the table %s); '
                         'the last %d calls routed %d experts, %d were in the VRAM and %d were uploaded '
@@ -193,6 +225,19 @@ class GsqPool:
                         self.layer_id, int((self.table >= 0).sum()), self.E, self.calls,
                         self.table[self.table >= 0][:6].tolist(), self.calls - 1, self.stat[0], self.stat[1],
                         self.stat[2], self.stat[3] / 2 ** 20, self.upload_bytes[0] / 2 ** 20, self.upload_bytes[1] / 2 ** 20)
+            if config.timing():
+                n = max(self.window_calls, 1)
+                for ev0, ev1 in self._pending:   # the GPU's kernel time of the calls (the events have landed)
+                    ev1.synchronize()
+                    self.gpu_ms += ev0.elapsed_time(ev1)
+                self._pending.clear()
+                logger.info('xtier timing: layer %d: the last %d calls: the GPU %.2f ms a call, the wall %.2f ms a '
+                            'call, the uploads %.2f ms a call (the selection %.2f, the ids %.2f, the copies %.2f)',
+                            self.layer_id, n, self.gpu_ms / n, self.wall_ms / n, self.up_ms / n, self.pre_ms / n,
+                            self.sync_ms / n, self.copy_ms / n)
+                self.gpu_ms = self.wall_ms = self.up_ms = 0.0
+                self.sync_ms = self.copy_ms = self.pre_ms = 0.0
+                self.window_calls = 0
             self.stat = [0, 0, 0, 0]
             self.upload_bytes = [0, 0]
         if os.environ.get('XTIER_ROUTE_STATS') and self.calls % 16 == 0:
@@ -226,21 +271,21 @@ class GsqPool:
         scratch = _scratch_arena(self, int(os.environ.get('XTIER_GSQ_PREFILL_UPLOAD', '64')))
         arena2 = scratch if scratch is not None else self.arena
         arena16_2 = arena2.view(torch.uint16)
-        gate_up[(nk, I // BN)](
+        gate_up[(nk, self.IP // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
             sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
             t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
-            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=0)
-        gate_up[(nk, I // BN)](
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=0, IOFF=self.ioff, IP=self.IP)
+        gate_up[(nk, self.IP // BN)](
             Pointer(x, self.dtype), sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs,
             sc['mid'], sc['gate'], m, H, I, self.limit, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
             t['ksigns'], MAX_M, BN, ALPHA=self.alpha, BETA=self.beta, DT=_tl_dtype(self.dtype), num_warps=4,
-            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=1)
+            num_stages=2, HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, ROLE=1, IOFF=self.ioff, IP=self.IP)
         down[(nk, H // BN)](
             sc['mid'], sc['slot_list'], sc['slot_exp'], self.arena, self.arena16, self.types, self.offs, sc['part'],
             m, H, I, self.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'], t['ksigns'], MAX_M, BN,
             DT=_tl_dtype(self.dtype), num_warps=4, num_stages=2,
-            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2)
+            HOT=self.S, ARENA2=arena2, ARENA16_2=arena16_2, IOFF=self.ioff, IP=self.IP)
         _combine[(m, triton.cdiv(H, 1024))](sc['part'], sc['rslot'], Pointer(routing, torch.float32), gout, H, k,
                                             MAX_M, 1024)
 
@@ -252,6 +297,7 @@ class GsqPool:
         checkpoint's files. The upload is what makes the decode GPU-first: the card decodes the IQ blocks about a
         hundred times faster than the engine's AVX2 kernels.
         """
+        t0 = time.perf_counter()
         self.uploaded.fill_(-1)
         flat = ids.reshape(-1)
         flat = flat[flat >= 0]
@@ -259,6 +305,9 @@ class GsqPool:
             return 0
         uniq = torch.unique(flat)
         want = uniq[self.table[uniq] < 0]         # the ones not in the VRAM
+        t_sync = time.perf_counter()
+        if config.timing():
+            self.pre_ms += (t_sync - t0) * 1e3
         if os.environ.get('XTIER_ROUTE_STATS'):
             self.routes.update(uniq.tolist())
             if self.calls == 16:
@@ -275,7 +324,11 @@ class GsqPool:
             return 0
         take = min(int(want.numel()), int(arena.shape[0]))
         experts = want[:take].tolist()
+        if config.timing():
+            self.sync_ms += (time.perf_counter() - t_sync) * 1e3
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
+        if config.timing():
+            self.copy_ms += (time.perf_counter() - t_sync) * 1e3 - self.sync_ms
         self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
         # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
         self.owner[self.S:self.S + take] = want[:take]
@@ -300,7 +353,9 @@ class GsqPool:
                 raise RuntimeError(self.mailbox.error())
             self._pool_on = True
         if ids_tensor is not None:
+            t0 = time.perf_counter()
             self._upload_routed(ids_tensor)
+            self.up_ms += (time.perf_counter() - t0) * 1e3
         sx, sids, sroute, sout, sorig = self.mailbox.slot(stream, m, k, with_routes=True)
         self._route(m, k, x, ids, routing, act, (sx, sids, sroute, sorig))
         if config.debug():
@@ -317,15 +372,63 @@ class GsqPool:
                          self.layer_id, m, host[:6].tolist(), ids_host[:6].tolist())
             torch.cuda.current_stream().synchronize()
         self.mailbox.signal(stream, m, k, 1)
+        if config.timing():
+            self._ev0 = torch.cuda.Event(enable_timing=True)
+            self._ev0.record()
         self._kernels(m, k, x, routing, sc['gout'])
+        if config.timing():
+            self._ev1 = torch.cuda.Event(enable_timing=True)
+            self._ev1.record()
+            self._pending.append((self._ev0, self._ev1))
         self.mailbox.signal(stream, m, k, 2)
         _unpack[(triton.cdiv(m * self.H, BLOCK),)](Pointer(sout, torch.float32), sc['gout'], Pointer(out, torch.float32),
                                                    m * self.H, BLOCK)
+        if config.timing():
+            # the wall time of the call (the uploads are synchronous, so the wall time carries them). The GPU's
+            # kernel time is read at the log point: waiting for the events here would drain the pipeline.
+            now = time.perf_counter()
+            self.wall_ms += (now - self.last_call) * 1e3
+            self.last_call = now
 
 
 _calls = [0]             # the decode calls (the residency log)
 _scratch_arenas = {}      # (device, stride) -> the arena the prefills upload the experts into
-_pinned = {}              # (device, size) -> the pinned buffer the upload stages the bytes in
+_pinned = {}              # (device, size) -> the pinned buffers the upload stages the bytes in
+_copy_streams = {}        # device -> the stream the uploads copy on (the decode stream is not drained by them)
+
+
+def _copy_stream(device):
+    """The stream the uploads copy on: the decode stream waits for the copies with an event, so the copies do not
+    drain the decode pipeline (a synchronization per expert drained it sixteen times a layer)."""
+    key = torch.device(device)
+    stream = _copy_streams.get(key)
+    if stream is None:
+        stream = _copy_streams[key] = torch.cuda.Stream(device=key)
+    return stream
+
+
+def _stage(device, size):
+    """A pinned buffer to stage the bytes of an expert in, and the event that says when its copy has landed (the
+    buffer is reused after that). A ring of them: the staging of the next expert overlaps the copy of this one."""
+    key = (torch.device(device), size)
+    ring = _pinned.get(key)
+    if ring is None:
+        ring = _pinned[key] = []
+    # a free buffer: its copy has landed (an event that was never recorded is complete)
+    for i, (buf, done) in enumerate(ring):
+        if done.query():
+            ring.append(ring.pop(i))
+            return buf, done
+    if len(ring) < 4:
+        buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        done = torch.cuda.Event()
+        ring.append((buf, done))
+        return buf, done
+    # every buffer is busy: wait for the oldest one and reuse it
+    buf, done = ring.pop(0)
+    done.synchronize()
+    ring.append((buf, done))
+    return buf, done
 
 
 def _scratch_arena(pool, slots):
@@ -363,13 +466,21 @@ def _upload(pool, plan, experts, arena, stream):
 
     The bytes are staged in pinned memory first: a copy from a mapped file (the pack's mapping) is a pageable one,
     and the driver stages those in small chunks (about a tenth of the bandwidth).
+
+    The copies run on their own stream: the decode stream is not drained by them (a synchronization per expert
+    drains the whole decode pipeline, and the decode calls it sixteen times a layer). The caller's stream waits for
+    the copies with an event, and the copy stream waits for the caller's stream before it overwrites the arena.
     """
     cudart = _runtime()
     cudart.cudaMemcpyAsync.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int, C.c_void_p]
     cudart.cudaMemcpyAsync.restype = C.c_int
     lib = getattr(plan, 'lib', None)
     handle = getattr(plan, 'plan', None)
-    with torch.cuda.stream(stream):
+    copy = _copy_stream(pool.arena.device)
+    # the arena's slots are reused by the next call: the copies wait for the decode that reads them
+    copy.wait_stream(stream)
+    failed = set()
+    with torch.cuda.stream(copy):
         for j, e in enumerate(experts):
             e = int(e)
             # the expert's bytes: the engine's RAM slot when it is there (the cold pool's RAM is fast), else the
@@ -386,35 +497,34 @@ def _upload(pool, plan, experts, arena, stream):
                     base = ptrs[0]
                     sources = [(ptrs[r], int(sizes[r])) for r in range(3)]
             try:
-                for role, off, want in zip(ROLES, pool.offsets[e], pool.sizes[e]):
+                for ri, (role, off, want) in enumerate(zip(ROLES, pool.offsets[e], pool.sizes[e])):
                     if sources is not None:
-                        address, size = sources[ROLES.index(role)]
+                        address, size = sources[ri]
                     else:
                         address, size, _ = pool.pack.expert_bytes(role, pool.layer_id, e)
-                    if size != want:
+                    if size != pool.tensor_sizes[e][ri]:
                         raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes of '
-                                         f'{role}, the layout says {want}')
+                                         f'{role}, the layout says {pool.tensor_sizes[e][ri]}')
+                    # the rank's slice of the tensor (the rows of the gate and the up)
+                    address += pool.slice_off[e][ri]
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
                     pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
-                    pool.upload_bytes[0 if pinned else 1] += size
+                    pool.upload_bytes[0 if pinned else 1] += want
                     try:
                         if pinned:
                             # the RAM slot is registered with CUDA: the driver copies it straight to the card
-                            rc = cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(size), 1,
-                                                        C.c_void_p(stream.cuda_stream))
+                            rc = cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(address), C.c_size_t(want), 1,
+                                                        C.c_void_p(copy.cuda_stream))
                             if rc != 0:
                                 cudart.cudaGetLastError()   # clear it: the staged copy below may still work
                                 pinned = False
                         if not pinned:
-                            key = (pool.arena.device, size)
-                            staged = _pinned.get(key)
-                            if staged is None:
-                                staged = _pinned[key] = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-                            C.memmove(staged.data_ptr(), address, size)     # the bytes -> the pinned buffer
+                            staged, done = _stage(pool.arena.device, want)
+                            C.memmove(staged.data_ptr(), address, want)     # the bytes -> the pinned buffer
                             _check(cudart.cudaMemcpyAsync(C.c_void_p(dst), C.c_void_p(staged.data_ptr()),
-                                                         C.c_size_t(size), 1,
-                                                         C.c_void_p(stream.cuda_stream)), 'cudaMemcpyAsync')
-                        stream.synchronize()   # the next expert stages over the same buffer
+                                                         C.c_size_t(want), 1,
+                                                         C.c_void_p(copy.cuda_stream)), 'cudaMemcpyAsync')
+                            done.record(copy)   # the buffer is free when the copy has landed
                     except Exception as exc:   # noqa: BLE001  a failed upload must not take the server down
                         cudart.cudaGetLastError()
                         logger.warning('xtier cache: the upload of the expert %d of the layer %d failed (%s): the '
@@ -423,6 +533,11 @@ def _upload(pool, plan, experts, arena, stream):
             finally:
                 if ram >= 0:
                     lib.xtier_slot_unpin(handle, ram)
+    # the decode stream waits for the copies (an event, not a drain of the whole pipeline)
+    landed = torch.cuda.Event()
+    landed.record(copy)
+    stream.wait_event(landed)
+    return failed
 
 
 def pin_slots(pool, plan, count):
@@ -581,23 +696,24 @@ def prefill(pool, plan, x, ids, weights, cpu_batch=1024):
                 if not tiles:
                     continue
                 meta = torch.tensor(tiles, dtype=torch.int32).T.contiguous().to(x.device, non_blocking=True)
-                mid = torch.empty((int(order_part.numel()), I), dtype=pool.dtype, device=x.device)
-                gate_buf = torch.empty((int(order_part.numel()), I), dtype=torch.float32, device=x.device)
+                mid = torch.empty((int(order_part.numel()), pool.IP), dtype=pool.dtype, device=x.device)
+                gate_buf = torch.empty((int(order_part.numel()), pool.IP), dtype=torch.float32, device=x.device)
                 nt = len(tiles)
-                gate_up_tiles[(nt, I // bn)](
+                gate_up_tiles[(nt, pool.IP // bn)](
                     x, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
                     pool.types, pool.offs, mid, gate_buf, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
                     t['iq2xxs'], t['ksigns'], bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype),
-                    num_warps=4, num_stages=2, ROLE=0)
-                gate_up_tiles[(nt, I // bn)](
+                    num_warps=4, num_stages=2, ROLE=0, IOFF=pool.ioff, IP=pool.IP)
+                gate_up_tiles[(nt, pool.IP // bn)](
                     x, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
                     pool.types, pool.offs, mid, gate_buf, k, H, I, pool.limit, pool.slot_bytes, t['iq1s'], t['iq2xs'],
                     t['iq2xxs'], t['ksigns'], bm, bn, ALPHA=pool.alpha, BETA=pool.beta, DT=_tl_dtype(pool.dtype),
-                    num_warps=4, num_stages=2, ROLE=1)
+                    num_warps=4, num_stages=2, ROLE=1, IOFF=pool.ioff, IP=pool.IP)
                 down_tiles[(nt, H // bn)](
                     mid, order_part, meta[0], meta[1], meta[2], meta[3], arena_part, arena_part.view(torch.uint16),
                     pool.types, pool.offs, routes, H, I, pool.slot_bytes, t['iq1s'], t['iq2xs'], t['iq2xxs'],
-                    t['ksigns'], bm, bn, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2)
+                    t['ksigns'], bm, bn, DT=_tl_dtype(pool.dtype), num_warps=4, num_stages=2,
+                    IOFF=pool.ioff, IP=pool.IP)
             # the per-token sum of the GPU's routes (the CPU's routes have no partial)
             w_gpu = torch.where(on_gpu.reshape(m, k), weights, 0.0).reshape(-1)
             _reduce[(m, triton.cdiv(H, 256))](routes, w_gpu, out_g, k, 256, H)
@@ -624,6 +740,7 @@ def fill_all():
     n = 0
     for pool in todo:
         n += pool.fill(pool.pack.ranking(pool.layer_id), stream)
+    stream.synchronize()   # the experts' bytes are in the VRAM before the first decode reads them
     partial = [p for p in todo if not p.full]
     if partial and _glob.get('prepared'):
         logger.warning('xtier cache: %d GSQ layers added after the adaptive policy started keep their initial '
@@ -640,9 +757,22 @@ def fill_all():
             offsets = (C.c_int32 * (pool.E * 3))(*[o for e in range(pool.E) for o in pool.offsets[e]])
             sizes = (C.c_size_t * (pool.E * 3))(*[s for e in range(pool.E) for s in pool.sizes[e]])
             resident = (C.c_int32 * pool.S)(*pool.resident)
+            # the experts' bytes in the checkpoint's own mapping: a swap of an expert that is not in the engine's RAM
+            # (a cold expert) reads them from there. The source offsets say where the rank's slice starts in each
+            # tensor (the rows of the gate and the up).
+            sources = (C.c_void_p * (pool.E * 3))()
+            cuts = (C.c_int64 * (pool.E * 3))()
+            for e in range(pool.E):
+                for r, role in enumerate(ROLES):
+                    address, size, _ = pool.pack.expert_bytes(role, pool.layer_id, e)
+                    if size != pool.tensor_sizes[e][r]:
+                        raise ValueError(f'xtier cache: the expert {e} of the layer {pool.layer_id} has {size} bytes '
+                                         f'of {role}, the layout says {pool.tensor_sizes[e][r]}')
+                    sources[e * 3 + r] = C.c_void_p(address)
+                    cuts[e * 3 + r] = pool.slice_off[e][r]
             if lib.xtier_mailbox_pool_attach_gsq(pool.mailbox.bridge, pool.index, pool.S, pool.S, pool.E,
                                                  C.c_void_p(pool.arena.data_ptr()), C.c_size_t(pool.slot_bytes),
-                                                 offsets, sizes, resident) < 0:
+                                                 offsets, sizes, resident, sources, cuts) < 0:
                 raise RuntimeError(pool.mailbox.error())
         _glob['adapt'] = (lib, every, budget, decay, gain)
     return n

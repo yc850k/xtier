@@ -170,6 +170,9 @@ struct PoolLayer {
     size_t gsq_stride=0;                  // the bytes of a slot
     std::vector<int32_t> gsq_off;        // per expert and role: the tensor's offset in its slot
     std::vector<size_t> gsq_size;        // per expert and role: the tensor's bytes
+    std::vector<const char *> gsq_src;   // per expert and role: the tensor's bytes in the checkpoint's mapping
+                                            // (a swap reads them when the expert is not in the engine's RAM)
+    std::vector<int64_t> gsq_src_off; // per expert and role: where the rank's slice starts inside the tensor
     std::vector<int> resident;        // slot -> expert (-1 empty), as decided (copies may be in flight)
     std::vector<int> slot_of;         // expert -> slot, as decided
     std::vector<uint32_t> busy;       // slot -> seq of its in-flight copy (0 = none)
@@ -204,6 +207,17 @@ public:
     uint32_t next_seq=0;
     std::thread worker;
     uint32_t *posted(){return seqs;}uint32_t *applied(){return seqs+16;}uint32_t *landed(){return seqs+32;}
+    // a pinned staging buffer for the copies out of the checkpoint's mapping (a pageable copy goes through the
+    // driver's staging buffer at a tenth of the bandwidth)
+    char *staging=nullptr;size_t staging_bytes=0;
+    char *stage(size_t n) {
+        if(n>staging_bytes) {
+            if(staging)cudaFreeHost(staging);
+            staging_bytes=n;
+            check(cudaHostAlloc(reinterpret_cast<void**>(&staging),n,cudaHostAllocDefault));
+        }
+        return staging;
+    }
     void ensure_ring() {
         if(ring)return;
         check(cudaHostAlloc(reinterpret_cast<void**>(&ring),sizeof(PoolCmd)*POOL_RING,cudaHostAllocMapped));
@@ -244,20 +258,48 @@ public:
         }
         if(any){warm_left.store(warm_rounds,std::memory_order_relaxed);prompts++;}
     }
-    // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts)
+    // ram: the RAM slot holding the expert (xtier_slot_pin; the expert itself without cold experts), or -1 when the
+    // expert is not in the engine's RAM (the GSQ path then reads the checkpoint's own files)
     void upload(PoolLayer &L,int ram,int slot,int expert,char *const *arena,cudaStream_t stream) {
         if(L.gsq&&expert>=0) {   // the GSQ path: the expert's three tensors (the gate, the up and the down) as the checkpoint has them
             // The source is the engine's RAM slot (the cold pool's): its three regions hold the expert's tensors, each
             // at the region's start. The slots are separate allocations, so the slot's own pointers are needed (the
-            // first slot's plus a stride would read outside them).
+            // first slot's plus a stride would read outside them). An expert that is not in the RAM (a cold expert)
+            // is read from the checkpoint's own files: the bytes are there, mapped (the pool's mapping).
             void *ptr[3];size_t bytes[3];
-            if(xtier_gsq_slot_pieces(L.bridge->plan,ram,ptr,bytes)<0)
-                throw std::runtime_error("The GSQ pool's RAM slot is gone");
-            for(int r=0;r<3;r++) {
-                char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
-                const char *src=static_cast<const char*>(ptr[r]);
-                check(cudaMemcpyAsync(dst,src,L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,stream));
+            bool from_ram=false;
+            if(ram>=0) {
+                if(xtier_gsq_slot_pieces(L.bridge->plan,ram,ptr,bytes)<0)
+                    throw std::runtime_error("The GSQ pool's RAM slot is gone");
+                from_ram=true;
+            } else if(L.gsq_src.size()==size_t(L.E)*3) {
+                for(int r=0;r<3;r++)ptr[r]=const_cast<void*>(static_cast<const void*>(L.gsq_src[size_t(expert)*3+r]));
+            } else return;   // no source: the slot keeps its old expert
+            // the rank's slice of each tensor starts inside it (the rows of the gate and the up)
+            const int64_t *cut=L.gsq_src_off.size()==size_t(L.E)*3?L.gsq_src_off.data():nullptr;
+            if(from_ram) {
+                for(int r=0;r<3;r++) {
+                    char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
+                    const char *src=static_cast<const char*>(ptr[r])+(cut?cut[size_t(expert)*3+r]:0);
+                    check(cudaMemcpyAsync(dst,src,L.gsq_size[size_t(expert)*3+r],cudaMemcpyHostToDevice,stream));
+                }
+                return;
             }
+            // The checkpoint's mapping is pageable: the driver stages those in small chunks (about a tenth of the
+            // bandwidth), so the bytes go through a pinned buffer (the three tensors in one, so the copy is staged
+            // once and synchronized once).
+            size_t total=0;for(int r=0;r<3;r++)total+=L.gsq_size[size_t(expert)*3+r];
+            char *staged=stage(total);
+            size_t off=0;
+            for(int r=0;r<3;r++) {
+                const size_t n=L.gsq_size[size_t(expert)*3+r];
+                char *dst=L.gsq_arena+size_t(slot)*L.gsq_stride+L.gsq_off[size_t(expert)*3+r];
+                const char *src=static_cast<const char*>(ptr[r])+(cut?cut[size_t(expert)*3+r]:0);
+                std::memcpy(staged+off,src,n);
+                check(cudaMemcpyAsync(dst,staged+off,n,cudaMemcpyHostToDevice,stream));
+                off+=n;
+            }
+            check(cudaStreamSynchronize(stream));   // the staging buffer is reused by the next copy
             return;
         }
         const size_t H=L.H,I=L.I,IN=I/L.nodes,HN=H/L.nodes;
@@ -344,13 +386,14 @@ public:
         std::vector<Copy> todo;
         for(auto &s:swaps_round) {
             auto *L=layers[s.layer].get();
-            // the RAM slot the copy reads, kept until it lands; an expert not in RAM (cold experts) is not swapped in
+            // the RAM slot the copy reads, kept until it lands; an expert not in RAM (cold experts) is read from the
+            // checkpoint's own files when the layer has them (the GSQ path), and not swapped in otherwise
             const int ram=xtier_slot_pin(L->bridge->plan,s.in);
-            if(ram<0){swaps_no_ram++;continue;}
+            if(ram<0&&(!L->gsq||L->gsq_src.size()!=size_t(L->E)*3)){swaps_no_ram++;continue;}
             const uint32_t seq=post(*L,s.in,s.slot);
             swaps_posted++;
             todo.push_back({L,s.in,s.slot,ram,seq});
-            pins.push_back({seq,L->bridge->plan,ram});
+            if(ram>=0)pins.push_back({seq,L->bridge->plan,ram});
         }
         swaps_picked+=long(swaps_round.size());
         {std::lock_guard<std::mutex> lock(mu);for(auto &L:layers)if(L)for(auto &v:L->usage)v*=decay;}
@@ -993,9 +1036,12 @@ int xtier_mailbox_pool_attach(void *bridge,int layer,int slots,int active,int ex
 }
 // The GSQ path: the layer's experts are the IQ blocks of a GGUF checkpoint. The arena holds one expert per slot (the
 // gate, the up and the down as the checkpoint has them); the engine's RAM slots hold the same bytes, so a swap copies
-// three ranges. offsets and sizes are per expert and role ([e*3+role]).
+// three ranges. offsets and sizes are per expert and role ([e*3+role]). sources, when given, are the same three
+// ranges in the checkpoint's own mapping (the pool's): a swap of an expert that is not in the engine's RAM reads them
+// from there.
 int xtier_mailbox_pool_attach_gsq(void *bridge,int layer,int slots,int active,int experts,void *arena,size_t stride,
-                                   const int32_t *offsets,const size_t *sizes,const int32_t *resident) {
+                                   const int32_t *offsets,const size_t *sizes,const int32_t *resident,
+                                   const char *const *sources,const int64_t *source_offsets) {
     try {
         if(!bridge||layer<0||layer>4095||slots<1||active<1||active>slots||experts<1||!arena||!offsets||!sizes
            ||!resident)
@@ -1009,6 +1055,8 @@ int xtier_mailbox_pool_attach_gsq(void *bridge,int layer,int slots,int active,in
         L->gsq=true;L->gsq_arena=static_cast<char*>(arena);L->gsq_stride=stride;
         L->gsq_off.assign(offsets,offsets+size_t(experts)*3);
         L->gsq_size.assign(sizes,sizes+size_t(experts)*3);
+        if(sources)L->gsq_src.assign(sources,sources+size_t(experts)*3);
+        if(source_offsets)L->gsq_src_off.assign(source_offsets,source_offsets+size_t(experts)*3);
         // the engine's RAM slots: the copies read them (the expert's three tensors) when they land
         void *ptr[3];size_t bytes[3];
         if(xtier_gsq_slot_pieces(b->plan,0,ptr,bytes)<0)throw std::runtime_error(xtier_last_error());

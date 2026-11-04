@@ -336,7 +336,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             from xtier.cache.gsq_pool import GsqPool
             self.pool = GsqPool(pack, self.cfg.layer_id, slots, self.mailbox, dtype=self.dtype,
                                  swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
-                                 swiglu_beta=self.swiglu_beta)
+                                 swiglu_beta=self.swiglu_beta, tp_rank=rank, tp_part=part)
         # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
         # drive). The routed experts that are not in RAM are read from there when a forward needs them.
         if gsq_cold.enabled():
@@ -348,6 +348,17 @@ class XTierMoEMethod(FusedMoEMethodBase):
                 pin_slots(self.pool, self.plan, resident)
         logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
                     self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
+        if self.cfg.layer_id == 0:
+            # The tensor-parallel geometry, once: the rank's slice of the intermediate, and the whole of it.
+            logger.info('xtier: the TP geometry: the rank %d of %d, the intermediate %d of %d, the pool\'s %d',
+                        rank, size, part, full, pack.inter)
+            try:
+                from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+                from sglang.srt.distributed.parallel_state import get_parallel
+                logger.info('xtier: the TP reduce: moe_tp_size %d, the post-experts reduce skipped %s',
+                            get_parallel().moe_tp_size, should_skip_post_experts_all_reduce(is_tp_path=True))
+            except Exception as exc:   # the SGLang internals moved: the geometry above is the important part
+                logger.info('xtier: the TP reduce: not known (%s)', exc)
 
     def process_weights_after_loading(self, layer):
         if self.plan is None:   # some expert tensor never came through the loader: those weights would be garbage
