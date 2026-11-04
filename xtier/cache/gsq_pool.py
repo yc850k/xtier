@@ -159,6 +159,7 @@ class GsqPool:
         self.sync_ms = 0.0            # the wait for the routed ids (XTIER_TIMING)
         self.copy_ms = 0.0            # the copies themselves (XTIER_TIMING)
         self.pre_ms = 0.0             # the routed experts' selection (XTIER_TIMING)
+        self.py_ms = 0.0              # the decode call's CPU time (XTIER_TIMING)
         self.pf = [0, 0, 0, 0, 0]     # the prefetch's returns (0 ok, 1 nothing, 2 read, -1 failed, -3 busy)
         self.cold_ms = 0.0            # the cold pool's reads (XTIER_TIMING)
         self.window_calls = 0         # the calls in the timing window (XTIER_TIMING)
@@ -235,11 +236,12 @@ class GsqPool:
                 self._pending.clear()
                 logger.info('xtier timing: layer %d: the last %d calls: the GPU %.2f ms a call, the wall %.2f ms a '
                             'call, the uploads %.2f ms a call (the selection %.2f, the ids %.2f, the copies %.2f, '
-                            'the cold pool %.2f, the prefetch %s)',
+                            'the cold pool %.2f, the prefetch %s, the Python %.2f)',
                             self.layer_id, n, self.gpu_ms / n, self.wall_ms / n, self.up_ms / n, self.pre_ms / n,
-                            self.sync_ms / n, self.copy_ms / n, self.cold_ms / n, self.pf)
+                            self.sync_ms / n, self.copy_ms / n, self.cold_ms / n, self.pf, self.py_ms / n)
                 self.gpu_ms = self.wall_ms = self.up_ms = 0.0
                 self.sync_ms = self.copy_ms = self.pre_ms = self.cold_ms = 0.0
+                self.py_ms = 0.0
                 self.pf = [0, 0, 0, 0, 0]
                 self.window_calls = 0
             self.stat = [0, 0, 0, 0]
@@ -376,6 +378,7 @@ class GsqPool:
             if self.mailbox.lib.xtier_mailbox_pool_enable(self.mailbox.bridge, 1) < 0:
                 raise RuntimeError(self.mailbox.error())
             self._pool_on = True
+        t_py = time.thread_time() if config.timing() else 0.0
         if ids_tensor is not None:
             t0 = time.perf_counter()
             self._upload_routed(ids_tensor)
@@ -413,6 +416,7 @@ class GsqPool:
             now = time.perf_counter()
             self.wall_ms += (now - self.last_call) * 1e3
             self.last_call = now
+            self.py_ms += (time.thread_time() - t_py) * 1e3
 
 
 _calls = [0]             # the decode calls (the residency log)

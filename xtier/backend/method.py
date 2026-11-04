@@ -434,8 +434,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
                 XTierMoEMethod.py_ms += (time.thread_time() - t_apply) * 1e3
                 XTierMoEMethod.py_calls += 1
                 if XTierMoEMethod.py_calls % 64 == 0:
-                    logger.info('xtier timing: the decode path: the Python %.2f ms of CPU a call (the upload and the '
-                                'kernels)', XTierMoEMethod.py_ms / 64)
+                    logger.info('xtier timing: the decode path: the Python %.2f ms of CPU a call',
+                                XTierMoEMethod.py_ms / 64)
                     XTierMoEMethod.py_ms = 0.0
             self.calls['decode'] += 1
         elif self.gsq:
