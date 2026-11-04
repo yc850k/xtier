@@ -187,9 +187,11 @@ class GsqPool:
                         self.table[self.table >= 0][:6].tolist())
         if _calls[0] % 256 == 1:
             logger.info('xtier cache: layer %d: the residency of the last %d calls: %d routed experts, %d in the '
-                        'VRAM, %d uploaded (%.1f MiB over PCIe)',
-                        self.layer_id, 256, self.stat[0], self.stat[1], self.stat[2], self.stat[3] / 2 ** 20)
+                        'VRAM, %d uploaded (%.1f MiB over PCIe: %.1f from the pinned RAM, %.1f from the files)',
+                        self.layer_id, 256, self.stat[0], self.stat[1], self.stat[2], self.stat[3] / 2 ** 20,
+                        _bytes[0] / 2 ** 20, _bytes[1] / 2 ** 20)
             self.stat = [0, 0, 0, 0]
+            _bytes[0] = _bytes[1] = 0
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
@@ -330,9 +332,12 @@ def _scratch_arena(pool, slots):
     return arena
 
 
+_bytes = [0, 0]   # the bytes uploaded from the pinned RAM and from the checkpoint's files
+
+
 def _upload(pool, plan, experts, arena, stream):
     """The experts' bytes into the scratch arena over PCIe: the engine's RAM slot when the expert is there (the
-    cold pool's RAM is fast), else the checkpoint's files (the pack's mapping).
+    cold pool's resident set) else the checkpoint's files (the pack's mapping).
 
     This is the batched prefill's trade: the bytes of every expert the batch routes to are moved once and decoded on
     the GPU, instead of being read and decoded by the CPU engine. The cost is the transfer (PCIe), the gain is the
@@ -373,6 +378,7 @@ def _upload(pool, plan, experts, arena, stream):
                                          f'{role}, the layout says {want}')
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
                     pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
+                    _bytes[0 if pinned else 1] += size
                     try:
                         if pinned:
                             # the RAM slot is registered with CUDA: the driver copies it straight to the card
