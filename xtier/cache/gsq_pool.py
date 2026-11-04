@@ -159,6 +159,7 @@ class GsqPool:
         self.sync_ms = 0.0            # the wait for the routed ids (XTIER_TIMING)
         self.copy_ms = 0.0            # the copies themselves (XTIER_TIMING)
         self.pre_ms = 0.0             # the routed experts' selection (XTIER_TIMING)
+        self.cold_ms = 0.0            # the cold pool's reads (XTIER_TIMING)
         self.window_calls = 0         # the calls in the timing window (XTIER_TIMING)
         self._pending = []            # the events of the calls (the GPU's kernel time, read at the log point)
         self.last_call = time.perf_counter()
@@ -232,11 +233,12 @@ class GsqPool:
                     self.gpu_ms += ev0.elapsed_time(ev1)
                 self._pending.clear()
                 logger.info('xtier timing: layer %d: the last %d calls: the GPU %.2f ms a call, the wall %.2f ms a '
-                            'call, the uploads %.2f ms a call (the selection %.2f, the ids %.2f, the copies %.2f)',
+                            'call, the uploads %.2f ms a call (the selection %.2f, the ids %.2f, the copies %.2f, '
+                            'the cold pool %.2f)',
                             self.layer_id, n, self.gpu_ms / n, self.wall_ms / n, self.up_ms / n, self.pre_ms / n,
-                            self.sync_ms / n, self.copy_ms / n)
+                            self.sync_ms / n, self.copy_ms / n, self.cold_ms / n)
                 self.gpu_ms = self.wall_ms = self.up_ms = 0.0
-                self.sync_ms = self.copy_ms = self.pre_ms = 0.0
+                self.sync_ms = self.copy_ms = self.pre_ms = self.cold_ms = 0.0
                 self.window_calls = 0
             self.stat = [0, 0, 0, 0]
             self.upload_bytes = [0, 0]
@@ -333,7 +335,10 @@ class GsqPool:
         lib = getattr(plan, 'lib', None)
         if lib is not None and hasattr(lib, 'xtier_gsq_cold_resident'):
             wanted = (C.c_int32 * len(experts))(*experts)
+            t_cold = time.perf_counter()
             lib.xtier_gsq_cold_resident(plan.plan, 1, len(experts), wanted)
+            if config.timing():
+                self.cold_ms += (time.perf_counter() - t_cold) * 1e3
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
         if config.timing():
             self.copy_ms += (time.perf_counter() - t_sync) * 1e3 - self.sync_ms

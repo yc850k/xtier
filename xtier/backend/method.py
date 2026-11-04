@@ -428,7 +428,15 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if m <= config.decode_max() or capturing:
             if not capturing:   # short prompts never reach a prefill branch: the policy must start here too
                 self._cache_start()
+            t_apply = time.perf_counter() if config.timing() else 0.0
             out = self._decode(x, ids, weights, m, k)
+            if config.timing():
+                XTierMoEMethod.py_ms += (time.perf_counter() - t_apply) * 1e3
+                XTierMoEMethod.py_calls += 1
+                if XTierMoEMethod.py_calls % 64 == 0:
+                    logger.info('xtier timing: the decode path: the Python %.2f ms a call (the upload and the '
+                                'kernels)', XTierMoEMethod.py_ms / 64)
+                    XTierMoEMethod.py_ms = 0.0
             self.calls['decode'] += 1
         elif self.gsq:
             # The experts are in the checkpoint file: the CPU engine reads the ones that are not in the VRAM, and the
@@ -660,6 +668,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         gsq_pool.maybe_start()
 
     _timing = {}
+    py_ms = 0.0        # the decode path's Python (XTIER_TIMING)
+    py_calls = 0
 
     def _time(self, m, seconds):
         """XTIER_TIMING=1: prefill MoE time per kind of layer, logged once per forward (at the last layer)."""
