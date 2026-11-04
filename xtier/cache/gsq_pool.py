@@ -128,6 +128,8 @@ class GsqPool:
         self.rank = torch.empty(max(self.S + self.upload_slots, 1), dtype=torch.int32, device=dev)
         self.resident = [-1] * self.S
         self.stat = [0, 0, 0, 0]    # the residency counters (routed, hits, uploaded, bytes)
+        self.bytes = [0, 0]          # the uploaded bytes: the pinned RAM and the checkpoint's files
+        self.calls = 0                # this layer's decode calls (the residency log)
         self.filled = False
         self.scratch = _scratch(self.H, self.I, self.dtype, dev)
         self.pinned = []          # the RAM slots registered with CUDA (pin_slots)
@@ -181,17 +183,16 @@ class GsqPool:
         # (the launcher turns them off on this card), so the swaps can start with the first decode call
         _glob['captured'] = True
         _calls[0] += 1
-        if _calls[0] % 16 == 1:
-            logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d, the table %s)',
-                        self.layer_id, int((self.table >= 0).sum()), self.E, _calls[0],
-                        self.table[self.table >= 0][:6].tolist())
-        if _calls[0] % 256 == 1:
-            logger.info('xtier cache: layer %d: the residency of the last %d calls: %d routed experts, %d in the '
-                        'VRAM, %d uploaded (%.1f MiB over PCIe: %.1f from the pinned RAM, %.1f from the files)',
-                        self.layer_id, 256, self.stat[0], self.stat[1], self.stat[2], self.stat[3] / 2 ** 20,
-                        _bytes[0] / 2 ** 20, _bytes[1] / 2 ** 20)
+        self.calls += 1
+        if self.calls % 64 == 1:
+            logger.info('xtier cache: layer %d: %d of %d experts in the VRAM (the calls %d, the table %s); '
+                        'the last %d calls routed %d experts, %d were in the VRAM and %d were uploaded '
+                        '(%.1f MiB over PCIe: %.1f from the pinned RAM, %.1f from the files)',
+                        self.layer_id, int((self.table >= 0).sum()), self.E, self.calls,
+                        self.table[self.table >= 0][:6].tolist(), self.calls - 1, self.stat[0], self.stat[1],
+                        self.stat[2], self.stat[3] / 2 ** 20, self.bytes[0] / 2 ** 20, self.bytes[1] / 2 ** 20)
             self.stat = [0, 0, 0, 0]
-            _bytes[0] = _bytes[1] = 0
+            self.bytes = [0, 0]
         if self.index == 0 and _glob.get('adapt'):
             # once per decode window (anywhere in the window is safe: a slot is overwritten only after this
             # kernel acknowledged its eviction): apply the posted swaps
@@ -332,9 +333,6 @@ def _scratch_arena(pool, slots):
     return arena
 
 
-_bytes = [0, 0]   # the bytes uploaded from the pinned RAM and from the checkpoint's files
-
-
 def _upload(pool, plan, experts, arena, stream):
     """The experts' bytes into the scratch arena over PCIe: the engine's RAM slot when the expert is there (the
     cold pool's resident set) else the checkpoint's files (the pack's mapping).
@@ -378,7 +376,7 @@ def _upload(pool, plan, experts, arena, stream):
                                          f'{role}, the layout says {want}')
                     dst = arena.data_ptr() + j * pool.slot_bytes + off
                     pinned = base is not None and any(b <= address < b + n for b, n in pool.pinned)
-                    _bytes[0 if pinned else 1] += size
+                    pool.bytes[0 if pinned else 1] += size
                     try:
                         if pinned:
                             # the RAM slot is registered with CUDA: the driver copies it straight to the card
