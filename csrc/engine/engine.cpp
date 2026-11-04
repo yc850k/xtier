@@ -607,8 +607,6 @@ struct PlanBase {
     // the store, the coldest resident leaves). The GPU's hot cache calls it: the pool's traffic then decides what
     // the RAM holds, and the upload reads the bytes from the RAM (fast) instead of the files.
     virtual int cold_resident(int tokens,int k,const int32_t *ids)=0;
-    // The cold pool's prefetch: read the most routed experts that are not in RAM, in the background.
-    virtual int cold_prefetch(int n)=0;
     virtual void unpin(int slot)=0;
     virtual void cold_stats(double *out)=0;
 };
@@ -684,11 +682,6 @@ template<bool MX,bool GSQ=false> class Plan: public PlanBase {
     std::vector<long long> gsq_cold_off;       // per expert and role: the store's offset
     size_t gsq_slot_bytes=0;                   // the bytes of a slot
     bool gsq_cold=false;                       // the cold pool is attached: the routed experts are read into RAM slots
-    // The prefetch: the experts with the most routes that are not in RAM are read from the drive in the background,
-    // so the drive's latency is paid while the decode runs and not when a call needs the expert.
-    void *gsq_prefetch_ticket=nullptr;         // the reads in flight
-    std::vector<int> gsq_prefetch_experts;     // the experts they are for
-    std::vector<int> gsq_prefetch_slots;       // the RAM slots they go into
     // The tensor-parallel split: the gate and the up take the rank's rows of I (a contiguous range inside every
     // expert), the down the rank's columns of I (a strided range inside every row).
     size_t gsq_row_off=0,gsq_row_count=0;      // the gate/up rows of this rank
@@ -1673,98 +1666,8 @@ public:
         if(!cold_store)return 0;   // no cold pool: nothing to make resident
         std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
         if(!guard.owns_lock())return -3;   // an engine call is running: the caller reads the files itself
-        gsq_land_prefetch();   // the experts the prefetch read are in RAM now: they are not read again
         void *reads=ensure_resident_gsq(tokens,k,ids);
         if(reads)finish_reads(reads,tokens);
-        return 0;
-    }
-    // The experts the prefetch read are in RAM: their slots hold them and the tables say so.
-    void gsq_land_prefetch() {
-        if(!gsq_prefetch_ticket)return;
-        if(cold_io.finish(cold_store,gsq_prefetch_ticket)==0) {
-            std::lock_guard<std::mutex> g(resident_lock);
-            for(size_t q=0;q<gsq_prefetch_experts.size();q++) {
-                const int e=gsq_prefetch_experts[q],s=gsq_prefetch_slots[q];
-                slot_of[e]=s;expert_of[s]=e;gsq_point(e,s);
-            }
-        }
-        gsq_prefetch_ticket=nullptr;
-        gsq_prefetch_experts.clear();
-        gsq_prefetch_slots.clear();
-    }
-    // The prefetch: the experts with the most routes that are not in RAM are read from the drive now, in the
-    // background, so the drive's latency is paid while the decode runs and not when a call needs the expert. The
-    // experts keep their slots: they are reserved (the eviction skips them) until the reads land.
-    int cold_prefetch(int n) {
-        if constexpr(!GSQ)return -1;
-        if(!cold_store||n<1)return 0;
-        std::unique_lock<std::mutex> guard(call_lock,std::try_to_lock);
-        if(!guard.owns_lock())return -3;   // an engine call is running: the prefetch waits for the next round
-        // the reads in flight: they have landed by now (a round is a few layer calls, a read is about a
-        // millisecond), so the experts are in RAM before anything asks for them
-        gsq_land_prefetch();
-        const long long now=++cold_forwards;
-        // the candidates: the experts with the most routes that are not in RAM
-        std::vector<std::pair<double,int>> cand;
-        {
-            std::lock_guard<std::mutex> g(resident_lock);
-            for(int e=0;e<experts;e++) {
-                if(slot_of[e]>=0)continue;   // in RAM
-                const double u=cold_score[e]*std::exp(cold_log*double(now-cold_stamp[e]));
-                if(u>0.)cand.emplace_back(u,e);
-            }
-        }
-        if(cand.empty())return 0;
-        std::partial_sort(cand.begin(),cand.begin()+std::min(cand.size(),size_t(n)),cand.end(),
-                          [](const auto &a,const auto &b){return a.first>b.first;});
-        // the slots: the coldest resident experts leave RAM for the ones that are read now
-        std::vector<int> taken;
-        {
-            std::lock_guard<std::mutex> g(resident_lock);
-            for(size_t q=0;q<cand.size()&&q<size_t(n);q++) {
-                const int e=cand[q].second;
-                int best=-1;double low=0;
-                for(int s=0;s<slots;s++) {
-                    if(pins[s])continue;
-                    const int v=expert_of[s];
-                    if(v==-2)continue;                      // reserved for another read
-                    double u=-1;
-                    if(v>=0)u=cold_score[v]*std::exp(cold_log*double(now-cold_stamp[v]));
-                    if(best<0||u<low){best=s;low=u;}
-                }
-                if(best<0)break;
-                if(expert_of[best]>=0){slot_of[expert_of[best]]=-1;gsq_unpoint(expert_of[best]);}
-                expert_of[best]=-2;
-                taken.push_back(best);
-                gsq_prefetch_experts.push_back(e);
-                gsq_prefetch_slots.push_back(best);
-            }
-        }
-        if(taken.empty())return 0;
-        const int jobs=int(taken.size())*3;
-        const size_t njobs=static_cast<size_t>(jobs);
-        std::vector<int> pf_files(njobs);std::vector<long long> pf_offsets(njobs);
-        std::vector<void*> pf_dst(njobs);std::vector<size_t> pf_len(njobs);
-        for(size_t q=0;q<taken.size();q++) {
-            const int e=gsq_prefetch_experts[q];uint8_t *base=gsq_slot[size_t(taken[q])].get();
-            for(int r=0;r<3;r++) {
-                const int j=int(q)*3+r;
-                pf_files[size_t(j)]=gsq_cold_file[size_t(e)*3+r];pf_offsets[size_t(j)]=gsq_cold_off[size_t(e)*3+r];
-                pf_dst[size_t(j)]=base+gsq_slot_reg[r];
-                pf_len[size_t(j)]=r==0?gsq_gate_size[e]:r==1?gsq_up_size[e]:gsq_down_size[e];
-            }
-        }
-        std::vector<int> groups(size_t(jobs),0);
-        void *ticket=cold_io.submit(cold_store,jobs,pf_files.data(),pf_offsets.data(),pf_dst.data(),pf_len.data(),1,
-                                    groups.data(),1);
-        if(!ticket){   // the read did not start: the slots stay reserved, the experts are read on demand
-            std::lock_guard<std::mutex> g(resident_lock);
-            for(int s:taken)if(expert_of[s]==-2)expert_of[s]=-1;
-            gsq_prefetch_experts.clear();
-            gsq_prefetch_slots.clear();
-            return -1;
-        }
-        gsq_prefetch_ticket=ticket;
         return 0;
     }
     // The GSQ cold pool: the experts in the RAM slots and the rest in the store (the checkpoint's own files, on the
@@ -2105,11 +2008,6 @@ int XTIER_API(xtier_slot_pin)(void *plan,int expert) {return plan?static_cast<Ha
 // upload copies the bytes from the RAM (the pinned slots) instead of the checkpoint's files.
 int XTIER_API(xtier_gsq_cold_resident)(void *plan,int tokens,int k,const int32_t *ids) {
     return plan?static_cast<Handle*>(plan)->plan->cold_resident(tokens,k,ids):-1;
-}
-// The cold pool's prefetch: the most routed experts that are not in RAM are read from the drive in the background,
-// so the drive's latency is paid while the decode runs and not when a call needs the expert.
-int XTIER_API(xtier_gsq_cold_prefetch)(void *plan,int n) {
-    return plan?static_cast<Handle*>(plan)->plan->cold_prefetch(n):-1;
 }
 void XTIER_API(xtier_slot_unpin)(void *plan,int slot) {if(plan)static_cast<Handle*>(plan)->plan->unpin(slot);}
 void XTIER_API(xtier_cold_plan_stats)(void *plan,double *out) {if(plan&&out)static_cast<Handle*>(plan)->plan->cold_stats(out);}

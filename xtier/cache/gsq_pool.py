@@ -160,7 +160,6 @@ class GsqPool:
         self.copy_ms = 0.0            # the copies themselves (XTIER_TIMING)
         self.pre_ms = 0.0             # the routed experts' selection (XTIER_TIMING)
         self.py_ms = 0.0              # the decode call's CPU time (XTIER_TIMING)
-        self.pf = [0, 0, 0, 0, 0]     # the prefetch's returns (0 ok, 1 nothing, 2 read, -1 failed, -3 busy)
         self.cold_ms = 0.0            # the cold pool's reads (XTIER_TIMING)
         self.window_calls = 0         # the calls in the timing window (XTIER_TIMING)
         self._pending = []            # the events of the calls (the GPU's kernel time, read at the log point)
@@ -236,13 +235,12 @@ class GsqPool:
                 self._pending.clear()
                 logger.info('xtier timing: layer %d: the last %d calls: the GPU %.2f ms a call, the wall %.2f ms a '
                             'call, the uploads %.2f ms a call (the selection %.2f, the ids %.2f, the copies %.2f, '
-                            'the cold pool %.2f, the prefetch %s, the Python %.2f)',
+                            'the cold pool %.2f, the Python %.2f)',
                             self.layer_id, n, self.gpu_ms / n, self.wall_ms / n, self.up_ms / n, self.pre_ms / n,
-                            self.sync_ms / n, self.copy_ms / n, self.cold_ms / n, self.pf, self.py_ms / n)
+                            self.sync_ms / n, self.copy_ms / n, self.cold_ms / n, self.py_ms / n)
                 self.gpu_ms = self.wall_ms = self.up_ms = 0.0
                 self.sync_ms = self.copy_ms = self.pre_ms = self.cold_ms = 0.0
                 self.py_ms = 0.0
-                self.pf = [0, 0, 0, 0, 0]
                 self.window_calls = 0
             self.stat = [0, 0, 0, 0]
             self.upload_bytes = [0, 0]
@@ -347,14 +345,6 @@ class GsqPool:
         _upload(self, self.mailbox.plan, experts, arena, torch.cuda.current_stream())
         if config.timing():
             self.copy_ms += (time.perf_counter() - t_ids) * 1e3
-        # The prefetch: the experts with the most routes that are not in RAM are read from the drive now, in the
-        # background, so the drive's time is paid while the decode runs and not when a call needs the expert.
-        plan = self.mailbox.plan
-        lib = getattr(plan, 'lib', None)
-        if lib is not None and hasattr(lib, 'xtier_gsq_cold_prefetch'):
-            rc = lib.xtier_gsq_cold_prefetch(plan.plan, int(os.environ.get('XTIER_COLD_PREFETCH', '2')))
-            if config.timing():
-                self.pf[rc if rc >= 0 else 4] += 1
         self.uploaded[want[:take]] = torch.arange(take, dtype=torch.int32, device=ids.device)
         # the packing kernel reads the expert of every slot from the owner table: the uploaded slots follow the hot ones
         self.owner[self.S:self.S + take] = want[:take]
