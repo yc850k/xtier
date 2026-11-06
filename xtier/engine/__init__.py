@@ -31,6 +31,13 @@ def engine() -> C.CDLL:
         lib.xtier_create3.restype = _P
         lib.xtier_set_swiglu.argtypes = [_P, C.c_float, C.c_float]
         lib.xtier_set_swiglu.restype = _I
+        if hasattr(lib, 'xtier_gsq_decode'):   # the GSQ experts' decode (llama.cpp's dequantize_row_iq*)
+            lib.xtier_gsq_decode.argtypes = [_I, _P, _P, _I]
+            lib.xtier_gsq_decode.restype = _I
+        if hasattr(lib, 'xtier_create5'):   # the GSQ experts (a GGUF checkpoint's IQ-quantized rows)
+            lib.xtier_create5.argtypes = ([_I, _I, _I, _I, C.c_float] + [_P] * 6
+                                        + [C.c_float, C.c_float] + [C.c_long] * 5)
+            lib.xtier_create5.restype = _P
         lib.xtier_forward.argtypes = [_P, _I, _I] + [_P] * 4
         lib.xtier_forward.restype = _I
         lib.xtier_destroy.argtypes = [_P]
@@ -59,6 +66,15 @@ def engine() -> C.CDLL:
                                 ('cold_close', [_P], None), ('cold_error', [], C.c_char_p)):
             fn = getattr(lib, 'xtier_' + name)
             fn.argtypes, fn.restype = args, res
+        if hasattr(lib, 'xtier_gsq_cold_attach'):   # the GSQ cold pool (the IQ experts, 2026-10-29)
+            lib.xtier_gsq_cold_attach.argtypes = [_P, _P, _P, _P, _P, _I, _P, C.c_float]
+            lib.xtier_gsq_cold_attach.restype = _I
+        if hasattr(lib, 'xtier_gsq_slot_pieces'):   # a RAM slot's three regions (where a GPU upload reads them)
+            lib.xtier_gsq_slot_pieces.argtypes = [_P, _I, _P, _P]
+            lib.xtier_gsq_slot_pieces.restype = _I
+        if hasattr(lib, 'xtier_gsq_cold_resident'):  # the GSQ cold pool: make the routed experts resident in RAM
+            lib.xtier_gsq_cold_resident.argtypes = [_P, _I, _I, _P]
+            lib.xtier_gsq_cold_resident.restype = _I
         _engine = lib
     return _engine
 
@@ -83,14 +99,33 @@ class CpuPlan:
     and left to the caller to fill (shards / slot_pieces) before the first forward."""
 
     def __init__(self, experts, threads, weight_pointers, hidden, inter, swiglu_limit=0.0, scale_format='nvfp4',
-                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None):
-        if scale_format not in SCALE_FORMATS:
+                 swiglu_alpha=1.0, swiglu_beta=0.0, resident=None, gsq_types=None, gsq_split=None):
+        if scale_format not in SCALE_FORMATS and not (scale_format == 'gsq' and gsq_types is not None):
             raise ValueError(f'Unknown scale format {scale_format!r}')
         self.lib = engine()
         self.hidden, self.inter, self.experts = int(hidden), int(inter), int(experts)
         self.swiglu_limit, self.scale_format = float(swiglu_limit), scale_format
         self.slots = self.experts if resident is None else len(resident)   # resident: the experts of slots 0..
         self.dynamic = None   # cold experts: the RAM slots experts can leave (cold.attach)
+        self._localized = False
+        if gsq_types is not None:
+            # The GSQ experts: the gate, the up and the down rows of every expert, one tensor each, and the type per
+            # expert per role (the ggml type ids): the pack quantizes every role on its own, so the down's type often
+            # differs from the gate's.
+            if not hasattr(self.lib, 'xtier_create5'):
+                raise RuntimeError('xtier: this engine build has no GSQ experts; rebuild it (tools/build_engine.sh)')
+            # gsq_split: (row_off, row_count, col_off, col_count, full_inter) of this tensor-parallel rank
+            row_off, row_count, col_off, col_count, full_inter = gsq_split or (0, self.inter, 0, self.inter, self.inter)
+            types_gate, types_up, types_down = gsq_types
+            self.plan = self.lib.xtier_create5(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
+                                               weight_pointers[0], weight_pointers[1], weight_pointers[2],
+                                               types_gate, types_up, types_down,
+                                               float(swiglu_alpha), float(swiglu_beta),
+                                               int(row_off), int(row_count), int(col_off), int(col_count),
+                                               int(full_inter))
+            if not self.plan:
+                raise RuntimeError(self.lib.xtier_last_error().decode())
+            return
         if resident is None:
             self.plan = self.lib.xtier_create3(self.hidden, self.inter, self.experts, int(threads), self.swiglu_limit,
                                                SCALE_FORMATS[scale_format], *weight_pointers)
@@ -105,7 +140,6 @@ class CpuPlan:
         if (swiglu_alpha, swiglu_beta) != (1.0, 0.0):
             if self.lib.xtier_set_swiglu(self.plan, swiglu_alpha, swiglu_beta):
                 raise RuntimeError(self.lib.xtier_last_error().decode())
-        self._localized = False
 
     def forward(self, m, k, x, ids, routing, out):
         """x: BF16 [m, H], ids: int32 [m, k], routing: float32 [m, k] -> out: float32 [m, H] (host addresses here)."""
@@ -209,6 +243,22 @@ class CpuPlan:
                                       float(half_life)):
             raise RuntimeError(self.lib.xtier_last_error().decode())
 
+    def attach_cold_gsq(self, store, files, offsets, resident, scores, half_life):
+        """The GSQ cold pool: the store's locations of every expert's three tensors ([e * 3 + role]; role 0 the
+        gate, 1 the up, 2 the down), the experts to have in RAM (slot i holds resident[i]), their initial decayed
+        use counts and their half-life in forwards (xtier_gsq_cold_attach)."""
+        if not hasattr(self.lib, 'xtier_gsq_cold_attach'):
+            raise RuntimeError('xtier: this engine build has no GSQ cold pool; rebuild it (tools/build_engine.sh)')
+        if len(files) != self.experts * 3 or len(offsets) != len(files):
+            raise ValueError('xtier: the GSQ cold files / offsets need one entry per expert and role')
+        f = (C.c_int32 * len(files))(*files)
+        o = (C.c_longlong * len(offsets))(*offsets)
+        r = (C.c_int32 * len(resident))(*resident)
+        sc = (C.c_float * self.experts)(*scores)
+        if self.lib.xtier_gsq_cold_attach(self.plan, store.handle, C.cast(f, _P), C.cast(o, _P), C.cast(r, _P),
+                                          len(resident), C.cast(sc, _P), float(half_life)):
+            raise RuntimeError(self.lib.xtier_last_error().decode())
+
     def cold_stats(self):
         """(forwards, experts read from NVMe, seconds spent reading; the same for forwards of at most 8 tokens;
         experts not in RAM XTIER_TAIL_SKIP left out: reads saved)."""
@@ -306,6 +356,7 @@ def mailbox_lib() -> C.CDLL:
             'slot': ([_P, _P, _I, _I, _P], _I), 'notify': ([_P, _P, _I, _I], _I), 'slot2': ([_P, _P, _I, _I, _P], _I),
             'signal': ([_P, _P, _I, _I, _I], _I), 'pool_enable': ([_P, _I], _I), 'pool_stats': ([_P, _P], _I),
             'pool_ring': ([_P], _I), 'pool_attach': ([_P, _I, _I, _I, _I, _P, _P], _I),
+            'pool_attach_gsq': ([_P, _I, _I, _I, _I, _P, C.c_size_t, _P, _P, _P], _I),
             'pool_pause': ([_I], _I), 'pool_quiesce': ([_I], _I), 'pool_shrink': ([_I], _I), 'pool_resume': ([], _I),
             'pool_grow': ([_I], _I), 'pool_active': ([], _I), 'vmm_reserve': ([C.c_size_t, _P, _P], _I),
             'vmm_map': ([_P, C.c_size_t, C.c_size_t], _I), 'vmm_unmap': ([_P, C.c_size_t], _I),

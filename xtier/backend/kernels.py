@@ -25,7 +25,9 @@ class Pointer:
 def _pack(X, IDS, ROUTE, ACT, SX, SIDS, SROUTE, NX: tl.constexpr, NK: tl.constexpr, K: tl.constexpr,
           HAS_ACT: tl.constexpr, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
-    tl.store(SX + i, tl.load(X + i, i < NX), i < NX)
+    # the engine reads BF16 (its contract): the activations are converted here, as on a BF16 host the round trip is
+    # exact (on an FP16 host the model runs in FP16 and the engine still wants BF16)
+    tl.store(SX + i, tl.load(X + i, i < NX).to(tl.float32).to(tl.bfloat16), i < NX)
     if tl.program_id(0) == 0:
         j = tl.arange(0, 128)  # m*k <= 8*10 routes
         ids = tl.load(IDS + j, j < NK)
@@ -42,12 +44,13 @@ def _unpack(SOUT, OUT, N: tl.constexpr, B: tl.constexpr):
     tl.store(OUT + i, tl.load(SOUT + i, i < N, cache_modifier='.cv'), i < N)
 
 
-def pack(slot, m, k, x, ids, routing, H, act=0):
-    """x: BF16 [m, H], ids: int32 [m, k], routing: float32 [m, k], act: int32 [m] token flags or 0 (device addresses)
-    -> the slot's inputs."""
+def pack(slot, m, k, x, ids, routing, H, act=0, dtype=torch.bfloat16):
+    """x: the activations [m, H] in `dtype` (BF16, or FP16 where the GPU has no BF16 tensor cores), ids: int32 [m, k],
+    routing: float32 [m, k], act: int32 [m] token flags or 0 (device addresses) -> the slot's inputs. The engine reads
+    BF16: the store into the slot converts."""
     sx, sids, sroute = slot[:3]
-    _pack[(triton.cdiv(m * H, BLOCK),)](Pointer(x, torch.int16), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
-                                        Pointer(act or ids, torch.int32), Pointer(sx, torch.int16),
+    _pack[(triton.cdiv(m * H, BLOCK),)](Pointer(x, dtype), Pointer(ids, torch.int32), Pointer(routing, torch.int32),
+                                        Pointer(act or ids, torch.int32), Pointer(sx, torch.bfloat16),
                                         Pointer(sids, torch.int32), Pointer(sroute, torch.int32), m * H, m * k, k,
                                         bool(act), BLOCK)
 

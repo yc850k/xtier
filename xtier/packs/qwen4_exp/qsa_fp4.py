@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier import arch
 from xtier.arch import HW_FP8, e4m3_f32
 
 BLOCK_TOPK = 16
@@ -217,7 +218,7 @@ def pack_qsa_prefill_kv(original, *, k, v, req_to_token, req_indices, cu_k, tota
     if not _active:
         return original(k=k, v=v, req_to_token=req_to_token, req_indices=req_indices, cu_k=cu_k, total_k=total_k,
                         max_k=max_k, output_dtype=output_dtype)
-    return pack(_active[-1], req_to_token, req_indices, cu_k, total_k, max_k, output_dtype or torch.bfloat16)
+    return pack(_active[-1], req_to_token, req_indices, cu_k, total_k, max_k, output_dtype or arch.dtype())
 
 
 def extraction(original, k, v, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk,

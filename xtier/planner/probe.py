@@ -23,6 +23,8 @@ import time
 
 import torch
 
+from xtier import arch
+
 FORMAT_GROUP = {'nvfp4': 16, 'mxfp4': 32}
 
 
@@ -101,7 +103,7 @@ class Layer:
 
 def _graph_time(call, id_sets, m, H, reps):
     """Microseconds per call: one CUDA graph of len(id_sets) calls (each with its own routes), replayed reps times."""
-    x = (torch.randn(m, H, device='cuda') * 0.5).bfloat16()
+    x = (torch.randn(m, H, device='cuda') * 0.5).to(arch.dtype())   # the activations' dtype (FP16 on Turing)
     rw = torch.softmax(torch.randn(m, id_sets[0].shape[1], device='cuda'), -1)
     out = torch.empty(m, H, device='cuda', dtype=torch.float32)
     ids = [t.cuda() for t in id_sets]

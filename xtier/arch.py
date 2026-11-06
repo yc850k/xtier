@@ -1,75 +1,253 @@
-"""What this GPU gives XTier's own Triton kernels, and software decoding where it gives less.
+"""What this host's GPU can compute: the compute capability, the dtypes its tensor cores take, and the features
+XTier must leave off.
 
-- FP4 (E2M1) to FP16: the cvt.rn.f16x2.e2m1x2 instruction needs SM100 or newer (SM120 included); RTX 30 / 40 series
-  (SM86 / SM89) build the FP16 bits with integer operations (XTIER_FP4_DECODE=hw|soft|auto).
-- FP8 (E4M3) to FP32: Triton has float8e4nv from SM89 on; RTX 30 series (SM86) build the FP32 bits with integer
-  operations (XTIER_FP8_DECODE=hw|soft|auto). The other way, ``e4m3_bits`` encodes FP32 in software as the conversion
-  Triton emits from SM89 on (round to nearest even, saturating), for kernels that store FP8 on those GPUs.
-The software paths give exactly the values of the conversions (tests/fp4_decode_check.py, tests/fp8_decode_check.py),
-so a kernel computes the same results with either. The flags are fixed when this module is first imported, in the
-process that runs the kernels.
+Turing (sm_75) is the oldest GPU XTier runs on. It has FP16 tensor cores with FP32 accumulation, but:
+
+- no BF16 (sm_80): a BF16 dot product is not compiled below sm_80 and cuBLAS has no BF16 GEMM there, so on
+  Turing the model's activations are FP16 (``--dtype float16``) and XTier's GPU kernels take FP16 operands. The
+  CPU engine keeps its BF16 contract: the activations are converted to BF16 when they are staged for it.
+- no FP8 (sm_89): the FP8 paths (the DeepSeek and GLM packs' FP8 weights, the FP8 GEMM tuning configs) are off.
+- no TMA (sm_90): the Qwen hyper-connection mix's overlapped kernel stays off (it checks the capability itself).
+- no FP4 tensor cores (sm_100) and no FP4 conversion instruction: the Blackwell instruction
+  ``cvt.rn.f16x2.e2m1x2`` that the cache's decode kernels use to convert two E2M1 values at a time does not exist
+  below sm_100, so the software E2M1 decode (as in the GPU prefill) is used there.
+
+The capability is read once per process. ``XTIER_ARCH`` overrides it (e.g. ``XTIER_ARCH=7.5`` on a host without a
+GPU, for the tests); ``XTIER_ARCH=none`` means "no GPU": only the CPU paths run.
 """
+
+import functools
+import logging
 import os
 
-import torch
-import triton
-import triton.language as tl
+logger = logging.getLogger(__name__)
+
+SM75 = (7, 5)     # Turing: FP16 tensor cores, no BF16, no FP8, no TMA, no FP4
+SM80 = (8, 0)     # Ampere: BF16 and TF32
+SM89 = (8, 9)     # Ada: FP8
+SM90 = (9, 0)     # Hopper: TMA
+SM100 = (10, 0)   # Blackwell: FP4 tensor cores and the FP4 conversion instruction
+SM120 = (12, 0)   # Blackwell (consumer, RTX PRO 5000): the SM120 MXFP8 / MXFP4 CUTLASS runners
 
 
-def _hardware(variable, capability):
+def _override():
+    """XTIER_ARCH=7.5 (or 'none' for a host without a GPU) -> the capability to assume."""
+    spec = os.environ.get('XTIER_ARCH', '').strip().lower()
+    if not spec:
+        return None
+    if spec in ('none', 'cpu'):
+        return None
+    major, _, minor = spec.partition('.')
+    try:
+        return int(major), int(minor or 0)
+    except ValueError:
+        raise ValueError(f'xtier: XTIER_ARCH={spec!r} is not a compute capability (e.g. 7.5)')
+
+
+def _driver_capability():
+    """The compute capability of the device, read through the driver API (no CUDA context: the plugin's hooks are
+    installed before the process creates one)."""
+    import ctypes
+    try:
+        lib = ctypes.CDLL('libcuda.so.1')
+    except OSError:
+        return None
+    if lib.cuInit(0) != 0:
+        return None
+    device = ctypes.c_int()
+    if lib.cuDeviceGet(ctypes.byref(device), 0) != 0:
+        return None
+    major, minor = ctypes.c_int(), ctypes.c_int()
+    # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR / _MINOR
+    if lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device) != 0:
+        return None
+    if lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device) != 0:
+        return None
+    return major.value, minor.value
+
+
+@functools.lru_cache(maxsize=1)
+def capability():
+    """The compute capability of the current device, (major, minor). None without a GPU."""
+    override = _override()
+    if override is not None:
+        return override
+    if os.environ.get('XTIER_ARCH', '').strip().lower() in ('none', 'cpu'):
+        return None
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None and torch.cuda.is_initialized():   # the process has a context: ask torch
+        return torch.cuda.get_device_capability()
+    cap = _driver_capability()
+    if cap is not None:
+        return cap
+    if torch is not None and torch.cuda.is_available():
+        return torch.cuda.get_device_capability()
+    return None
+
+
+def at_least(major, minor=0) -> bool:
+    """Whether the device is at least this compute capability."""
+    cap = capability()
+    return cap is not None and cap >= (major, minor)
+
+
+def has_bf16() -> bool:
+    """BF16 tensor cores (sm_80)."""
+    return at_least(*SM80)
+
+
+def has_tf32() -> bool:
+    """TF32 tensor cores (sm_80): the down projection's default precision."""
+    return at_least(*SM80)
+
+
+def _decode_mode(variable: str) -> str:
+    """XTIER_FP8_DECODE / XTIER_FP4_DECODE: hw (the hardware conversion), soft (the bit math) or auto (the card's)."""
     mode = os.environ.get(variable, 'auto').strip().lower()
-    if mode in ('hw', 'soft'):
+    if mode not in ('hw', 'soft', 'auto'):
+        raise ValueError(f'xtier: {variable}={mode!r} is not hw, soft or auto')
+    return mode
+
+
+def has_fp8() -> bool:
+    """FP8 tensor cores (sm_89): the E4M3 conversions the kernels do.
+
+    ``XTIER_FP8_DECODE=soft`` forces the software conversion (the bit math of ``xtier.backend.fp4``) on a card that
+    has the hardware one, so the two paths can be compared on the same GPU.
+    """
+    mode = _decode_mode('XTIER_FP8_DECODE')
+    if mode != 'auto':
         return mode == 'hw'
-    return torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) >= capability
+    return at_least(*SM89)
 
 
-HW_FP4 = tl.constexpr(_hardware('XTIER_FP4_DECODE', (10, 0)))
-HW_FP8 = tl.constexpr(_hardware('XTIER_FP8_DECODE', (8, 9)))
+def has_tma() -> bool:
+    """TMA (cp.async.bulk, sm_90)."""
+    return at_least(*SM90)
+
+
+def has_fp4() -> bool:
+    """FP4 tensor cores (sm_100)."""
+    return at_least(*SM100)
+
+
+def has_fp4_convert() -> bool:
+    """The FP4 conversion instruction (cvt.rn.f16x2.e2m1x2, sm_100): the cache's decode kernels use it to convert
+    two E2M1 values at a time; below it the software decode is used.
+
+    ``XTIER_FP4_DECODE=soft`` forces the software decode on a card that has the instruction.
+    """
+    mode = _decode_mode('XTIER_FP4_DECODE')
+    if mode != 'auto':
+        return mode == 'hw'
+    return at_least(*SM100)
+
+
+def has_blackwell_mxfp4_moe() -> bool:
+    """FlashInfer's CUTLASS MXFP4 fused MoE (the SM120 runner the GPU prefill's FP4 path uses)."""
+    return capability() is not None and capability()[0] == SM120[0]
+
+
+def dot_dtype():
+    """The dtype the GPU's tensor cores take for a 16-bit dot product: BF16 from sm_80 on, FP16 below. An unknown
+    capability (no GPU in sight) keeps the BF16 default."""
+    import torch
+    cap = capability()
+    return torch.bfloat16 if cap is None or cap >= SM80 else torch.float16
+
+
+def dtype():
+    """The dtype of the activations XTier's GPU kernels compute in: the model's dtype. From sm_80 on it is BF16;
+    below it (Turing, sm_75) the model runs FP16, the dtype SGLang itself falls back to on a card without BF16
+    tensor cores - the residual stream that needs BF16's range is kept in FP32 by the pack instead.
+    ``XTIER_DTYPE=bf16|fp16|auto`` (default auto: the card's)."""
+    import torch
+    spec = os.environ.get('XTIER_DTYPE', 'auto').strip().lower()
+    if spec in ('', 'auto'):
+        return dot_dtype()
+    if spec == 'bf16':
+        return torch.bfloat16
+    if spec == 'fp16':
+        return torch.float16
+    raise ValueError(f'xtier: XTIER_DTYPE={spec!r} is not bf16, fp16 or auto')
+
+
+def check_activation_dtype(dtype):
+    """The dtype of the activations: BF16 or FP16. The CPU engine keeps its BF16 contract either way: the
+    activations are converted when they are staged for it.
+
+    Below sm_80 the card's dtype is FP16 (the model's own fallback), and BF16 is allowed with a warning: the
+    emulation is exact, only slower - the residual stream that needs BF16's range is kept in FP32 by the pack."""
+    import torch
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f'xtier: BF16 or FP16 activations required, got {dtype}')
+    if dtype == torch.bfloat16 and capability() is not None and not has_bf16():
+        logger.warning('xtier: %s has no BF16 tensor cores: the BF16 activations are emulated (slower, exact)',
+                       describe())
+    return dtype
+
+
+def describe() -> str:
+    """One line about the device, for the logs."""
+    cap = capability()
+    if cap is None:
+        return 'no GPU'
+    return f'sm_{cap[0]}{cap[1]}'
+
+
+def shared_memory_kb():
+    """The shared memory a kernel may use per block, in KiB: Turing has 64, the newer cards more. The kernels' tiles
+    are sized so that their pipeline fits."""
+    import torch
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        for name in ('shared_memory_per_block_optin', 'shared_memory_per_multiprocessor'):
+            value = getattr(props, name, 0)
+            if value:
+                return value // 1024
+    cap = capability()
+    return 64 if cap is None or cap[0] <= 7 else 228
+
+# The codecs the kernels use: the E2M1 and E4M3 values in software (xtier/backend/fp4.py holds the bit math; the HW
+# parameter picks the hardware conversion where the card has one). Upstream's below-SM89 / SM90 work calls them as
+# ``arch.e4m3_f32(byte)``; the flags are decided once, when this module is first imported, in the process that runs
+# the kernels.
+import triton
+import triton.language as tl  # noqa: E402
+
+from xtier.backend.fp4 import e2m1_f16 as _e2m1_f16, e4m3_bits as _e4m3_bits, e4m3_f32 as _e4m3_f32  # noqa: E402
+
+HW_FP4 = tl.constexpr(has_fp4_convert())
+HW_FP8 = tl.constexpr(has_fp8())
+
+
+def tl_dtype(dtype):
+    """The Triton dtype of a 16-bit float dtype: the kernels' dot operands (BF16 or FP16). The dtype of the
+    activations, so that a kernel's operands and its accumulator's input always agree."""
+    import torch
+    return tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
 
 
 @triton.jit
-def e2m1_f16(c):
-    """E2M1 code (low 4 bits; sign in bit 3) -> FP16, the bits cvt.rn.f16x2.e2m1x2 gives: magnitudes 0.5..6 have
-    exponent field (m >> 1) + 14 and mantissa bit (m & 1), i.e. (m << 9) + 0x3800; 0 and 0.5 (subnormal in E2M1) are
-    m * 0x3800; the sign moves from bit 3 to bit 15 (code 8 is -0.0)."""
-    m = c & 7
-    bits = tl.where(m >= 2, (m << 9) + 0x3800, m * 0x3800) | ((c & 8) << 12)
-    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
+def e2m1_f16(code):
+    """E2M1 nibble (the sign in bit 3) -> FP16: the software form of ``cvt.rn.f16x2.e2m1x2``."""
+    return _e2m1_f16(code)
 
 
 @triton.jit
-def e4m3_f32(b):
-    """E4M3 byte (uint8 storage of float8_e4m3fn) -> FP32. In software: exponent field e, mantissa m; e > 0 is
-    2^(e-7) * (1 + m/8), the FP32 bits ((e + 120) << 23) | (m << 20); e = 0 is m * 2^-9 (subnormal); 0x7F / 0xFF are
-    NaN; bit 7 is the sign (0x80 is -0.0)."""
-    if HW_FP8:
-        return b.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    else:
-        v = b.to(tl.int32)
-        e = (v >> 3) & 15
-        m = v & 7
-        mag = tl.where(e == 0, m.to(tl.float32) * 0.001953125,
-                       (((e + 120) << 23) | (m << 20)).to(tl.float32, bitcast=True))
-        mag = tl.where((v & 0x7F) == 0x7F, float('nan'), mag)
-        return tl.where((v & 0x80) != 0, -mag, mag)
+def e4m3_f32(code, HW: tl.constexpr = HW_FP8.value):
+    """The E4M3 byte -> FP32: the hardware conversion where the card has it (sm_89 and newer), the bit math below.
+
+    ``HW`` picks the conversion per call: the default is this card's (the flag above), a kernel that knows better
+    (the Turing path, where the card has no FP8 conversion) passes its own.
+    """
+    return _e4m3_f32(code, HW=HW)
 
 
 @triton.jit
-def e4m3_bits(x):
-    """FP32 -> E4M3 (fn) byte as cvt.rn.satfinite.e4m3x2.f32 gives it: round to nearest even, saturating to +-448
-    (infinities too), NaN to 0x7F with its sign. From 2^-6 up the FP32 bits are rounded at mantissa bit 20 (a carry
-    moves into the exponent); below, the value is |x| * 2^9 subnormal steps rounded to the nearest even (8 steps are
-    the smallest normal, code 0x08)."""
-    bits = x.to(tl.int32, bitcast=True)
-    sign = (bits >> 24) & 0x80
-    a = bits & 0x7FFFFFFF
-    r = a + 0x7FFFF + ((a >> 20) & 1)
-    normal = (((r >> 23) - 120) << 3) | ((r >> 20) & 7)
-    t = a.to(tl.float32, bitcast=True) * 512.0
-    lo = tl.floor(t)
-    steps = lo.to(tl.int32)
-    half = t - lo
-    steps += ((half > 0.5) | ((half == 0.5) & ((steps & 1) == 1))).to(tl.int32)
-    code = tl.where(a < 0x3C800000, steps, tl.minimum(normal, 0x7E))
-    code = tl.where(a > 0x7F800000, 0x7F, code)
-    return (code | sign).to(tl.uint8)
+def e4m3_bits(x, HW: tl.constexpr = HW_FP8.value):
+    """FP32 -> the E4M3 byte, as ``cvt.rn.satfinite.e4m3x2.f32`` gives it: round to nearest even, saturating."""
+    return _e4m3_bits(x, HW=HW)

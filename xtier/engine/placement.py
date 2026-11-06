@@ -38,6 +38,37 @@ def _format(cpus) -> str:
     return ','.join(out)
 
 
+def _cgroup_cpus() -> set[int]:
+    """The CPUs the process may use: the cgroup's cpuset, or the host's online CPUs when it has none.
+
+    The process's own affinity can be narrower than that: the scheduler narrows it (the engine's CPUs are reserved
+    for the workers) before the model worker is spawned, and the worker inherits the narrowed set. The worker takes
+    the CPUs back with this, so it can place itself on the whole cgroup.
+    """
+    from pathlib import Path
+
+    text = ''
+    try:
+        path = Path('/proc/self/cgroup').read_text().strip().split('0::')[-1]
+        text = Path('/sys/fs/cgroup' + path + '/cpuset.cpus.effective').read_text().strip()
+    except OSError:
+        text = ''
+    if not text:
+        try:
+            text = Path('/sys/devices/system/cpu/online').read_text().strip()
+        except OSError:
+            return set()
+    cpus = set()
+    for part in text.replace('\n', ',').split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-')
+            cpus.update(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
+
+
 def per_rank(name: str, rank: int, size: int) -> str:
     """The value of `name`, or rank's part of 'a|b|...'."""
     value = os.environ.get(name, '')
@@ -111,7 +142,9 @@ def dispatch_cpu(workers: set[int], allowed: set[int], rank: int = 0, size: int 
         return int(chosen)
     free = sorted(allowed - workers, reverse=True)
     if not free:
-        raise RuntimeError('xtier: no CPU left for the mailbox dispatcher; lower XTIER_THREADS')
+        raise RuntimeError('xtier: no CPU left for the mailbox dispatcher '
+                           f'({len(allowed)} CPUs allowed, {len(workers)} of them workers, '
+                           f'{len(allowed & workers)} in common); lower XTIER_THREADS')
     idle = [c for c in free if not (_siblings(c) & workers)]
     return (idle or free)[0]
 
@@ -129,6 +162,17 @@ def apply(threads: int, rank: int = 0, size: int = 1) -> None:
         return
     _applied.append((rank, size))
     allowed = set(os.sched_getaffinity(0))
+    cgroup = _cgroup_cpus()
+    if cgroup and not allowed >= cgroup:
+        # the process inherited a narrowed affinity (the scheduler placed itself before the worker was spawned):
+        # take the cgroup's CPUs back, the placement below narrows them again
+        logger.info('xtier: the affinity was narrowed to %d CPUs, taking the cgroup\'s %d back',
+                    len(allowed), len(cgroup))
+        allowed = cgroup
+        try:
+            os.sched_setaffinity(0, allowed)
+        except OSError:
+            pass
     mine = None
     if size > 1 or deferred():
         nodes = cpu_nodes()

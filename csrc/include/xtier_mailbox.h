@@ -36,6 +36,13 @@ int xtier_mailbox_pool_stats(void *bridge, double *statistics);
 // window, decay, minimum gain).
 int xtier_mailbox_pool_ring(void **pointers);
 int xtier_mailbox_pool_attach(void *bridge, int layer, int slots, int active, int experts, void **arena, const int *resident);
+// The GSQ path (the IQ-quantized experts of a GGUF pack): the slots hold the experts' bytes as the checkpoint has
+// them (one slot per expert: the gate, the up and the down), so the residency table maps the experts to their slots
+// the same way, but the offsets and the sizes are per expert and per role. sources, when given, are the same three
+// ranges in the checkpoint's own mapping: a swap of an expert that is not in the engine's RAM reads them from there.
+int xtier_mailbox_pool_attach_gsq(void *bridge, int layer, int slots, int active, int experts, void *arena,
+                                  size_t stride, const int32_t *offsets, const size_t *sizes, const int *resident,
+                                  const char *const *sources, const int64_t *source_offsets);
 int xtier_mailbox_pool_start(int every, int budget, float decay, float min_gain);
 // Prompt warm-up (XTIER_CACHE_PROMPT, cache/pool.py record_prompt): pool_prompt hands a prefill's route counts (host) to the
 // policy on the stream; pool_warm sets how they blend in and what they may swap.

@@ -1,43 +1,50 @@
-"""DeepSeek V4.1 attention below SM90 (RTX 30 / 40 series): Triton sparse MLA over SGLang's FP8 KV pages in place of
-FlashMLA.
+"""The DeepSeek V4.1 attention on Turing: a Triton sparse MLA over SGLang's packed FP8 KV pages, in place of FlashMLA.
 
-Off SM100 SGLang keeps DeepSeek V4's KV layout (per token 448 FP8 E4M3 values with one UE8M0 scale per 64, then the 64
-rope values in BF16) and its DeepSeek V4 backend sends every attention call (decode, DSpark verify, prefill) to
-``sglang.kernels.ops.attention.flash_mla_interface.flash_mla_with_kvcache`` (the sgl-flash-mla wheel), prefill chunks above _LARGE_INDEXER_QUERY_THRESHOLD tokens to
-``flash_mla_sparse_fwd`` instead; only SM120 goes to FlashInfer's SM120 kernels (flash_mla_sm120). FlashMLA is built
-for SM90 / SM100 / SM103 only. SGLang's Triton fallback for SM120 (flash_mla_sm120_triton) runs one program per query
-row and head and rounds the window's and the compressed keys' partial outputs to BF16 before it merges them and applies
-the sink.
+Upstream's approach for the cards below SM90 (RTX 30 / 40 series, PR #10) is taken over from there: SGLang serves
+every DeepSeek V4 attention call through FlashMLA (the sgl-flash-mla wheel), which is built for SM90 / SM100 only, so
+the call is hooked and a Triton sparse MLA computes the same attention over the same pages. The upstream's kernel
+(xtier/packs/deepseek_v4/sparse_mla.py in origin/main) is the one here, with the three changes Turing needs:
 
-Here one Triton kernel reads both caches of a row (the window, then the compressed keys) into one online softmax: FP8
-values decoded exactly (xtier.arch.e4m3_f32, in software on RTX 30 series) and scaled to BF16 (exact: four
-significant bits), Q.K on BF16 tensor cores with FP32 accumulation, the softmax scale on the FP32 scores, P in BF16 for
-the PV product as in the flash kernels, FP32 accumulation, the sink in the FP32 normalization, one BF16 rounding of the
-output. Decode-sized calls split a row's keys over programs and merge the partial results in FP32, so the values
-differ from one pass only in summation order. Positions with index -1 or past the row's length are masked before any
-load: unreferenced slots never enter the sums. The hooks (registered below SM90 only) route the backend's FP8 sparse
-calls here, prefill included; other calls of flash_mla_with_kvcache stay FlashMLA's.
+- the dot products run in FP16, not BF16: Turing has FP16 tensor cores and no BF16 ones, so a BF16 dot is emulated
+  (the pack's own dtype is FP16 on this card, so the values are the ones the model computes anyway);
+- the tiles are smaller: Turing's SM has 64 KiB of shared memory, the upstream's tiling is sized for Hopper's 99 KiB;
+- the FP8 values are decoded with the branch's own software codec (xtier/backend/fp4.py), exactly as the upstream does
+  on the cards without the FP8 conversion instruction.
+
+The kernel reads both caches of a row (the window, then the compressed keys) into one online softmax: the FP8 values
+decoded exactly and scaled, Q.K on the tensor cores with FP32 accumulation, the softmax scale on the FP32 scores, P in
+FP16 for the PV product, FP32 accumulation, the sink in the FP32 normalization. Decode-sized calls split a row's keys
+over programs and merge the partial results in FP32.
+
+The hook is registered on the symbol SGLang calls: ``sgl_kernel.flash_mla.flash_mla_with_kvcache`` (the local import in
+the DSV4 backend). The upstream's symbol (``flash_mla_interface``) is hooked too when that module exists, so a newer
+SGLang takes the same path.
 """
+
 import functools
+import logging
 
 import torch
 import triton
 import triton.language as tl
 
-from xtier.arch import e4m3_f32
+from xtier import arch
+from xtier.backend.fp4 import e4m3_f32
 
-NOPE, DIM = 448, 512             # FP8 values per token; with the 64 BF16 rope values, the head dim of Q, K and V
+logger = logging.getLogger(__name__)
+
+NOPE, DIM = 448, 512             # FP8 values per token; with the 64 rope values, the head dim of Q, K and V
 DATA_BYTES, SCALE_BYTES = 576, 8  # a token's data row (448 + 2 x 64 bytes) and scale row (7 UE8M0 scales + 1 pad)
-BLOCK_N = 32                     # keys per iteration
-HEADS_PER_PROGRAM = 32           # with BLOCK_N 32 and 8 warps the fastest tiling that fits 99 KB of shared memory
-NUM_WARPS = 8
+BLOCK_N = 16                     # keys per iteration: Turing's SM has 64 KiB of shared memory, Hopper's 99 KiB
+HEADS_PER_PROGRAM = 16           # heads per program (the upstream's 32 needs Hopper's shared memory)
+NUM_WARPS = 4
 KEYS_PER_SPLIT = 128             # decode-sized calls: keys of a row per program
 LOG2E = 1.4426950408889634
 
 
 @triton.jit
 def _keys(C, CB, IDX, LEN, row, start, topk, page_size, page_bytes, stride, n, d, HAS_LEN: tl.constexpr):
-    """Keys at positions start + n of a row's index list as a BF16 tile [BLOCK_N, 512], and which are valid."""
+    """Keys at positions start + n of a row's index list as an FP16 tile [BLOCK_N, 512], and which are valid."""
     pos = start + n
     idx = tl.load(IDX + row * stride + pos, mask=pos < topk, other=-1)
     valid = idx >= 0
@@ -55,8 +62,8 @@ def _keys(C, CB, IDX, LEN, row, start, topk, page_size, page_bytes, stride, n, d
     scale = tl.where(e == 0, 0x00400000, e << 23).to(tl.float32, bitcast=True)   # UE8M0: 2^(e - 127)
     rope = tl.load(CB + (data[:, None] + 448) // 2 + (d[None, :] - 448), mask=valid[:, None] & (d >= 448)[None, :],
                    other=0.0)
-    k = tl.where(nope[None, :], e4m3_f32(b) * scale, rope.to(tl.float32))
-    return k.to(tl.bfloat16), valid
+    k = tl.where(nope[None, :], e4m3_f32(b, HW=False) * scale, rope.to(tl.float32))
+    return k.to(tl.float16), valid
 
 
 @triton.jit
@@ -66,7 +73,7 @@ def _step(q, k, valid, m_i, l_i, acc, scale):
     m_use = tl.where(m_new == float('-inf'), 0.0, m_new)   # no valid key yet: every weight stays 0
     alpha = tl.math.exp2(m_i - m_use)
     p = tl.math.exp2(s - m_use[:, None])
-    acc = tl.dot(p.to(tl.bfloat16), k, acc * alpha[:, None])
+    acc = tl.dot(p.to(tl.float16), k, acc * alpha[:, None])
     return m_new, l_i * alpha + tl.sum(p, 1), acc
 
 
@@ -79,7 +86,7 @@ def _finish(m_i, l_i, acc, SINK, O, LSE, row, h, hmask, d, SO_B, SO_H, H: tl.con
         sink = tl.load(SINK + h, mask=hmask, other=0.0) * 1.4426950408889634
         total = total + tl.math.exp2(sink - m_use)
     out = tl.where(l_i[:, None] > 0, acc / total[:, None], 0.0)
-    tl.store(O + row * SO_B + h[:, None] * SO_H + d[None, :], out.to(tl.bfloat16), mask=hmask[:, None])
+    tl.store(O + row * SO_B + h[:, None] * SO_H + d[None, :], out.to(O.dtype.element_ty), mask=hmask[:, None])
     lse = tl.where(l_i > 0, (m_use + tl.math.log2(tl.where(l_i > 0, l_i, 1.0))) * 0.6931471805599453,
                    float('-inf'))
     tl.store(LSE + row * H + h, lse, mask=hmask)
@@ -97,7 +104,7 @@ def _attend(Q, C1, CB1, I1, N1, C2, CB2, I2, N2, SINK, O, LSE, M, L, ACC, scale,
     hmask = h < H
     d = tl.arange(0, 512)
     n = tl.arange(0, BLOCK_N)
-    q = tl.load(Q + row * SQ_B + h[:, None] * SQ_H + d[None, :], mask=hmask[:, None], other=0.0)
+    q = tl.load(Q + row * SQ_B + h[:, None] * SQ_H + d[None, :], mask=hmask[:, None], other=0.0).to(tl.float16)
     m_i = tl.full([HB], float('-inf'), tl.float32)
     l_i = tl.zeros([HB], tl.float32)
     acc = tl.zeros([HB, 512], tl.float32)
@@ -166,16 +173,16 @@ def _rows(indices, rows):
 
 def sparse_mla(q, k_cache, indices, topk_length, attn_sink, softmax_scale, extra_k_cache=None, extra_indices=None,
                extra_topk_length=None):
-    """FlashMLA's sparse FP8 decode on the V4 KV layout: q [rows, 1, heads, 512] BF16, indices [rows, 1, topk] slots
+    """FlashMLA's sparse FP8 decode on the V4 KV layout: q [rows, 1, heads, 512], indices [rows, 1, topk] slots
     (-1: none) into k_cache [pages, page_size, 1, 584], optional extra_* into a second cache, attn_sink [heads] FP32.
-    Returns (out [rows, 1, heads, 512] BF16, lse [rows, heads, 1] of the keys, natural log)."""
+    Returns (out [rows, 1, heads, 512], lse [rows, heads, 1] of the keys, natural log)."""
     rows, s_q, heads, dim = q.shape
     if s_q != 1 or dim != DIM:
         raise NotImplementedError(f'xtier: sparse MLA takes one query per row and head dim {DIM}, not {tuple(q.shape)}')
     q = q.view(rows, heads, dim) if q.is_contiguous() else q.reshape(rows, heads, dim)
     if q.stride(-1) != 1:
         q = q.contiguous()
-    out = torch.empty((rows, heads, dim), dtype=torch.bfloat16, device=q.device)
+    out = torch.empty((rows, heads, dim), dtype=q.dtype, device=q.device)
     lse = torch.empty((rows, heads), dtype=torch.float32, device=q.device)
     if rows == 0:
         return out.unsqueeze(1), lse.unsqueeze(-1)
@@ -218,8 +225,8 @@ def sparse_mla(q, k_cache, indices, topk_length, attn_sink, softmax_scale, extra
 
 
 def flash_mla_with_kvcache(original, *args, **kwargs):
-    """AROUND hook of flash_mla_interface.flash_mla_with_kvcache (registered below SM90): the DeepSeek V4 backend's
-    sparse FP8 calls on the V4 layout."""
+    """AROUND hook of flash_mla_with_kvcache (registered below SM90): the DeepSeek V4 backend's sparse FP8 calls on
+    the V4 layout, in the Triton sparse MLA."""
     cache = kwargs.get('k_cache')
     if (args or kwargs.get('indices') is None or not kwargs.get('is_fp8_kvcache') or cache is None
             or cache.shape[-1] != DATA_BYTES + SCALE_BYTES or kwargs.get('head_dim_v', DIM) != DIM):
@@ -235,3 +242,9 @@ def no_sparse_prefill(original, self, *args, **kwargs):
     """AROUND hook of DeepseekV4AttnBackend._use_sparse_prefill (registered below SM90): prefill stays on the paged
     caches, as on SM120, instead of FlashMLA's sparse prefill over a BF16 workspace."""
     return False
+
+
+def shared_memory_ok() -> bool:
+    """Whether the tiles fit the card's shared memory: Turing's SM has 64 KiB, the newer cards 228 KiB."""
+    need = (BLOCK_N * DIM + HEADS_PER_PROGRAM * DIM) * 2
+    return need <= arch.shared_memory_kb() * 1024

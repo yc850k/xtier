@@ -35,16 +35,28 @@ import time
 import torch
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
-from xtier import config, platform
+from xtier import arch, config, platform
 from xtier.backend import direct, formats, kernels
 from xtier.backend.prefill import Prefill
-from xtier.cache import tail
+from xtier.cache import gsq_cold, tail
 from xtier.engine import CpuPlan, Mailbox, placement
 
 logger = logging.getLogger(__name__)
 SLOT_TOKENS = 8      # tokens per mailbox slot (engine DECODE_M)
 MAX_TOP_K = 10
 DECODE_ROWS = 256    # rows of the shared decode output buffer (fixed: captured graphs keep its address)
+
+
+def _model_path() -> str:
+    """The checkpoint's path (the GSQ pack sits beside it)."""
+    from sglang.srt.runtime_context import get_server_args
+
+    return get_server_args().model_path
+
+
+def _activation_dtype(dtype):
+    """The dtype of the activations: BF16 or FP16 (arch.check_activation_dtype)."""
+    return arch.check_activation_dtype(dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +81,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         self.gpu_method = gpu_method
         self.cfg = layer_config
         self.format = formats.detect(gpu_method, draft=layer_config.draft)
+        self.gsq = self.format.name == 'gsq'   # the IQ-quantized experts of a Maya GGUF pack
         self.plan = None
         self.prefill = None
         self.mailbox = None
@@ -87,14 +100,22 @@ class XTierMoEMethod(FusedMoEMethodBase):
             ('router weight on input', rc.apply_router_weight_on_input),
             ('fused shared experts', layer.num_fused_shared_experts > 0),
             ('expert parallel MoE', layer.moe_ep_size > 1),
-            ('params dtype', params_dtype != torch.bfloat16)) if bad]
+            ('params dtype', params_dtype not in (torch.bfloat16, torch.float16))) if bad]
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
+        self.dtype = _activation_dtype(params_dtype)
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
         self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
         # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
         self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
         self.swiglu_beta = 0.0 if rc.gemm1_beta is None else float(rc.gemm1_beta)
+        if self.format.name == 'gsq':
+            # The experts stay in the mapped checkpoint file (the engine reads them there): the GPU method's expert
+            # parameters are not created, so the loader skips the expert tensors and the GPU never holds them.
+            self.gsq = True
+            self._missing = {}   # no expert tensors come through the loader: the engine reads them from the file
+            XTierMoEMethod.layers.append(self)   # the layer registers itself: its cache is filled with the others'
+            return
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
         with torch.device('cpu'):
             self.gpu_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition,
@@ -219,6 +240,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             self._convert(layer)
 
     def _convert(self, layer):
+        if self.gsq:
+            return self._convert_gsq(layer)
         source = self._source or 'copy'
         if source == 'copy':
             up_first = bool(getattr(self.gpu_method, 'load_up_proj_weight_first', False))
@@ -252,7 +275,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         # uploads from the engine's shards; copies the global scales (pointers 4, 5) now
         self.prefill = Prefill(self.experts, pointers, native=self.plan, hidden=self.hidden, inter=self.inter,
                                swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
-                               swiglu_beta=self.swiglu_beta)
+                               swiglu_beta=self.swiglu_beta, dtype=self.dtype)
         self.prefill.order = self.cfg.layer_id   # the cross-layer prefetch links layers in this order
         self.prefill.cold = prefill_cold
         del inputs, pointers
@@ -261,7 +284,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         slots = self.experts if self.cfg.cache_slots < 0 else self.cfg.cache_slots
         if slots > 0:   # allocated now, so the KV cache is sized after it
             from xtier.cache.pool import LayerPool
-            self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id)
+            self.pool = LayerPool(self.prefill, slots, self.plan, self.mailbox, self.cfg.layer_id, dtype=self.dtype)
             self.pool.tp_size = getattr(layer, 'moe_tp_size', 1)
             if self.pool.full:   # a staged prefill reads the experts from the slots instead of host memory
                 self.prefill._upload_chunk = self._upload_from_cache
@@ -277,11 +300,82 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if direct.digest_enabled() and source == 'copy':   # the others' once their reads are done (direct.finish)
             logger.info('xtier: layer %d: shards digest %s', self.cfg.layer_id, direct.digest(self.plan))
 
+    def _convert_gsq(self, layer):
+        """The GSQ experts: the engine reads them from the mapped checkpoint file (the pack's tensors.txt and the
+        GGUF files), so nothing is copied and the GPU never holds the experts."""
+        from xtier.backend import gsq
+        placement.apply(self.cfg.threads, getattr(layer, 'moe_tp_rank', 0), getattr(layer, 'moe_tp_size', 1))
+        t0 = time.perf_counter()
+        pack = gsq.GsqPack(gsq.pack_dir() or gsq.pack_path(_model_path()))
+        try:
+            gate, up, down, types_gate, types_up, types_down = pack.layer_sources(self.cfg.layer_id)
+        finally:
+            pass   # the mapping stays open: the engine reads the experts from it
+        # The tensor-parallel split: this rank takes the rows of I of the gate and the up (a contiguous range inside
+        # every expert) and the columns of I of the down (a strided range inside every row, so the blocks that overlap
+        # it are decoded and only its columns are used). SGLang adds the ranks' partial outputs up.
+        rank = int(getattr(layer, 'moe_tp_rank', 0) or 0)
+        size = int(getattr(layer, 'moe_tp_size', 1) or 1)
+        part = self.inter   # this rank's intermediate size (SGLang splits the intermediate over the ranks)
+        full = part * size  # the expert's whole intermediate (the tensor as the checkpoint has it)
+        if full % 256:
+            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: the intermediate size {full} is not a multiple of '
+                               f"the IQ block's 256 values")
+        # The split: the engine reads the RAM slots, which hold the rank's slice (the rows of the gate and the up, the
+        # whole down). The rows are at 0 in the slot (the slice starts there) and the down's columns at their own
+        # place (the down is whole in the slot).
+        sliced = gsq_cold.enabled()
+        self.plan = CpuPlan(self.experts, self.cfg.threads, [gate, up, down], hidden=self.hidden, inter=part,
+                            swiglu_limit=self.swiglu_limit, scale_format='gsq',
+                            swiglu_alpha=self.swiglu_alpha, swiglu_beta=self.swiglu_beta,
+                            gsq_types=(types_gate, types_up, types_down),
+                            gsq_split=(0 if sliced else rank * part, part, rank * part, part, full))
+        self.gsq_pack = pack
+        self.prefill = None   # the GPU prefill needs the packed weights: the IQ blocks stay in the file
+        self.mailbox = Mailbox(self.plan)
+        self.pool = None
+        # The hot experts in the GPU cache: the GPU decodes the IQ blocks (xtier/backend/gsq_gpu.py). The experts'
+        # bytes go into the VRAM as the checkpoint has them.
+        slots = self.experts if self.cfg.cache_slots < 0 else self.cfg.cache_slots
+        if slots > 0:
+            from xtier.cache.gsq_pool import GsqPool
+            self.pool = GsqPool(pack, self.cfg.layer_id, slots, self.mailbox, dtype=self.dtype,
+                                 swiglu_limit=self.swiglu_limit, swiglu_alpha=self.swiglu_alpha,
+                                 swiglu_beta=self.swiglu_beta, tp_rank=rank, tp_part=part)
+        # The cold pool (XTIER_COLD=1): the experts of the RAM slots and the rest in the checkpoint's own files (the
+        # drive). The routed experts that are not in RAM are read from there when a forward needs them.
+        if gsq_cold.enabled():
+            resident = gsq_cold.attach(self.plan, pack, self.cfg.layer_id, gpu_slots=slots if self.pool else 0,
+                                       rank=rank, part=part)
+            if self.pool is not None:
+                # the engine's RAM slots registered with CUDA: the GPU reads them at the full PCIe speed (the
+                # upload of a batched prefill copies the experts' bytes from there)
+                from xtier.cache.gsq_pool import pin_slots
+                pin_slots(self.pool, self.plan, resident)
+        logger.info('xtier: layer %d: %d GSQ experts (H %d, I %d) read from %s in %.2f s', self.cfg.layer_id,
+                    self.experts, self.hidden, self.inter, pack.path, time.perf_counter() - t0)
+        if self.cfg.layer_id == 0:
+            # The tensor-parallel geometry, once: the rank's slice of the intermediate, and the whole of it.
+            logger.info('xtier: the TP geometry: the rank %d of %d, the intermediate %d of %d, the pool\'s %d',
+                        rank, size, part, full, pack.inter)
+            try:
+                from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+                from sglang.srt.distributed.parallel_state import get_parallel
+                logger.info('xtier: the TP reduce: moe_tp_size %d, the post-experts reduce skipped %s',
+                            get_parallel().moe_tp_size, should_skip_post_experts_all_reduce(is_tp_path=True))
+            except Exception as exc:   # the SGLang internals moved: the geometry above is the important part
+                logger.info('xtier: the TP reduce: not known (%s)', exc)
+
     def process_weights_after_loading(self, layer):
         if self.plan is None:   # some expert tensor never came through the loader: those weights would be garbage
             missing = {n: c for n, c in self._missing.items() if c}
-            raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: loading did not complete (experts missing per '
-                               f'parameter: {missing}); is the checkpoint complete?')
+            if self.gsq:   # the GSQ experts are read from the checkpoint file: nothing to wait for
+                logger.warning('xtier: layer %d: loading did not complete (experts missing per parameter: %s); '
+                               'handing the experts over now', self.cfg.layer_id, missing)
+                self._hand_off(layer)
+            else:
+                raise RuntimeError(f'xtier: layer {self.cfg.layer_id}: loading did not complete (experts missing per '
+                                   f'parameter: {missing}); is the checkpoint complete?')
 
     def _upload_from_cache(self, slot, e0, e1, stream, up_first=False):
         """Staged prefill of a fully cached layer (XTIER_CACHE_PREFILL=staged): device copies of slots e0..e1 (filled
@@ -306,8 +400,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         m = x.shape[0]
         if m == 0:
             return StandardCombineInput(hidden_states=x.new_zeros(x.shape))
-        if x.dtype != torch.bfloat16:
-            raise TypeError(f'xtier: BF16 activations required, got {x.dtype}')
+        _activation_dtype(x.dtype)
         if not XTierMoEMethod._localized:
             XTierMoEMethod._localize_all()
         ids = topk.topk_ids if topk.topk_ids.dtype == torch.int32 else topk.topk_ids.to(torch.int32)
@@ -320,6 +413,13 @@ class XTierMoEMethod(FusedMoEMethodBase):
             if not self.cfg.draft:   # only in calls of top-k N
                 tail.check(k)
             self._tail_checked = True
+        if config.debug():
+            bad = ((ids < -1) | (ids >= 384)).nonzero()
+            nan = (~torch.isfinite(weights)).nonzero()
+            logger.error('xtier debug: layer %d m %d k %d: the ids out of range %s the weights not finite %s '
+                         'the ids[:4] %s the weights[:4] %s the x not finite %s', self.cfg.layer_id, m, k, bad.shape[0],
+                         nan.shape[0], ids[:4].tolist(), weights[:4].tolist(),
+                         int((~torch.isfinite(x)).sum()))
         capturing = torch.cuda.is_current_stream_capturing()
         if not capturing and XTierMoEMethod._registered < len(XTierMoEMethod.layers):
             XTierMoEMethod._register_all()
@@ -335,8 +435,27 @@ class XTierMoEMethod(FusedMoEMethodBase):
         if m <= config.decode_max() or capturing:
             if not capturing:   # short prompts never reach a prefill branch: the policy must start here too
                 self._cache_start()
+            t_apply = time.thread_time() if config.timing() else 0.0
             out = self._decode(x, ids, weights, m, k)
+            if config.timing():
+                XTierMoEMethod.py_ms += (time.thread_time() - t_apply) * 1e3
+                XTierMoEMethod.py_calls += 1
+                if XTierMoEMethod.py_calls % 64 == 0:
+                    logger.info('xtier timing: the decode path: the Python %.2f ms of CPU a call',
+                                XTierMoEMethod.py_ms / 64)
+                    XTierMoEMethod.py_ms = 0.0
             self.calls['decode'] += 1
+        elif self.gsq:
+            # The experts are in the checkpoint file: the CPU engine reads the ones that are not in the VRAM, and the
+            # GPU decodes the cached ones from their IQ blocks (the hot experts' bytes are in the VRAM, so a batched
+            # prefill costs no PCIe transfer at all).
+            if self.pool is not None and not self.pool.full:
+                from xtier.cache.gsq_pool import prefill as gsq_prefill
+                out = gsq_prefill(self.pool, self.plan, x, ids, weights, config.cpu_prefill_batch())
+                self.calls['hybrid_prefill'] += 1
+            else:
+                out = self._cpu_prefill(x, ids, weights, m, k)
+                self.calls['cpu_prefill'] += 1
         elif self.pool is not None and self.pool.full and config.resident_prefill():
             from xtier.cache.prefill import resident_prefill
             out = resident_prefill(self.prefill, self.pool.arena, x, ids, weights)
@@ -355,7 +474,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
             else:
                 out = torch.empty_like(x)
                 self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k,
-                                 torch.cuda.current_stream().cuda_stream)
+                                 torch.cuda.current_stream().cuda_stream, dtype=x.dtype)
                 self.calls['gpu_prefill'] += 1
         else:
             self._cache_start()
@@ -365,6 +484,9 @@ class XTierMoEMethod(FusedMoEMethodBase):
             torch.cuda.current_stream().synchronize()
             self._time(m, time.perf_counter() - t0)
         out = out.to(x.dtype)
+        if config.debug():
+            logger.error('xtier debug: layer %d: the MoE output not finite %s', self.cfg.layer_id,
+                         int((~torch.isfinite(out)).sum()))
         rsf = layer.moe_runner_config.routed_scaling_factor
         if rsf is not None and rsf != 1.0 and not layer.should_fuse_routed_scaling_factor_in_topk:
             out.mul_(rsf)
@@ -386,10 +508,11 @@ class XTierMoEMethod(FusedMoEMethodBase):
             xs, ids_s, ws = x.data_ptr() + start * H * 2, ids.data_ptr() + start * k * 4, weights.data_ptr() + start * k * 4
             act = active.data_ptr() + start * 4 if active is not None else 0
             if self.pool is not None:
-                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act)
+                self.pool.decode(stream, n, k, xs, ids_s, ws, out.data_ptr() + start * H * 4, act, x.dtype,
+                                 ids_tensor=ids[start:start + n])
                 continue
             slot = self.mailbox.slot(stream, n, k)
-            kernels.pack(slot, n, k, xs, ids_s, ws, H, act)
+            kernels.pack(slot, n, k, xs, ids_s, ws, H, act, dtype=x.dtype)
             self.mailbox.notify(stream, n, k)
             kernels.unpack(slot, n, out.data_ptr() + start * H * 4, H)
         return out[:m]
@@ -438,7 +561,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
         stream = torch.cuda.current_stream().cuda_stream
         if g >= E:
             out = torch.empty_like(x)
-            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+            self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream,
+                             dtype=x.dtype)
             return out
         table = None
         cold = self.prefill.cold
@@ -451,7 +575,8 @@ class XTierMoEMethod(FusedMoEMethodBase):
             lo = max(0, hi - (E - g) // CH * CH)
             if lo >= hi:
                 out = torch.empty_like(x)
-                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream)
+                self.prefill.run(x.data_ptr(), out.data_ptr(), ids.data_ptr(), weights.data_ptr(), m, k, stream,
+                                 dtype=x.dtype)
                 return out
             table = self.plan.slot_table()   # before the CPU part runs (slot_table refuses during a forward)
             slot = torch.tensor(table, dtype=torch.int64, device=ids.device)[ids.clamp(min=0).long()]
@@ -488,7 +613,7 @@ class XTierMoEMethod(FusedMoEMethodBase):
         t0 = time.perf_counter()
         try:
             self.prefill.run(x.data_ptr(), out_g.data_ptr(), ids_g.data_ptr(), w_g.data_ptr(), m, k, stream,
-                             output_dtype=torch.float32, cold_table=table)
+                             output_dtype=torch.float32, cold_table=table, dtype=x.dtype)
             gpu_s = time.perf_counter() - t0   # the GPU part only; the join may wait for the CPU
         finally:
             worker.join()
@@ -522,16 +647,23 @@ class XTierMoEMethod(FusedMoEMethodBase):
         follow the NUMA localize (pinned pages cannot migrate)."""
         new, cls._registered = cls.layers[cls._registered:], len(cls.layers)
         cached = any(method.pool is not None for method in new)
+        gsq = any(getattr(method, 'gsq_pack', None) is not None for method in new)
         if not config.gpu_prefill_min() and not cached:
             return
         t0 = time.perf_counter()
         for method in new:
-            method.prefill.ensure_registered()
+            if method.prefill is not None:
+                method.prefill.ensure_registered()
         logger.info('xtier: pinned the shards of %d layers for GPU prefill in %.1f s', len(new),
                     time.perf_counter() - t0)
         if cached:
             from xtier.cache import pool
             pool.fill_all()
+        if gsq:
+            from xtier.cache import gsq_pool
+            n = gsq_pool.fill_all()
+            if n:
+                logger.info('xtier: %d GSQ experts uploaded to the GPU cache in %.1f s', n, time.perf_counter() - t0)
 
     @staticmethod
     def _cache_start():
@@ -539,8 +671,12 @@ class XTierMoEMethod(FusedMoEMethodBase):
         speculative decoding and short prompts every call before the first graph replay is a decode-sized one)."""
         from xtier.cache import pool
         pool.maybe_start()
+        from xtier.cache import gsq_pool
+        gsq_pool.maybe_start()
 
     _timing = {}
+    py_ms = 0.0        # the decode path's Python (XTIER_TIMING)
+    py_calls = 0
 
     def _time(self, m, seconds):
         """XTIER_TIMING=1: prefill MoE time per kind of layer, logged once per forward (at the last layer)."""

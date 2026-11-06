@@ -9,14 +9,22 @@ import sys
 import time
 from pathlib import Path
 
-# TileLang picks its HIP target first when a ROCm toolkit is installed (the server gets xtier.platform's fix)
-os.environ.setdefault('TILELANG_DEFAULT_TARGET', '{"kind": "cuda", "arch": "sm_120"}')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch  # noqa: E402
+
+# TileLang picks its HIP target first when a ROCm toolkit is installed (the server gets xtier.platform's fix), and its
+# CUDA target is the device's compute capability (sm_120 on the Blackwell hosts, sm_75 on a Turing card)
+_cap = torch.cuda.get_device_capability()
+os.environ.setdefault('TILELANG_DEFAULT_TARGET', f'{{"kind": "cuda", "arch": "sm_{_cap[0]}{_cap[1]}"}}')
 
 from sglang.srt.layers.attention.qsa import mqa  # noqa: E402
 
 from xtier.packs.qwen4_exp import qsa_prefill  # noqa: E402
+
+if _cap < (8, 0):
+    # the check compares SGLang's TileLang prefill, whose MMA shapes need the tensor cores of sm_80 and newer
+    print('SKIP: the TileLang prefill needs SM80 and newer (this card is sm_%d%d)' % _cap)
+    sys.exit(0)
 
 HEADS, DIM, RATIO = 4, 128, 4
 torch.manual_seed(20261023)

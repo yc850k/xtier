@@ -38,6 +38,19 @@ void *xtier_create3(int hidden,int inter,int experts,int threads,float limit,int
 // create3 / create4 with w13, w2, s13 and s2 all null allocate the shards without filling them: the caller writes
 // every slot (xtier_shard / xtier_slot_pieces, e.g. read straight from the checkpoint or the cold store) and checks
 // its block scales, before the first forward.
+// The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each. The type per expert
+// and per role (the ggml type ids: 16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M); the pack quantizes every role on its
+// own, so the down's type (and its byte size) often differs from the gate's.
+// The tensor-parallel split of the GSQ experts: the gate and the up take the rank's rows of I (row_off, row_count),
+// the down the rank's columns of I (col_off, col_count); full_inter is I of the file.
+// The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values (n % 256 == 0) of the type's blocks
+// as FP32 (n floats). The type is the ggml type id (16 IQ2_XXS, 17 IQ2_XS, 19 IQ1_S, 29 IQ1_M); an unknown type
+// leaves the output untouched and returns -1.
+int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n);
+void *xtier_create5(int hidden,int inter,int experts,int threads,float limit,const uint8_t *gate,
+                    const uint8_t *up,const uint8_t *down,const uint8_t *types_gate,const uint8_t *types_up,
+                    const uint8_t *types_down,float swiglu_alpha,float swiglu_beta,
+                    long row_off,long row_count,long col_off,long col_count,long full_inter);
 void *xtier_create4(int hidden,int inter,int experts,int slots,int threads,float limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2,const int32_t *resident);
@@ -55,6 +68,17 @@ int xtier_place(void *plan,int expert,int slot);
 // computes the routes to the experts in RAM while those reads run, then the others (two FP32 sums, added: not bitwise
 // the one-pass order); 0: it waits for the reads first. Before the first forward. 0 or -1.
 int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,const float *scores,float half_life);
+// The GSQ cold pool (the IQ experts of a GGUF checkpoint): the experts of the RAM slots and the rest in the store (the
+// checkpoint's own files, on the drive). files[3*e+role] / offsets[3*e+role] locate expert e's tensor (role 0 the gate,
+// 1 the up, 2 the down) in the store; resident[0..count) are the experts to have in RAM (slot i holds resident[i]),
+// read from the store now. The others are read into a slot when a forward routes to them (the coldest resident expert
+// leaves RAM, the FP4 path's policy). The kernel reads an expert's bytes from its slot, as the checkpoint has them.
+// Before the first forward. 0 or -1.
+int xtier_gsq_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,
+                          const int32_t *resident,int count,const float *scores,float half_life);
+// The GSQ slot's three regions (the gate, the up and the down) and the distance between two slots' regions: where
+// the GPU cache's copy of an expert comes from (the cold pool's swaps). 0 or -1.
+int xtier_gsq_slot_pieces(void *plan,int slot,void **pointers,size_t *bytes);
 // For readers on other threads (the GPU pool's copies): the slot holding `expert`, kept until xtier_slot_unpin;
 // -1 if it is not in RAM.
 int xtier_slot_pin(void *plan,int expert);

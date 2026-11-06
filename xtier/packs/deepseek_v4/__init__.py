@@ -65,6 +65,8 @@ from pathlib import Path
 
 import torch
 
+from xtier import arch
+
 logger = logging.getLogger(__name__)
 ENGRAM = 'sglang.srt.layers.engram.EngramEmbedding'
 ENGRAM_LAYER = 'sglang.srt.layers.engram.Engram'
@@ -107,7 +109,8 @@ def open_table(model, layer_id, cache_bytes, row_range=None):
 
 
 class EngramLookup:
-    """BF16 Engram rows of device ids (zero rows outside the store's owned range), on the current stream."""
+    """The Engram rows of device ids in the model's dtype (zero rows outside the store's owned range), on the current
+    stream."""
 
     def __init__(self, store):
         from xtier.tables.lookup import GraphLookup
@@ -125,7 +128,7 @@ class EngramLookup:
         return out
 
     def __call__(self, indices):
-        return self.fill(indices, torch.empty(*indices.shape, ROW_BYTES, dtype=torch.bfloat16, device=indices.device))
+        return self.fill(indices, torch.empty(*indices.shape, ROW_BYTES, dtype=arch.dtype(), device=indices.device))
 
 
 def _check_rows(self, param, loaded_weight):
@@ -196,7 +199,7 @@ def _prefetch(hash_ids, self, input_ids, *args, **kwargs):
             continue
         view = hash_ids[:, index]
         ids = view.contiguous()
-        out = torch.empty(*view.shape, ROW_BYTES, dtype=torch.bfloat16, device=view.device)
+        out = torch.empty(*view.shape, ROW_BYTES, dtype=arch.dtype(), device=view.device)
         side.wait_stream(main)
         with torch.cuda.stream(side):
             embedding._xtier_lookup.fill(ids, out)
@@ -315,7 +318,19 @@ def _mxfp8_linear(original, input, *args, **kwargs):
 
 
 def install(registry, hook_type):
-    from xtier.packs.deepseek_v4 import ragged_verify, paged_indexer, wo_a
+    from xtier.packs import supported
+    from xtier.packs.deepseek_v4 import (
+        attention,
+        dtypes,
+        fp4_rope,
+        kv_fp8,
+        paged_indexer,
+        ragged_verify,
+        rope,
+        tilelang,
+        w8a16,
+        wo_a,
+    )
 
     registry.register(f'{HASHER}.forward', ragged_verify.forward, hook_type.AROUND)
     registry.register('sglang.srt.layers.attention.dsv4.dsv41_sparse.token_req_indices',
@@ -324,20 +339,33 @@ def install(registry, hook_type):
                       ragged_verify.token_req_indices, hook_type.AROUND)
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
+    if not supported((8, 0), 'the TileLang kernels of DeepSeek V4.1'):
+        tilelang.install()
+        rope.install()
+    if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache'):
+        kv_fp8.install()
+        fp4_rope.install(registry, hook_type)
+    if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1'):
+        # the Triton sparse MLA over the packed FP8 pages (attention.py; the upstream's kernel below SM90, adapted
+        # to this card) and the mHC pre-mix split-K for the 20480 hidden size (upstream's mhc_splitk.py)
+        attention.install(registry, hook_type)
+        if supported((8, 0), 'the TileLang split-K of the mHC pre-mix (deepseek_v4)'):
+            # the TileLang kernel needs the tensor cores of sm_80 and newer: below them the MHC's pre-mix runs in
+            # PyTorch (the TileLang switches above are off), so the split-K rebuild has nothing to serve
+            from xtier.packs.deepseek_v4 import mhc_splitk
+            registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
+    dtypes.install(registry, hook_type)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
-    wo_a.install(registry, hook_type)
+    if supported((8, 0), 'the wo_a FP8 einsum (deepseek_v4)'):   # BF16 dot products
+        wo_a.install(registry, hook_type)
     paged_indexer.install(registry, hook_type)
-    if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0':   # speed only: 0 keeps SGLang's own configs
+    if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0' and supported((8, 9), 'the W8A8 FP8 configs '
+                                                                      '(deepseek_v4)'):
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
-    if torch.cuda.get_device_capability()[0] < 9:
-        from xtier.packs.deepseek_v4 import mhc_splitk, sparse_mla
-        registry.register(FLASH_MLA, sparse_mla.flash_mla_with_kvcache, hook_type.AROUND)
-        registry.register(SPARSE_PREFILL, sparse_mla.no_sparse_prefill, hook_type.AROUND)
-        registry.register(mhc_splitk.MHC_PRE, mhc_splitk.mhc_pre, hook_type.AROUND)
     from xtier.arch import HW_FP8
-    if not HW_FP8:
+    if not HW_FP8:   # a card without the FP8 conversion: the FP8 weights in software (upstream's block)
         from xtier.packs.deepseek_v4 import engram_gather, fake_quant_fp8, w8a16
         registry.register(f'{w8a16.FP8_METHOD}.__init__', w8a16.no_marlin, hook_type.AFTER)
         registry.register(w8a16.BLOCK_LINEAR, w8a16.linear, hook_type.AROUND)
@@ -349,6 +377,7 @@ def install(registry, hook_type):
         if os.environ.get('XTIER_ENGRAM_PREFETCH', '1') != '0':
             registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
             registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
-    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and torch.cuda.get_device_capability() >= (8, 9):
+    if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and supported((8, 9), 'the FP8 draft head '
+                                                                          '(deepseek_v4)'):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)

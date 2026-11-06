@@ -17,6 +17,12 @@ SHAPES = [(4096, 8192), (16384, 1536), (4096, 16384), (4096, 1536), (4096, 12288
 g = torch.Generator(device='cuda').manual_seed(20261023)
 bad = 0
 
+if torch.cuda.get_device_capability() < (8, 9):
+    # the FP8 weights of the GLM pack need the FP8 types in Triton (SM89 and newer); the pack is off below that
+    print('SKIP: the FP8 weights need SM89 and newer (this card is sm_%d%d)'
+          % torch.cuda.get_device_capability())
+    sys.exit(0)
+
 
 def rel(a, b):
     return float((a.double() - b).norm() / b.norm())

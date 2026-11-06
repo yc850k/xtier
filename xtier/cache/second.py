@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier import arch
 from xtier.arch import HW_FP4
 from xtier.backend.kernels import Pointer
 from xtier.cache.pool import _combine, _down, _gate_up, CONFIG, MAX_M, MAX_ROUTES, Profile
@@ -128,14 +129,18 @@ class SecondLayer:
                 _fetch[(triton.cdiv(words, 256),)](Pointer(s['host_control'], torch.int32), Pointer(base, torch.int32), words, 256)
                 rslot, slot_list = Pointer(base, torch.int32), Pointer(base + 512, torch.int32)
                 slot_exp, routing = Pointer(base + 1024, torch.int32), Pointer(base + 1536, torch.float32)
-                x = Pointer(base + CONTROL, torch.bfloat16)
+                x = Pointer(base + CONTROL, torch.bfloat16)   # the engine's activations (its BF16 contract)
+                hw4, hw8 = arch.has_fp4_convert(), arch.has_fp8()
                 _gate_up[(nk, I // cfg['gbn'])](x, slot_list, slot_exp, self.arena[0], self.arena[2], self.g13, s['mid'], m,
                                                 H, I, pool.limit, MAX_M, cfg['gbn'], pool.bk_h, MX=pool.prefill.mxfp4,
-                                                ALPHA=pool.alpha, BETA=pool.beta, num_warps=cfg['gw'], num_stages=cfg['gs'])
+                                                ALPHA=pool.alpha, BETA=pool.beta, HW4=hw4, HW8=hw8,
+                                                DT=pool._tl_dtype(torch.bfloat16),
+                                                num_warps=cfg['gw'], num_stages=cfg['gs'])
                 # XTIER_GPU2_SLOW=n, test only: a slower GPU, n more times the same work (the same result)
                 for _ in range(1 + int(os.environ.get('XTIER_GPU2_SLOW', '0'))):
                     _down[(nk, H // cfg['dbn'])](s['mid'], slot_list, slot_exp, self.arena[1], self.arena[3], self.g2,
                                                  s['part'], m, H, I, MAX_M, cfg['dbn'], pool.bk_i, MX=pool.prefill.mxfp4,
+                                                 HW4=hw4, HW8=hw8, DT=pool._tl_dtype(torch.bfloat16),
                                                  num_warps=cfg['dw'], num_stages=cfg['ds'])
                 _combine[(m, triton.cdiv(H, 1024))](s['part'], rslot, routing, Pointer(s['host_out'], torch.float32), H, k,
                                                     MAX_M, 1024)

@@ -20,6 +20,8 @@
                              (0: always on the CPU; Qwen3.8 on PCIe 5: the CPU engine and the upload break even near
                              1000 tokens); switches of the GPU prefill: backend/prefill.py (XTIER_PREFILL_*)
   XTIER_CACHE_SLOTS=0        GPU expert cache slots per layer (xtier.cache; 0: no cache)
+  XTIER_GSQ_PREFILL_TILE_M=32, XTIER_GSQ_PREFILL_TILE_N=16   the batched prefill of the GSQ path (the routes of one
+                             hot expert per tile, the rows of a tensor per program: cache/gsq_pool.py)
   XTIER_CACHE_FULL=list      layers that keep every expert on the GPU (no CPU part)
   XTIER_CACHE_PROFILE=file   ranking profile that fills the slots at start (LKQstrata format)
   XTIER_CACHE_ADAPT=1, XTIER_CACHE_EVERY=4, XTIER_CACHE_SWAPS=16, XTIER_CACHE_DECAY=0.7, XTIER_CACHE_MIN_GAIN=1.5,
@@ -47,6 +49,11 @@ import os
 
 def _flag(name: str, default: str = '0') -> bool:
     return os.environ.get(name, default) == '1'
+
+
+def debug() -> bool:
+    """XTIER_DEBUG_ROUTE=1: the route and the activation diagnostics in the log (the NaN hunt)."""
+    return _flag('XTIER_DEBUG_ROUTE')
 
 
 def _int(name: str, default: int) -> int:

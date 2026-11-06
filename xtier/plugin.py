@@ -31,6 +31,47 @@ def _in_scheduler() -> bool:
     return False
 
 
+def _install_gguf() -> None:
+    """The GGUF checkpoints: a split checkpoint is read as one file, and the DeepSeek V4.1 names are mapped.
+
+    SGLang's GGUF loader reads the checkpoint with the ``gguf`` package's reader (one file) and derives the tensor
+    names from the architectures the package and Transformers know. A Maya pack of DeepSeek V4.1 is a split checkpoint
+    of an architecture neither knows, so both are supplied here.
+    """
+    from xtier.backend import gguf_mhc, gguf_names, gguf_split, gguf_weights
+
+    gguf_split.install()
+    gguf_split.install_loader()
+    gguf_weights.install_method()
+    gguf_weights.install_iterator()
+    gguf_mhc.install()
+    try:
+        from sglang.srt.model_loader.gguf_name_maps import GGUF_HF_NAME_MAP_BUILDERS
+    except ImportError:
+        return
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE as _FM
+    _orig_init = _FM.__init__
+
+    def _init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        print(f'[xtier] DEBUG the MoE layer: the quant config {type(self.quant_config).__name__} '
+              f'-> the method {type(self.quant_method).__name__}', flush=True)
+
+    _FM.__init__ = _init
+    from sglang.srt.layers.quantization import gguf as _gguf
+    _orig = _gguf.GGUFConfig.get_quant_method
+
+    def _get_quant_method(self, layer, prefix):
+        m = _orig(self, layer, prefix)
+        print(f'[xtier] DEBUG the GGUF config: {type(layer).__name__} {prefix} -> {type(m).__name__}', flush=True)
+        return m
+
+    _gguf.GGUFConfig.get_quant_method = _get_quant_method
+    if 'deepseek_v41' not in GGUF_HF_NAME_MAP_BUILDERS:
+        GGUF_HF_NAME_MAP_BUILDERS['deepseek_v41'] = gguf_names.build_deepseek_v41_name_map
+        logger.info('xtier: the GGUF name map for DeepSeek V4.1 registered')
+
+
 def _check_scheduler_entry() -> None:
     """_in_scheduler goes by that function's name: under another name no process would install the hooks and the server
     would run without XTier. SystemExit, because SGLang swallows the exceptions of a plugin. From the source, the
@@ -60,6 +101,17 @@ def _check_sglang() -> None:
                        '(tools/check_sglang.py lists them)', __version__, SGLANG_COMMIT, version)
 
 
+def _target_exists(target: str) -> bool:
+    """Whether the installed SGLang has the hook's target (the module, the class and the attribute)."""
+    import pkgutil
+
+    try:
+        pkgutil.resolve_name(target)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return True
+
+
 def _require_hooks() -> None:
     """SGLang logs a hook it cannot apply and goes on: the server would run without that part of XTier, slower or with
     other results. Checked right after SGLang applied them, before anything is loaded."""
@@ -71,9 +123,17 @@ def _require_hooks() -> None:
         apply_hooks()
         failed = sorted(target for target, hooks in HookRegistry._hooks.items() if target not in HookRegistry._patched
                         and any(getattr(h[-1], 'plugin_name', None) == 'xtier' for h in hooks))
-        if failed:
-            raise SystemExit(f'xtier: hooks not applied (SGLang logged why): {failed}; tools/check_sglang.py lists what '
-                             'this SGLang lacks')
+        # A target this SGLang does not have (it is older than the commit XTier follows) is not a failure: the hook
+        # has nothing to patch, and the version warning above says so. A target that exists but did not take the
+        # hook is a failure: the server would run without that part of XTier.
+        missing = [t for t in failed if not _target_exists(t)]
+        applied = [t for t in failed if _target_exists(t)]
+        if missing:
+            logger.warning('xtier: %d hooks have no target in this SGLang (it is older than the commit XTier '
+                           'follows): %s', len(missing), missing)
+        if applied:
+            raise SystemExit(f'xtier: hooks not applied (SGLang logged why): {applied}; tools/check_sglang.py lists '
+                             'what this SGLang lacks')
 
     if hasattr(HookRegistry, '_hooks') and hasattr(HookRegistry, '_patched'):
         HookRegistry.apply_hooks = checked
@@ -99,6 +159,7 @@ def install() -> None:
     from xtier import packs, platform
     from xtier.backend import hooks
 
+    _install_gguf()
     hooks.install(HookRegistry, HookType)
     from xtier.cache import elastic
     if elastic.install(HookRegistry, HookType):
@@ -106,8 +167,9 @@ def install() -> None:
     names = packs.install(HookRegistry, HookType)
     fixes = platform.install(HookRegistry, HookType)
     _installed.append(True)
-    logger.info('xtier %s: MoE backend hooks, packs %s and host fixes %s registered (pid %d)', __version__, names,
-                fixes, os.getpid())
+    from xtier import arch
+    logger.info('xtier %s: MoE backend hooks, packs %s and host fixes %s registered on %s (pid %d)', __version__,
+                names, fixes, arch.describe(), os.getpid())
 
 
 def install_serving() -> None:

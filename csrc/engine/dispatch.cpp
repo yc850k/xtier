@@ -18,13 +18,19 @@ struct Impl {
     const char *(*last_error)();
     const char *(*isa)();
     void *(*create3)(int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,const float*);
+    void *(*create5)(int,int,int,int,float,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,
+                     const uint8_t*,float,float,long,long,long,long,long);
+    int (*gsq_decode)(int,const uint8_t*,float*,int);
     void *(*create4)(int,int,int,int,int,float,int,const uint8_t*,const uint8_t*,const uint8_t*,const uint8_t*,const float*,
                      const float*,const int32_t*);
     int (*place)(void*,int,int);
     int (*slot_table)(void*,int32_t*);
     int (*slot_pieces)(void*,int,int,void**,size_t*);
+    int (*gsq_slot_pieces)(void*,int,void**,size_t*);
     int (*cold_attach)(void*,void*,void*,const int32_t*,const long long*,const float*,float);
+    int (*cold_attach_gsq)(void*,void*,void*,const int32_t*,const long long*,const int32_t*,int,const float*,float);
     int (*slot_pin)(void*,int);
+    int (*cold_resident)(void*,int,int,const int32_t*);
     void (*slot_unpin)(void*,int);
     void (*cold_plan_stats)(void*,double*);
     int (*set_swiglu)(void*,float,float);
@@ -85,10 +91,12 @@ const Impl *load(const char *isa) {
             bind(h,p,"xtier_destroy",m.destroy)&&bind(h,p,"xtier_last_timings",m.last_timings)&&
             bind(h,p,"xtier_localize",m.localize)&&bind(h,p,"xtier_shard",m.shard)&&
             bind(h,p,"xtier_nodes",m.nodes)&&bind(h,p,"xtier_worker_cpus",m.worker_cpus)&&
+            bind(h,p,"xtier_create5",m.create5)&&bind(h,p,"xtier_gsq_decode",m.gsq_decode)&&
             bind(h,p,"xtier_create4",m.create4)&&bind(h,p,"xtier_place",m.place)&&
-            bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&
-            bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
+            bind(h,p,"xtier_slot_table",m.slot_table)&&bind(h,p,"xtier_slot_pieces",m.slot_pieces)&&bind(h,p,"xtier_gsq_slot_pieces",m.gsq_slot_pieces)&&
+            bind(h,p,"xtier_cold_attach",m.cold_attach)&&bind(h,p,"xtier_gsq_cold_attach",m.cold_attach_gsq)&&bind(h,p,"xtier_slot_pin",m.slot_pin)&&
             bind(h,p,"xtier_slot_unpin",m.slot_unpin)&&bind(h,p,"xtier_cold_plan_stats",m.cold_plan_stats)&&
+            bind(h,p,"xtier_gsq_cold_resident",m.cold_resident)&&
             bind(h,p,"xtier_forward_decode",m.forward_decode)&&bind(h,p,"xtier_tail_stats",m.tail_stats);
     if(!ok)return nullptr;
     m.name=isa;
@@ -126,6 +134,18 @@ void *xtier_create3(int h,int i,int e,int t,float l,int f,
                      const float *g13,const float *g2) {
     auto p=impl();return p?p->create3(h,i,e,t,l,f,w13,w2,s13,s2,g13,g2):nullptr;
 }
+// The GSQ experts' decode (llama.cpp's dequantize_row_iq*): a row of n values as FP32.
+int xtier_gsq_decode(int type,const uint8_t *src,float *dst,int n) {
+    auto p=impl();return p?p->gsq_decode(type,src,dst,n):-1;
+}
+// The GSQ experts (a GGUF checkpoint's IQ-quantized rows): gate, up and down, one tensor each, and the type per expert.
+void *xtier_create5(int h,int i,int e,int t,float l,const uint8_t *gate,const uint8_t *up,const uint8_t *down,
+                    const uint8_t *types_gate,const uint8_t *types_up,const uint8_t *types_down,
+                    float alpha,float beta,long row_off,long row_count,long col_off,long col_count,
+                    long full_inter) {
+    auto p=impl();return p?p->create5(h,i,e,t,l,gate,up,down,types_gate,types_up,types_down,alpha,beta,
+                                      row_off,row_count,col_off,col_count,full_inter):nullptr;
+}
 void *xtier_create4(int h,int i,int e,int slots,int t,float l,int f,const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,
                     const uint8_t *s2,const float *g13,const float *g2,const int32_t *resident) {
     auto p=impl();return p?p->create4(h,i,e,slots,t,l,f,w13,w2,s13,s2,g13,g2,resident):nullptr;
@@ -141,13 +161,25 @@ int xtier_cold_attach(void *plan,void *store,const int32_t *files,const long lon
     auto p=impl();
     return p?p->cold_attach(plan,store,const_cast<ColdIO*>(&io),files,offsets,scores,half_life):-1;
 }
+int xtier_gsq_cold_attach(void *plan,void *store,const int32_t *files,const long long *offsets,
+                          const int32_t *resident,int count,const float *scores,float half_life) {
+    static const ColdIO io{&xtier_cold_read,&xtier_cold_submit,&xtier_cold_finish};
+    auto p=impl();
+    return p?p->cold_attach_gsq(plan,store,const_cast<ColdIO*>(&io),files,offsets,resident,count,scores,half_life):-1;
+}
 int xtier_slot_pin(void *plan,int expert){auto p=impl();return p?p->slot_pin(plan,expert):-1;}
+int xtier_gsq_cold_resident(void *plan,int tokens,int k,const int32_t *ids) {
+    auto p=impl();return p?p->cold_resident(plan,tokens,k,ids):-1;
+}
 void xtier_slot_unpin(void *plan,int slot){if(auto p=impl())p->slot_unpin(plan,slot);}
 void xtier_cold_plan_stats(void *plan,double *out){if(auto p=impl())p->cold_plan_stats(plan,out);}
 int xtier_place(void *plan,int expert,int slot){auto p=impl();return p?p->place(plan,expert,slot):-2;}
 int xtier_slot_table(void *plan,int32_t *table){auto p=impl();return p?p->slot_table(plan,table):-1;}
 int xtier_slot_pieces(void *plan,int slot,int node,void **pointers,size_t *bytes) {
     auto p=impl();return p?p->slot_pieces(plan,slot,node,pointers,bytes):-1;
+}
+int xtier_gsq_slot_pieces(void *plan,int slot,void **pointers,size_t *bytes) {
+    auto p=impl();return p?p->gsq_slot_pieces(plan,slot,pointers,bytes):-1;
 }
 int xtier_set_swiglu(void *plan,float alpha,float beta){auto p=impl();return p?p->set_swiglu(plan,alpha,beta):-1;}
 int xtier_shape(void *plan,int *out){auto p=impl();return p?p->shape(plan,out):-1;}

@@ -23,6 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
+from xtier import arch
+from xtier.arch import tl_dtype
+
 logger = logging.getLogger(__name__)
 PAGE = 128
 OPS = 'sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse'
@@ -39,14 +42,14 @@ def _e2m1(code):
 
 
 @triton.jit
-def _fp4_tile(pay, sc, page, head, rows, rmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po):
-    """Rows `rows` (slots within one page) of one head: (even, odd) halves [rows, D/2] as BF16 (E2M1 x E4M3 scale per
-    16 values; byte i holds values 2i, 2i+1 and uses scale i // 8)."""
+def _fp4_tile(pay, sc, page, head, rows, rmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT: tl.constexpr):
+    """Rows `rows` (slots within one page) of one head: (even, odd) halves [rows, D/2] in the dot operands' dtype
+    (DT: E2M1 x E4M3 scale per 16 values; byte i holds values 2i, 2i+1 and uses scale i // 8)."""
     base = page * s_pp + head * s_ph
     b = tl.load(pay + base + rows[:, None] * s_po + offs_i[None, :], mask=rmask[:, None], other=0).to(tl.int32)
     s = tl.load(sc + page * c_pp + head * c_ph + rows[:, None] * c_po + (offs_i // 8)[None, :], mask=rmask[:, None],
                 other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    return (_e2m1(b & 15) * s).to(tl.bfloat16), (_e2m1(b >> 4) * s).to(tl.bfloat16)
+    return (_e2m1(b & 15) * s).to(DT), (_e2m1(b >> 4) * s).to(DT)
 
 
 @triton.jit
@@ -58,7 +61,7 @@ def _fp4_sparse_decode_kernel(
         stride_r2t_b, stride_ti_h, stride_ti_b, stride_ti_t,
         stride_o_c, stride_o_b, stride_o_h, stride_o_d, stride_l_c, stride_l_b, stride_l_h,
         HALF_D: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_T: tl.constexpr,
-        NUM_TOPK_CHUNKS: tl.constexpr):
+        NUM_TOPK_CHUNKS: tl.constexpr, DT: tl.constexpr):
     """Split-K over the top-k blocks as SGLang's _gqa_share_sparse_decode_kernel_impl (no sink, no HiSparse, block =
     page): partial outputs and log-sum-exps per chunk, merged by its _merge_topk_attn_out_kernel."""
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
@@ -93,8 +96,8 @@ def _fp4_sparse_decode_kernel(
         base_slot = tl.load(req_to_token_ptr + sid * stride_r2t_b + c, mask=c < seq_len, other=0).to(tl.int64)
         page = base_slot // BLOCK_SIZE_N
         rows = base_slot % BLOCK_SIZE_N + off_n
-        k_e, k_o = _fp4_tile(k_pay, k_sc, page, pid_kh, rows, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po)
-        v_e, v_o = _fp4_tile(v_pay, v_sc, page, pid_kh, rows, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po)
+        k_e, k_o = _fp4_tile(k_pay, k_sc, page, pid_kh, rows, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT)
+        v_e, v_o = _fp4_tile(v_pay, v_sc, page, pid_kh, rows, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < seq_len - c, 0, float('-inf'))
         qk += (tl.dot(q_even, tl.trans(k_e)) + tl.dot(q_odd, tl.trans(k_o))) * (sm_scale * kv_scale)
@@ -102,7 +105,7 @@ def _fp4_sparse_decode_kernel(
         p = tl.exp(qk - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
         alpha = tl.exp(m_i - m_ij)
-        pb = p.to(tl.bfloat16)
+        pb = p.to(DT)
         acc_e = acc_e * alpha[:, None] + tl.dot(pb, v_e) * kv_scale
         acc_o = acc_o * alpha[:, None] + tl.dot(pb, v_o) * kv_scale
         m_i = m_ij
@@ -144,8 +147,8 @@ def fp4_sparse_decode(q, k_pay, k_sc, v_pay, v_sc, req_to_token, slot_ids, topk_
         o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3),
         lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2),
         HALF_D=head_dim // 2, BLOCK_SIZE_H=max(16, triton.next_power_of_2(gqa_group_size)), BLOCK_SIZE_N=block_size,
-        BLOCK_SIZE_T=triton.next_power_of_2(max_topk), NUM_TOPK_CHUNKS=chunks, num_warps=num_warps,
-        num_stages=num_stages)
+        BLOCK_SIZE_T=triton.next_power_of_2(max_topk), NUM_TOPK_CHUNKS=chunks, DT=tl_dtype(q.dtype),
+        num_warps=num_warps, num_stages=num_stages)
     _merge_topk_attn_out_kernel[(batch_size, num_q_heads)](
         o_partial, lse_partial, head_dim, o_partial.stride(0), o_partial.stride(1), o_partial.stride(2),
         o_partial.stride(3), lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2),
@@ -154,15 +157,16 @@ def fp4_sparse_decode(q, k_pay, k_sc, v_pay, v_sc, req_to_token, slot_ids, topk_
 
 
 @triton.jit
-def _fp4_rows(pay, sc, slots, rmask, offs_i, s_pp, s_po, c_pp, c_po):
-    """Index K rows of arbitrary slots (pool [page, slot in page, byte]): (even, odd) halves [n, D/2] as BF16."""
+def _fp4_rows(pay, sc, slots, rmask, offs_i, s_pp, s_po, c_pp, c_po, DT: tl.constexpr):
+    """Index K rows of arbitrary slots (pool [page, slot in page, byte]): (even, odd) halves [n, D/2] in the dot
+    operands' dtype (DT)."""
     page = slots // 128
     row = slots % 128
     b = tl.load(pay + page[:, None] * s_pp + row[:, None] * s_po + offs_i[None, :], mask=rmask[:, None],
                 other=0).to(tl.int32)
     s = tl.load(sc + page[:, None] * c_pp + row[:, None] * c_po + (offs_i // 8)[None, :], mask=rmask[:, None],
                 other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    return (_e2m1(b & 15) * s).to(tl.bfloat16), (_e2m1(b >> 4) * s).to(tl.bfloat16)
+    return (_e2m1(b & 15) * s).to(DT), (_e2m1(b >> 4) * s).to(DT)
 
 
 @triton.jit
@@ -172,7 +176,7 @@ def _fp4_decode_score_kernel(
         init_blocks, local_blocks, stride_q_b, stride_q_h, stride_q_d, s_pp, s_po, c_pp, c_po, stride_r2t_b,
         stride_s_h, stride_s_b, stride_s_n,
         HALF_D: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, NUM_KV_CHUNKS: tl.constexpr, SCORE_TYPE: tl.constexpr,
-        SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr):
+        SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr, DT: tl.constexpr):
     """SGLang's _decode_score_kernel (score only, one index head, BLOCK_SIZE_N = block_size) over an NVFP4 index K."""
     tl.static_assert(SCORE_TYPE == 'max' or SCORE_TYPE == 'lse')
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -207,7 +211,7 @@ def _fp4_decode_score_kernel(
         pos_mask = i + off_n < seq_len
         slots = tl.load(r2t_base + i + off_n, mask=pos_mask, other=0).to(tl.int64)
         slots = (slots + max_slots) % max_slots
-        k_e, k_o = _fp4_rows(k_pay, k_sc, slots, pos_mask, offs_i, s_pp, s_po, c_pp, c_po)
+        k_e, k_o = _fp4_rows(k_pay, k_sc, slots, pos_mask, offs_i, s_pp, s_po, c_pp, c_po, DT)
         qk = tl.zeros((BLOCK_SIZE_H, block_size), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float('-inf'))
         qk += (tl.dot(q_even, tl.trans(k_e)) + tl.dot(q_odd, tl.trans(k_o))) * (sm_scale_log2e * k_scale)
@@ -240,7 +244,7 @@ class _ScoreShim:
                 pay.stride(0), pay.stride(1), sc.stride(0), sc.stride(1), sr0, ss0, ss1, ss2,
                 HALF_D=head_dim // 2, BLOCK_SIZE_H=max(16, triton.next_power_of_2(gqa_group_size)),
                 NUM_KV_CHUNKS=NUM_KV_CHUNKS, SCORE_TYPE=SCORE_TYPE, SKIP_TRIVIAL_TOPK_SCORE=SKIP_TRIVIAL_TOPK_SCORE,
-                num_warps=4, num_stages=2)
+                DT=tl_dtype(q.dtype), num_warps=4, num_stages=2)
         return launch
 
 
@@ -267,15 +271,16 @@ def fp4_decode_topk_idx(q, idx_pay, idx_sc, run=None, **kwargs):
 
 
 @triton.jit
-def _fp4_rows_h(pay, sc, slots, head, rmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po):
-    """Main K/V rows of arbitrary slots for one head (pool [page, head, slot in page, byte]): (even, odd) halves."""
+def _fp4_rows_h(pay, sc, slots, head, rmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT: tl.constexpr):
+    """Main K/V rows of arbitrary slots for one head (pool [page, head, slot in page, byte]): (even, odd) halves in
+    the dot operands' dtype (DT)."""
     page = slots // 128
     row = slots % 128
     b = tl.load(pay + page[:, None] * s_pp + head * s_ph + row[:, None] * s_po + offs_i[None, :], mask=rmask[:, None],
                 other=0).to(tl.int32)
     s = tl.load(sc + page[:, None] * c_pp + head * c_ph + row[:, None] * c_po + (offs_i // 8)[None, :],
                 mask=rmask[:, None], other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    return (_e2m1(b & 15) * s).to(tl.bfloat16), (_e2m1(b >> 4) * s).to(tl.bfloat16)
+    return (_e2m1(b & 15) * s).to(DT), (_e2m1(b >> 4) * s).to(DT)
 
 
 @triton.jit
@@ -297,7 +302,7 @@ def _fp4_sparse_fwd_kernel(
         stride_qn, stride_qh, stride_qd, s_pp, s_ph, s_po, c_pp, c_ph, c_po, stride_th, stride_tn, stride_tk,
         stride_on, stride_oh, stride_od, stride_r2t_b,
         HALF_D: tl.constexpr, BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
-        BLOCK_SIZE_T: tl.constexpr, BLOCK_SIZE_QH: tl.constexpr):
+        BLOCK_SIZE_T: tl.constexpr, BLOCK_SIZE_QH: tl.constexpr, DT: tl.constexpr):
     """SGLang's _gqa_share_sparse_fwd_kernel (no sink, no HiSparse map, no sub-tiling) over an NVFP4 main cache."""
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -340,7 +345,7 @@ def _fp4_sparse_fwd_kernel(
             pos_mask = pos < seq_len
             slots = tl.load(req_to_token_ptr + sid * stride_r2t_b + pos, mask=pos_mask, other=0).to(tl.int64)
             slots = (slots + max_slots) % max_slots
-            k_e, k_o = _fp4_rows_h(k_pay, k_sc, slots, pid_kh, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po)
+            k_e, k_o = _fp4_rows_h(k_pay, k_sc, slots, pid_kh, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             qk += tl.where(off_q_k[:, None, :] >= c, 0, float('-inf'))
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
@@ -350,8 +355,8 @@ def _fp4_sparse_fwd_kernel(
             p = tl.exp2(qk - m_ij[:, None])
             l_ij = tl.sum(p, axis=1)
             alpha = tl.exp2(m_i - m_ij)
-            v_e, v_o = _fp4_rows_h(v_pay, v_sc, slots, pid_kh, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po)
-            pb = p.to(tl.bfloat16)
+            v_e, v_o = _fp4_rows_h(v_pay, v_sc, slots, pid_kh, pos_mask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT)
+            pb = p.to(DT)
             acc_e = acc_e * alpha[:, None] + tl.dot(pb, v_e) * kv_scale
             acc_o = acc_o * alpha[:, None] + tl.dot(pb, v_o) * kv_scale
             m_i = m_ij
@@ -399,8 +404,8 @@ def fp4_prefill_gqa_share_sparse(q, k_cache, v_cache, sink, req_to_token, slot_i
         k_sc8.stride(0), k_sc8.stride(1), k_sc8.stride(2), topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
         o.stride(0), o.stride(1), o.stride(2), req_to_token.stride(0),
         HALF_D=head_dim // 2, BLOCK_SIZE_Q=bq, BLOCK_SIZE_K=block_size_k, BLOCK_SIZE_H=bh,
-        BLOCK_SIZE_T=triton.next_power_of_2(topk_idx.shape[-1]), BLOCK_SIZE_QH=bq * bh, num_warps=num_warps,
-        num_stages=num_stages)
+        BLOCK_SIZE_T=triton.next_power_of_2(topk_idx.shape[-1]), BLOCK_SIZE_QH=bq * bh, DT=tl_dtype(q.dtype),
+        num_warps=num_warps, num_stages=num_stages)
     return o
 
 
@@ -409,7 +414,7 @@ def _fp4_index_score_kernel(
         q_ptr, k_pay, k_sc, score_ptr, req_to_token_ptr, cu_seqlens, seq_lens, prefix_lens, slot_ids, max_slots,
         num_heads, gqa_group_size, sm_scale, k_scale, stride_q_n, stride_q_h, stride_q_d, s_pp, s_po, c_pp, c_po,
         stride_s_h, stride_s_q, stride_s_k, stride_r2t_b,
-        HALF_D: tl.constexpr, BLOCK_SIZE_Q: tl.constexpr, block_size: tl.constexpr):
+        HALF_D: tl.constexpr, BLOCK_SIZE_Q: tl.constexpr, block_size: tl.constexpr, DT: tl.constexpr):
     """Causal max index score per query and KV block over an NVFP4 index K (SGLang's _index_block_score_only_kernel,
     the score half of _flash_attn_fwd_with_block_score_kernel with DISABLE_INDEX_VALUE)."""
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -438,7 +443,7 @@ def _fp4_index_score_kernel(
         pos_mask = pos < seq_len
         slots = tl.load(req_to_token_ptr + sid * stride_r2t_b + pos, mask=pos_mask, other=0).to(tl.int64)
         slots = (slots + max_slots) % max_slots
-        k_e, k_o = _fp4_rows(k_pay, k_sc, slots, pos_mask, offs_i, s_pp, s_po, c_pp, c_po)
+        k_e, k_o = _fp4_rows(k_pay, k_sc, slots, pos_mask, offs_i, s_pp, s_po, c_pp, c_po, DT)
         qk = (tl.dot(q_e, tl.trans(k_e)) + tl.dot(q_o, tl.trans(k_o))) * (sm_scale_log2e * k_scale)
         qk = tl.where((off_q[:, None] >= pos[None, :]) & pos_mask[None, :], qk, float('-inf'))
         score = tl.max(qk, axis=1)
@@ -467,8 +472,8 @@ class _PrefillScoreShim:
                 q, pay, sc, score, req_to_token, cu_seqlens, seq_lens, prefix_lens, slot_ids,
                 pay.shape[0] * pay.shape[1], num_heads, gqa_group_size, sm_scale, k_scale, sq0, sq1, sq2,
                 pay.stride(0), pay.stride(1), sc.stride(0), sc.stride(1), ss0, ss1, ss2, sr0,
-                HALF_D=qk_head_dim // 2, BLOCK_SIZE_Q=self.BLOCK_SIZE_Q, block_size=block_size_k, num_warps=4,
-                num_stages=2)
+                HALF_D=qk_head_dim // 2, BLOCK_SIZE_Q=self.BLOCK_SIZE_Q, block_size=block_size_k,
+                DT=tl_dtype(q.dtype), num_warps=4, num_stages=2)
         return launch
 
 
@@ -495,9 +500,10 @@ def fp4_prefill_topk_index(q, idx_pay, idx_sc, run=None, **kwargs):
 
 @triton.jit
 def _dequant_kernel(pay, sc, out, req_to_token, slot_ids, seq_lens, max_slots, rows_per_req, s_pp, s_ph, s_po, c_pp,
-                    c_ph, c_po, stride_r2t_b, stride_oh, HALF_D: tl.constexpr, HEADS: tl.constexpr):
+                    c_ph, c_po, stride_r2t_b, stride_oh, HALF_D: tl.constexpr, HEADS: tl.constexpr,
+                    DT: tl.constexpr):
     """Request b's positions [blk * 128, blk * 128 + 128) of an NVFP4 page cache (main: [page, head, slot, byte]; index:
-    head stride 0) -> BF16 rows b * rows_per_req + position of out [rows, HEADS, 2 * HALF_D]."""
+    head stride 0) -> rows b * rows_per_req + position of out [rows, HEADS, 2 * HALF_D] (the out buffer's dtype)."""
     b, blk = tl.program_id(0), tl.program_id(1)
     pos = blk * 128 + tl.arange(0, 128)
     pmask = pos < tl.load(seq_lens + b)
@@ -507,26 +513,27 @@ def _dequant_kernel(pay, sc, out, req_to_token, slot_ids, seq_lens, max_slots, r
     offs_i = tl.arange(0, HALF_D)
     rows = (b * rows_per_req + pos).to(tl.int64)
     for h in tl.static_range(HEADS):
-        e, o = _fp4_rows_h(pay, sc, slots, h, pmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po)
+        e, o = _fp4_rows_h(pay, sc, slots, h, pmask, offs_i, s_pp, s_ph, s_po, c_pp, c_ph, c_po, DT)
         vals = tl.reshape(tl.join(e, o), 128, 2 * HALF_D)   # interleave: value 2i, 2i + 1
         tl.store(out + rows[:, None] * (HEADS * 2 * HALF_D) + h * stride_oh + tl.arange(0, 2 * HALF_D)[None, :], vals,
                  mask=pmask[:, None])
 
 
 def dequantize_context(pay, sc, req_to_token, slot_ids, seq_lens, rows_per_req, out=None):
-    """BF16 [b * rows_per_req, heads, d] of each request's first seq_lens[b] positions (rows_per_req >= their
-    maximum, a multiple of 128): pay / sc [pages, heads, 128, d / 2 | d / 16] (main) or [pages, 128, ...] (index)."""
+    """[b * rows_per_req, heads, d] of each request's first seq_lens[b] positions (rows_per_req >= their
+    maximum, a multiple of 128): pay / sc [pages, heads, 128, d / 2 | d / 16] (main) or [pages, 128, ...] (index).
+    The rows take the model's dtype (BF16, or FP16 below sm_80)."""
     sc8 = sc.view(torch.uint8) if sc.dtype != torch.uint8 else sc
     if pay.dim() == 3:   # index: one head, no head dimension
         pay, sc8 = pay.unsqueeze(1), sc8.unsqueeze(1)
     pages, heads, _, half = pay.shape
     b = slot_ids.shape[0]
     if out is None:
-        out = torch.empty(b * rows_per_req, heads, 2 * half, dtype=torch.bfloat16, device=pay.device)
+        out = torch.empty(b * rows_per_req, heads, 2 * half, dtype=arch.dtype(), device=pay.device)
     _dequant_kernel[(b, rows_per_req // PAGE)](
         pay, sc8, out, req_to_token, slot_ids, seq_lens, pages * PAGE, rows_per_req, pay.stride(0), pay.stride(1),
         pay.stride(2), sc8.stride(0), sc8.stride(1), sc8.stride(2), req_to_token.stride(0), 2 * half,
-        HALF_D=half, HEADS=heads, num_warps=4)
+        HALF_D=half, HEADS=heads, DT=arch.tl_dtype(out.dtype), num_warps=4)
     return out
 
 

@@ -51,6 +51,8 @@ import logging
 import os
 import threading
 
+from xtier import arch
+
 logger = logging.getLogger(__name__)
 TILELANG_TARGET = 'tilelang.backend.target.auto_detect_target'
 DROP_FILE_CACHE = 'sglang.srt.model_loader.weight_utils._drop_file_cache_after_load'
@@ -240,7 +242,8 @@ def install(registry, hook_type) -> list[str]:
     if importlib.util.find_spec('tilelang') is not None:   # acts below SM89 only
         registry.register(ACT_QUANT, _act_quant, hook_type.AROUND)
         fixes.append('fp8-act-quant-below-sm89')
-    if importlib.util.find_spec('flashinfer') is not None and os.environ.get('XTIER_MXFP8_PREFILL_TILE', '1') != '0':
+    if (importlib.util.find_spec('flashinfer') is not None and os.environ.get('XTIER_MXFP8_PREFILL_TILE', '1') != '0'
+            and arch.at_least(*arch.SM120)):
         registry.register(MXFP8_TUNER, _choose_one, hook_type.AROUND)
         fixes.append('sm120-mxfp8-prefill-tile')
     if importlib.util.find_spec('sglang.kernels.jit.utils.compile') is not None:

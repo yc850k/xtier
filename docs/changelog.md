@@ -17,6 +17,108 @@
   - 尾部跳过（`XTIER_TAIL_SKIP=R`，会改变输出）：decode 一步里每个 token 都排在第 R 名以后的冷专家不读、不算，不重新归一化；`XTIER_TAIL_SKIP_EVAL=1`、
     `bench/ppl_eval.py --top N`、`bench/kl_compare.py` 测精度。DS 卸载 30%、R = 4 时每步冷读 −37%、decode 约 +5%，NLL 在波动内；Kimi R = 9 时 decode 2.1 倍。
   新测试 `tests/tail_skip_check.py`；`tests/cold_passes_check.py` 可以接任意块盘。详见[文档](reports/2026-11-06-cold-units-tail-skip.md)。
+- 2026-11-04：**Turing（sm_75）这一档的 decode 提速**：decode 从 0.5-0.9 tok/s 到 **2.9-3.2 tok/s**（只算 decode，不含
+  prefill；128 token 的流式请求实测 2.49/2.70/2.92/2.96/3.16 tok/s，512 token 的长请求稳定在 2.6-2.7 tok/s），
+  同时修掉一个**静默算错**的地方。落地的东西：
+  1. **TP 切分算错了**：GPU 池算的是整份专家（中间维 2304），而 SGLang 会把两个 rank 的 MoE 输出相加，所以每条路由
+     被算了 2 遍。证据是同一段提示的总 logprob：池子这条路 **-188.6**，纯 CPU 引擎 **-168.1**。现在池子只算本 rank
+     的那一片（gate/up 的行、down 的列，跟引擎的 `gsq_split` 一样）：池子这条路 **-169.7**（跟引擎的 BF16 只差 FP16
+     的舍入），复制测试仍 100% 命中。`gsq_gpu.py` 的四个内核多了一个 `IOFF`/`IP`（本 rank 的中间维偏移与宽度），
+     down 的边界块整块解码、按列掩掉（掩掉的列在中间维里是 0，点积不受影响）；
+  2. **上传不再把 decode 流排空**：以前每个不在显存里的专家分三段拷，拷一次 `cudaStreamSynchronize` 一次，一层
+     十六次，每次把整条 decode 流水线排空。现在拷贝走自己的流（decode 流用 event 等它，拷贝流等 decode 读完
+     arena 再覆写），pinned 的暂存缓冲也做成环形。实测这一项就是 0.5 → 1.65 tok/s；
+  3. **只传本 rank 的那一片字节**：gate/up 的行是连续的，所以显存里的槽只放本 rank 的行（5.2 MB 而不是 7.7 MB），
+     PCIe 上的字节少三分之一，显存里能多放一倍的槽（26 个/层）。实测 1.65 → 2.2 tok/s；
+  4. **自适应驻留真的在跟着流量走**：交换（swap）以前只能从引擎的 RAM 槽读字节，本机每层只有 384 个专家里的 115 个
+     在内存里，于是 87% 的交换被跳过（`swaps_no_ram`）。现在专家不在内存里时从 checkpoint 自己的文件映射读，命中
+     率从 8% 涨到 33%（每层路由量前 26 个专家占约三分之一）；
+  5. **内存里的冷池跟着 GPU 的流量走**：上传以前是从 checkpoint 的文件里读专家的字节（引擎的 RAM 池里放的是 profile
+     排出来的专家，引擎自己一条路由都没走到，因为路由全被 GPU 接管了），于是每次调用都从盘上读。现在池子在上传前
+     让冷池把这次路由到的专家读进引擎的 RAM（跟引擎自己算之前做的是同一件事：不在 RAM 里的从 store 读进来，最冷的
+     那个让位），RAM 里于是就是 GPU 真正要的专家，上传从已 pin 的槽拷（满速 PCIe），**稳态下 checkpoint 的文件一次都
+     不读了**（上传里来自文件的字节：每层每 192 次调用 748 MiB -> 0）。这一项把 decode 从 2.2 抬到 2.5-2.9 tok/s；
+  6. **内存里的冷池只存本 rank 的那一片**：RAM 池原来存整份专家（7.7 MB），而每个 rank 只需要自己那一片（5.2 MB：
+     gate/up 的行、down 整个），于是同样的内存只放得下每层 115 个专家，而流量碰到的是 116-125 个，LRU 在颠簸、盘上
+     每次调用都要读。现在槽里放的是本 rank 的那一片（引擎读槽里的行、down 的列，跟 GPU 读的一样），同样的内存放得下
+     **172** 个，工作集装得下，盘只读一次（上传里来自文件的字节 0）。引擎自己的数字一点没变：CPU 引擎那条路用切片的槽
+     算出来的 logprob 一模一样（-168.0674）。这一步把 decode 从 2.5-2.9 抬到 2.9-3.0 tok/s，内存也省了 29 GB；
+  7. **单 token 的 decode 不用张量核**：张量核的 M 是 16，而一次 decode 只有一个 token，它们的点积等于做 16 倍的
+     无用功。改成普通的乘法（FP32）后，一层调用的 GPU 时间从 2.4 ms 降到 **1.5 ms**（每 token 的 MoE 从 96 ms 到 62 ms）；
+  8. **prefill 的 CPU 那半没了**：`XTIER_GSQ_PREFILL_UPLOAD=128`（暂存 arena 的槽数），批次路由到的专家全部由 GPU
+     算，CPU 引擎每层只剩 1-20 ms（原来 200-660 ms）；prefill 的 tile 也调小了（`XTIER_GSQ_PREFILL_TILE_M=8`：32 个
+     路由 × 16 行的 tile 寄存器放不下，decode 的内核已经用满 255 个）；IQ2_XXS 的解码也改成三维（行、八个值的一组、
+     组里的值）：一组的码和比例对它的八个值是一样的，于是按组读一次而不是每个值读一次（每个值六次读变成一个半，kernel
+     的时间都花在读上），**首 token 的时间从 47 s 降到 17 s**（decode 不变：它卡在幅度值的 gather 上，不是码上）；
+  9. **15 tok/s 在这张卡上放不下**：decode 的 67 ms/token 预算，光是 GPU 上把路由到的专家的 IQ 块解开就要
+     **85-130 ms/token**（1.4 G 个值，卡上 44 G 值/s），稠密权重本身又是 12.1 GB/卡（27 ms/token）。能压的是周围的
+     等待，实测压到了 2.5-2.9 tok/s，剩下的时间是 PCIe 上那些显存里放不下的专家的字节（现在走内存，不再走盘）和每层
+     几十次 kernel 发射的 CPU 开销（GPU 在两次发射之间是闲着的，而 CUDA graph 在这里用不了：上传的地址每次调用都
+     变）。详见[文档](sm75.md)。
+- 2026-11-03：**Turing（sm_75）这一档做成了从 main 出发的分支** `feat/sm75-turing`：把上游针对 30/40 系（sm_86/sm_89）
+  的做法整套搬过来（分支 = main 的 `4b1e766` ＋ Turing 的那套活），再补上 RTX 30/40 不需要的一层：**这里没有 BF16
+  张量核**。落地的东西：
+  1. **dtype 层**：模型跑 **FP16**（卡上张量核吃的就是 FP16：实测 bf16 的 `mm` 6.2 TFLOP/s 对 fp16 的 106，Triton 的
+     BF16 `tl.dot` 更慢），超连接的残差流留在 **FP32**（它 40 层涨到 284672，超过 FP16 的 65504；`dtypes.py` 的
+     `_post_fp32`/`_combine_fp16`/`_norm_fp32`），CPU 引擎的 BF16 契约不变。上游那些按 BF16 模型写的内核改成跟着
+     激活的 dtype 走（`wo_a`、`w8a16`、`engram_gather`、Engram 行缓冲、FP8 KV 缓存、Qwen 的 PLE 行与打包 KV、
+     MiniMax 的 FP4 KV）：`arch.dtype()` 按卡取（sm_80 以下 FP16），内核用 `DT` 这个 constexpr；
+  2. **合并处的一个断点**：`arch.e4m3_f32` 的两种调用风格（上游 1 个参数、Turing 的内核 2 个）合不拢，Triton 报
+     `TypeError: too many positional arguments`，缓存的 gate/up 内核编不过；现在 `xtier/arch.py` 是唯一入口，硬件/软件
+     转换按调用传（`HW`），两种写法都能用；
+  3. 检查又找出三处合并伤，都修了：`_reduce` 的参数个数（上游的内核是 6 个）、`hybrid_prefill` 丢了上游的
+     `finally: worker.join()`（GPU 那半失败时 CPU 那半还活着）、GPU prefill 的权重反量化把 E4M3 转换留在硬件默认
+     （sm_89 以下编不过）；第二张卡当热专家池的那条路（`cache/second.py`）也补上了编解码标志；
+  4. **开关**：mHC pre-mix 的 TileLang split-K 要 sm_80（下面关掉，TileLang 那一整套本来就在下面关着）；FP8/FP4 的
+     功能按等级关闭（`supported()`）；
+  5. **卡上的检查**：`sm75_gpu_check`（缓存的 gate/up 与 GPU prefill 对 FP32 参考，FP16 下相对 L2 2.1e-4/3.0e-4）、
+     `fp4_decode_check`、`fp8_decode_check`、`fp8_encode_check`（940 万个值与 torch 的 e4m3fn 逐位相同）、
+     `ds_fp8_soft_check`、`ds_sparse_mla_check`、`sparse_mla_check`、`ds_w8a16_check`、`deepseek_fp8_kv_check`、
+     `qsa_decode_check`、`qsa_fp8_check`、`glm_indexer_torch_check`、`arch_check` 都通过；需要别的机器上的
+     safetensors 检查点或要 sm_89/sm_90 的那几条在本机改成 SKIP（原来直接失败）；跟 SGLang 自己 FP8 内核对不上的那几条
+     （`fp8_encode_check`、`ds_fp8_soft_check`、`qsa_fp8_check`）改成跟卡上有的参考比（torch 的 e4m3fn、池子自己的字节、
+     SGLang 的 torch 路径）；
+  6. **两张卡**：TP=2（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎，`tools/cpu_budget.py --tp 2` 分线程），
+     `XTIER_COLD_FRACTION=0.8`（两个 rank 的冷池各留 77/384 个专家在内存里，0.3 的话要 195 GB，cgroup 会卡住加载）。
+     实测：两张卡都用满（各 20.9/22.5 GB），加载约 3 分钟（权重 167 s），一次请求（81 token 提示、64 token 输出）
+     冷 198.7 s、热 187.1 s，答案正确（prefill 0.4-1.35 tok/s、decode 0.24-0.44 tok/s，SGLang 的计数）。
+  详见[文档](sm75.md)。
+- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 Flash 跑通了：一次请求有答案（"2+2 equals 4."），40 层没有 NaN。
+  实测速度：prefill 约 3.7 tok/s、decode 约 0.8 tok/s（SGLang 自己的计数），瓶颈是 BF16 的点积由软件模拟、MoE 在
+  CPU 引擎上、注意力走 PyTorch，不是显存。修了四处：
+  1. GGUF 的名字对照漏了共享专家的三个张量（gate/up/down），共享专家的权重一直没初始化：隐藏状态变 NaN，引擎拒绝
+     路由权重（`xtier/backend/gguf_names.py`）；
+  2. 压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3，Triton 只在 sm_89 以上能编，改走 SGLang 自己的 torch 路径
+     （`xtier/packs/deepseek_v4/fp4_rope.py`）；
+  3. 索引器与 KV 压缩器的权重固定是 BF16，激活按它们的 dtype 走；BF16→FP32 的 GEMM 要 sm_80，改为上转型
+     （`xtier/packs/deepseek_v4/dtypes.py`）；
+  4. 模型的 dtype 改回 BF16：超连接的残差流在 FP16 下到第 23 层就撑爆 65504（上游也是 BF16）。
+  端到端三层都在日志里：GPU 热缓存命中 7% 的路由（8 个槽对 384 个专家），其余由 CPU 引擎算（每层调用 35 ms），
+  内存与 GPU 槽里都没有的专家由冷池从傲腾盘读（每步约 1 个）；另外把分块 prefill 的块从 1024 改成 256（便携注意力
+  一次 gather 1.75 GiB，卡上只剩 1.25 GiB），GSQ 冷池也补上了统计日志（`XTIER_COLD_LOG`）。
+  详见[文档](sm75.md)。
+- 2026-11-02：Turing（sm_75）照搬别人提交的 **Ampere（RTX 30/40）适配**的做法：**不改检查点的存储格式，用软件适配**——
+  权重反量化到显卡能算的格式再算。落地了三件事：
+  1. E2M1/E4M3 的软硬件转换都齐了（`xtier/backend/fp4.py`）：E2M1 解码、E4M3 解码与编码，位级等于硬件指令
+     （`tests/fp4_decode_check.py`、`tests/fp8_decode_check.py`、`tests/fp8_encode_check.py`），
+     `XTIER_FP4_DECODE` / `XTIER_FP8_DECODE` 选路径，可在同一张卡上对拍；
+  2. 32×32 分块 FP8 的投影在 sm_89 以下也能跑（`xtier/packs/deepseek_v4/w8a16.py`）：保持 SGLang 自己的布局
+     （不重排 Marlin、不动检查点），权重按位反量化进复用的 BF16 buffer 再走 cuBLAS；
+  3. 记下一条量到的数：超连接的残差流在 40 层里涨到 **284672**（FP16 的上限是 65504），所以模型的 dtype 必须是
+     BF16——卡上没有 BF16 张量核，这部分是速度的主要代价。单次实测（prompt 126 + decode 64）：全程 124 s，
+     decode 0.5 tok/s（SGLang 计数 0.40→0.76），冷 prefill 约 1 tok/s、热 prefill 3.7 tok/s。
+- 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读的是**一个**文件（`gguf` 包的 reader 没有分片支持：
+  第一个分片里只有 42 个张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片。XTier 现在把分片当一个
+  文件读（`xtier/backend/gguf_split.py`），给出该模型的张量名对照（`gguf_names.py`）与权重的反量化
+  （`gguf_weights.py`：模型的注意力要反量化的权重，路由专家留在文件里给引擎的 IQ 解码）。
+- 2026-10-29（晚）：GSQ 路径（GGUF 的 IQ 专家）补上本项目的两个主功能：**热专家缓存**（GPU 用 Triton 解 IQ 块，
+  热专家的字节按检查点的原样进显存，常驻集跟着路由换人；实测同一批路由 GPU 22.9 ms 对引擎 90.5 ms，相对 L2 3.8e-04）
+  与**冷专家卸载到傲腾盘**（`XTIER_COLD=1`：热专家进内存槽，其余留在检查点自己的分片里，O_DIRECT 读，不经页缓存；
+  本机实测傲腾 2.4–3.5 GB/s，30% 卸载时 decode 每步缺 0.4 个专家、每步读 3.1 MB，步长与不卸载时相同）。
+  详见[文档](sm75.md)。
+- 2026-10-29：Turing（sm_75）适配，分支 `feat/sm75`：GPU 内核按显卡的算力等级取 dtype 与实现（Turing 没有 BF16
+  张量核，模型以 FP16 跑，下投影用 16 位点积；没有 FP4 转换指令，热专家缓存用软件解码 E2M1），加速包里的 FP8/TMA/FP4
+  功能按等级关闭，tile 按 64 KiB 共享内存缩小；新增 2× RTX 2080 Ti 的配置。详见[文档](sm75.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩（`Unsupported architecture for sparse decode fwd`）。SGLang 10-23 把 V4 后端改成
   经 `flash_mla_interface` 调 FlashMLA，XTier 10-30 跟进 6162b07 后，`packs/deepseek_v4` 的钩子还挂在旧入口上；旧入口还在，所以启动检查查不出
   （iounstone 发现，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。修复后在 RTX PRO 5000 上模拟 SM86 跑整模型：照抄 0 错，NLL 1.19735（升级前 1.19867）。真卡还要等他确认。

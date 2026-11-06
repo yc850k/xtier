@@ -44,7 +44,7 @@ def worker(out):
         s = s.to(dev)
         d = torch.empty((E, H, I), dtype=torch.float32, device=dev)
         B = 1024
-        prefill._unpack_all[(E, H * I // B)](w, s, d, H, I, B)
+        prefill._unpack_all[(E, H * I // B)](w, s, d, H, I, B, HW8=arch.has_fp8())
         # the pool's decode kernels on random NVFP4 slots (as tests/fp4_decode_check.py)
         S, m, k = 4, 4, 2
         q13 = torch.randint(0, 256, (S, 2 * I, H // 2), dtype=torch.uint8, generator=g).to(dev)
@@ -61,9 +61,11 @@ def worker(out):
         cfg, nk = pool.CONFIG, m * k
         pool._gate_up[(nk, I // cfg['gbn'])](x, slot_list, slot_exp, q13, s13, g13, mid, m, H, I, 0.0,
                                              pool.MAX_M, cfg['gbn'], pool._tile_k(H),
+                                             HW4=arch.has_fp4_convert(), HW8=arch.has_fp8(),
                                              num_warps=cfg['gw'], num_stages=cfg['gs'])
         pool._down[(nk, H // cfg['dbn'])](mid, slot_list, slot_exp, q2, s2, g2, part, m, H, I, pool.MAX_M, cfg['dbn'],
-                                          pool._tile_k(I), num_warps=cfg['dw'], num_stages=cfg['ds'])
+                                          pool._tile_k(I), HW4=arch.has_fp4_convert(), HW8=arch.has_fp8(),
+                                          num_warps=cfg['dw'], num_stages=cfg['ds'])
         torch.cuda.synchronize()
         result[name] = (d.cpu(), mid[:nk, :m].cpu(), part[:nk, :m].cpu())
     torch.save(result, out)

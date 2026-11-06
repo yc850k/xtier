@@ -9,6 +9,7 @@ XTier 是官方 [SGLang](https://github.com/sgl-project/sglang) 的插件（跟 
 - **不改 SGLang 源码**：只用官方插件框架的钩子（接在官方 KTransformers 混合推理的入口上），加载后自检是否接管成功。
 - **与模型无关**：混合推理包在官方 `FusedMoE` 的量化方法外面，用标准 MoE 层的模型装上就能跑（NVFP4、MXFP4 专家）。
 - **加速包可选**：某个模型独有的修正和内核放在 `xtier/packs/` 下。
+- **按卡适配**：GPU 内核跟显卡的能力走（FP8/TMA/FP4 的功能按等级关闭；Turing sm_75 没有 BF16 张量核，BF16 的点积由软件模拟），见 [docs/sm75.md](docs/sm75.md)。
 
 ## 结构
 
@@ -26,6 +27,7 @@ xtier/
 │              speculative（通用投机解码：EAGLE 的热词表配无损拒绝采样、草稿温度、按置信度截断验证；DSpark 按置信度截断验证）
 ├── tables/    大嵌入表的行放在 NVMe：多段多文件、任意行宽、行缓存、CUDA 图内查表
 ├── console/   启动台：一个网页选模型、调启动参数、启动 / 停止，跟踪加载阶段与 decode 遥测（只用标准库）
+├── arch.py    显卡的算力等级与由此关掉的功能（BF16/FP8/TMA/FP4；见 [docs/sm75.md](docs/sm75.md)）
 └── platform.py  与模型无关的主机修正（TileLang 目标选择）
 csrc/          CPU 引擎：AVX-512 / AVX2 专家内核、NUMA 线程池、CPU 与 GPU 之间的信箱通信
 configs/       每个"模型 × 硬件"的启动配置，console.py 是它在启动台里的条目（选项、默认值、启动命令）
@@ -272,10 +274,40 @@ decode 约慢 10%），主要受限于硬盘速度。
 - 约为正常配置的 25%，瓶颈在读盘：prefill 每个 8K 分块都要把约 70% 的专家从 4 块盘重读一遍，decode 每步约 100 个缺失。详见
   [报告](docs/reports/2026-10-27-ds41-minimal.md)。
 
+## Turing（sm_75）
+
+分支 `feat/sm75-turing` 让 XTier 在 Turing 卡（RTX 2080 Ti 一类）上跑：它是 **main（上游的 RTX 30/40 系那套）
+加上 Turing 这一档**——内核按卡的能力取实现：Turing 没有 BF16 张量核，**模型跑 FP16**（卡上张量核吃的就是 FP16），
+超连接的残差流留在 **FP32**（它 40 层涨到 284672，超过 FP16 的 65504）；TF32 也没有，下投影用 16 位点积；热专家缓存的
+FP4 解码用软件实现（没有 `cvt.rn.f16x2.e2m1x2`），FP8/TMA/FP4 的加速包功能按等级关闭，tile 按 64 KiB 共享内存缩小。
+注意力走 Triton 的稀疏 MLA（上游为 sm_90 以下做的那个，Turing 上把 tile 再缩小）。CPU 引擎不变。
+2× RTX 2080 Ti 上按 TP=2 跑（每张卡一半的稠密权重、一半的 KV、各自的 CPU 引擎）：两张卡都用满（各 20.9/22.5 GB），
+DeepSeek V4.1 Flash 能出答案（一次请求 81 token 提示 + 64 token 输出：冷 198.7 s、热 187.1 s，答案正确）。
+详见[文档](docs/sm75.md)与 [configs/sm75-2x2080ti/](configs/sm75-2x2080ti/)。
+
 ## 版本更新
 
 - 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 cyrus-xc，[#13](https://github.com/a775828b-dot/xtier/pull/13)）。在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上实测没有收益，所以默认仍是 static；其他机器请自行测试。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
 - 2026-11-06：两个选项，都默认关：冷存储按盘速分段（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）；尾部跳过（`XTIER_TAIL_SKIP=5/6` 这种「保留/总共」写法，会改变输出），CPU 算的专家都能跳，不必开冷专家。来自已归档的 Kimi K3.1 实验分支，详见[分段](docs/reports/2026-11-06-cold-units-tail-skip.md)、[尾部跳过](docs/reports/2026-11-06-tail-skip-cpu.md)。
+- 2026-11-03：Turing（sm_75）这一档做成了从 main 出发的分支 `feat/sm75-turing`：上游针对 30/40 系的整套做法搬过来，
+  再补上 RTX 30/40 不需要的一层（这里没有 BF16 张量核）：模型跑 FP16、超连接的残差流留在 FP32，上游那些按 BF16
+  模型写的内核改成跟着激活的 dtype 走。合并处的一个断点（`arch.e4m3_f32` 的两种调用风格）与检查又找出的三处合并伤
+  都修了；卡上的内核检查都通过。详见[文档](docs/sm75.md)。
+- 2026-10-30：Turing（sm_75）上的 DeepSeek V4.1 跑通了：一次请求有答案，40 层没有 NaN。修了四处：GGUF 的名字对照漏了共享专家的三个张量（权重一直没初始化，隐藏状态变 NaN）；压缩 KV 的融合 RoPE+FP4 假量化要转 NVFP4 的 e4m3（Triton 只在 sm_89 以上能编）；索引器与 KV 压缩器的 BF16 权重要 BF16 的激活、BF16→FP32 的 GEMM 要 sm_80；模型的 dtype 改回 BF16（残差流在 FP16 下第 23 层就溢出）。详见[文档](docs/sm75.md)。
+- 2026-10-29（夜）：**GGUF 分片**：SGLang 的 GGUF loader 读一个文件（`gguf` 包没有分片支持：第一个分片只有 42 个
+  张量，整个检查点 1008 个），DeepSeek V4.1 的 Maya 包是四个分片：XTier 把分片当一个文件读，并给出该模型的张量名
+  对照与权重的反量化。详见[文档](docs/sm75.md)。
+- 2026-10-29（晚）：GSQ 路径（GGUF 的 IQ 专家）补上两个主功能：热专家缓存（GPU 用 Triton 解 IQ 块，实测同一批路由
+  22.9 ms 对引擎 90.5 ms）与冷专家卸载到硬盘（`XTIER_COLD=1`，存储就是检查点自己的分片，O_DIRECT 读；本机实测
+  傲腾 2.4–3.5 GB/s，30% 卸载时 decode 每步缺 0.4 个专家、每步读 3.1 MB，步长不变）。详见[文档](docs/sm75.md)。
+- 2026-10-29：Turing（sm_75）适配，分支 `feat/sm75`：GPU 内核按显卡能力取 dtype 与内核（FP16 点积、软件 FP4 解码），
+  加速包的 FP8/TMA/FP4 功能按等级关闭，新增 2× RTX 2080 Ti 的配置。详见[文档](docs/sm75.md)。
+- 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
+  给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](docs/reports/2026-10-28-decode-miss-gpu.md)。
+- 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好
+  才报在线；DeepSeek 启动 472 → 186 s，卸载 30% 409 → 124 s。详见[文档](docs/reports/2026-10-27-fast-load.md)。
+- 2026-10-27：启动台新卡片「DeepSeek V4.1 Flash 1017 · 最小化」：32 GB 显存 + 128 GB 内存（模拟 RTX 5090），70% 的专家放硬盘，
+  prefill 约 1,160、decode 约 30 tok/s。详见[文档](docs/reports/2026-10-27-ds41-minimal.md)。
 - 2026-11-01（v0.1.1）：修了 DeepSeek 在 RTX 30 / 40 系上第一个请求就崩：跟进 SGLang 6162b07 后注意力钩子挂空了（感谢 iounstone，[#10](https://github.com/a775828b-dot/xtier/pull/10)）。
 - 2026-11-01（v0.1.0）：全面代码审计后修了换槽序号回绕、后台线程报错被吞、首个请求现编内核被内存守护杀掉等问题，失效的加速项启动时直接报错；
   冷专家池换到 4 块 PCIe 5.0 盘（卸载 30% 时 decode −21%），大模型的专家可以只存一份。详见[修复](docs/reports/2026-11-01-audit-fixes.md)、[冷专家](docs/reports/2026-11-01-cold-pcie5.md)。

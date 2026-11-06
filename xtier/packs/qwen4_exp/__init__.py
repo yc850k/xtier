@@ -50,15 +50,18 @@ def _fused_hc_mix(original, *args, **kwargs):
 
 
 def install(registry, hook_type):
+    from xtier.packs import supported
     registry.register(PLE, _allocate_ple_host_table, hook_type.AROUND)
-    registry.register(HC_MIX, _fused_hc_mix, hook_type.AROUND)
+    if supported((9, 0), 'the hyper-connection mix overlap (qwen4_exp)'):   # TMA bulk prefetch
+        registry.register(HC_MIX, _fused_hc_mix, hook_type.AROUND)
     if os.environ.get('XTIER_PLE_BLOCK', '4096') != '0':
         from xtier.packs.qwen4_exp import ple_blocks
         registry.register(f'{MODELS}.Qwen4ExpPLELayer.forward', ple_blocks.ple_forward, hook_type.AROUND)
-    if os.environ.get('XTIER_QSA_KEYS_PER_CTA', '4096') != '0':
+    if os.environ.get('XTIER_QSA_KEYS_PER_CTA', '4096') != '0' and supported((8, 0), 'the QSA indexer prefill '
+                                                                            '(qwen4_exp)'):   # Ampere MMA path
         from xtier.packs.qwen4_exp import qsa_prefill
         registry.register(QSA_PREFILL, qsa_prefill.qsa_mqa_prefill, hook_type.AROUND)
-    if os.environ.get('XTIER_QSA_FP4', '1') != '0':   # each hook acts only on an NVFP4 KV pool
+    if os.environ.get('XTIER_QSA_FP4', '1') != '0' and supported((8, 9), 'the NVFP4 KV cache reader (qwen4_exp)'):
         from xtier.packs.qwen4_exp import qsa_fp4
         registry.register(f'{QSA_BACKEND}.forward_extend', qsa_fp4.forward_extend, hook_type.AROUND)
         registry.register(f'{QSA_BACKEND}._forward_paged_attention', qsa_fp4.paged_attention, hook_type.AROUND)

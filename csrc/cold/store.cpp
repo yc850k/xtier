@@ -4,6 +4,8 @@
 // host memory beyond its buffers. Offsets and piece sizes are multiples of 512 bytes (the drives' logical block).
 // Reads are synchronous (xtier_cold_read: a forward waits for them, ahead of the others) or asynchronous
 // (xtier_cold_submit: a ticket, waited for by groups of jobs, e.g. the experts of a prefill's staging).
+// A range that is not whole blocks (the GSQ path: the checkpoint's own tensors, at 64 bytes modulo 512) cannot be
+// read into the destination with O_DIRECT: it is read as the aligned window around it and copied out.
 #include "xtier_engine.h"
 #include <cerrno>
 #include <chrono>
@@ -22,6 +24,23 @@
 namespace {
 thread_local std::string cold_error;
 using Clock=std::chrono::steady_clock;
+
+// The reader thread's bounce buffer: the aligned window a range that is not whole blocks is read through (it grows
+// with the jobs the thread reads).
+struct Bounce {
+    void *mem=nullptr;
+    size_t cap=0;
+    uint8_t *get(size_t bytes) {
+        if(bytes>cap) {
+            std::free(mem);
+            if(posix_memalign(&mem,4096,bytes)){mem=nullptr;cap=0;return nullptr;}
+            cap=bytes;
+        }
+        return static_cast<uint8_t*>(mem);
+    }
+    ~Bounce(){std::free(mem);}
+};
+thread_local Bounce bounce;
 
 // One read: its jobs by group (counters under the store's done_lock).
 struct Ticket {
@@ -69,6 +88,55 @@ bool read_all(int fd,long long offset,std::vector<iovec> v) {
     return true;
 }
 
+// The wanted bytes of a job: its pieces in order (the record's parts, contiguous in the file).
+long long job_bytes(const Job &job) {
+    long long total=0;
+    for(const iovec &p:job.pieces)total+=static_cast<long long>(p.iov_len);
+    return total;
+}
+
+// Whether a job's bytes can be read straight into the destination: the offset, the sizes and the addresses are all
+// whole logical blocks (the FP4 path's records).
+bool whole_blocks(const Job &job) {
+    if(job.offset%512)return false;
+    for(const iovec &p:job.pieces) {
+        if(p.iov_len%512||uintptr_t(p.iov_base)%512)return false;
+    }
+    return true;
+}
+
+// A range that is not whole blocks (the GSQ path: the checkpoint's own tensors, at 64 bytes modulo 512) is read as
+// the aligned window around it into the reader's bounce buffer, and the wanted bytes are copied out. The window can
+// reach past the end of the file: the read is short then, and every wanted byte is there.
+bool read_window(int fd,const Job &job) {
+    long long total=job_bytes(job);
+    if(total<=0)return true;
+    long long base=job.offset&~(long long)511;
+    long long win=((job.offset+total+511)&~(long long)511)-base;
+    uint8_t *buf=bounce.get(size_t(win));
+    if(!buf)return false;
+    long long got=0;
+    while(got<win) {
+        size_t want=size_t(win-got);
+        ssize_t n=pread(fd,buf+got,want,base+got);
+        if(n<0&&errno==EINTR)continue;
+        if(n<0)return false;
+        got+=n;
+        if(size_t(n)<want)break;   // the end of the file: the read is short
+    }
+    const uint8_t *src=buf+(job.offset-base);
+    long long left=got-(job.offset-base);   // the window's bytes at or after the wanted range
+    if(left<0)left=0;                       // the wanted range is past the end of the file
+    bool ok=true;
+    for(const iovec &p:job.pieces) {
+        size_t n=p.iov_len;
+        if(static_cast<long long>(n)>left){ok=false;n=size_t(left);}   // the file ended inside this piece
+        if(n)std::memcpy(p.iov_base,src,n);
+        src+=n;left-=static_cast<long long>(n);
+    }
+    return ok;   // every wanted byte was there
+}
+
 void reader(Store *store,File *file) {
     for(;;) {
         Job job;
@@ -79,7 +147,7 @@ void reader(Store *store,File *file) {
             auto &q=file->urgent.empty()?file->jobs:file->urgent;
             job=std::move(q.front());q.pop_front();
         }
-        bool ok=read_all(file->fd,job.offset,job.pieces);
+        bool ok=whole_blocks(job)?read_all(file->fd,job.offset,job.pieces):read_window(file->fd,job);
         std::lock_guard<std::mutex> g(store->done_lock);
         Ticket *t=job.ticket;
         if(!ok)t->failed++;
@@ -93,7 +161,7 @@ void reader(Store *store,File *file) {
 int queue(Store *store,Ticket *t,int jobs,const int *files,const long long *offsets,void *const *dst,const size_t *sizes,
           int n,const int *groups,bool urgent) {
     for(int j=0;j<jobs;j++) {
-        if(files[j]<0||files[j]>=int(store->files.size())||offsets[j]<0||offsets[j]%512){cold_error="Invalid read job";return -1;}
+        if(files[j]<0||files[j]>=int(store->files.size())||offsets[j]<0){cold_error="Invalid read job";return -1;}
         if(groups&&(groups[j]<0||groups[j]>=int(t->pending.size()))){cold_error="Invalid read group";return -1;}
     }
     t->left=jobs;t->start=t->end=Clock::now();

@@ -66,6 +66,10 @@ def mapping(seq_lens):
 def check_layout():
     from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
+    if torch.cuda.get_device_capability() < (9, 0):
+        # SGLang's NVFP4 quantizer needs the FP4 tensor cores (SM90 and newer); the decode checks below do not
+        print('layout: skipped (SGLang\'s NVFP4 quantizer needs SM90 and newer)', flush=True)
+        return True
     gs = torch.ones(1, dtype=torch.float32, device=dev)
     ok = True
     for shape, scale in (((4096, KH, D), 3.0), ((4096, 1, D), 0.02), ((7, KH, D), 40.0)):
@@ -175,6 +179,13 @@ def check_store():
     print('store: fused nvfp4_store_kv_index bytes = the pool\'s eager path:', ok, flush=True)
     return ok
 
+
+if torch.cuda.get_device_capability() < (8, 0):
+    # SGLang's own decode kernels are sized for the cards with 99 KiB of shared memory (Turing has 64 KiB), so the
+    # reference they are would not run here
+    print('SKIP: SGLang\'s reference kernels need SM80 and newer (this card is sm_%d%d)'
+          % torch.cuda.get_device_capability())
+    sys.exit(0)
 
 oks = [check_layout(), check_decode([4000, 2500, 1300]), check_decode([8000]), check_decode([128, 129, 300]),
        check_prefill([0], [1500]), check_prefill([1000], [500]), check_prefill([0, 300], [900, 600]),

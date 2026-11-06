@@ -4,6 +4,8 @@
 one, wraps the checkpoint's MoE method as ``KTEPWrapperMethod(gpu_method, config)`` before creating any weight. XTier
 answers that question for the layers its planner takes (an XTier ``LayerConfig``) and replaces the wrapper class by
 a subclass that turns an XTier config into ``XTierMoEMethod`` (real KTransformers configs keep the original wrapper).
+A layer whose format the CPU engine cannot read (BF16 experts, a GGUF checkpoint) stays with SGLang: the layer is
+reported and the model runs on SGLang alone.
 After each model load a self-check counts the layers XTier runs and fails loudly if the hooks did not take.
 """
 
@@ -13,12 +15,28 @@ from xtier import config, planner
 
 logger = logging.getLogger(__name__)
 KT = 'sglang.srt.layers.moe.kt_ep_wrapper'
+DELEGATED = []     # (layer_id, why) of the layers XTier left with SGLang (a format its CPU engine cannot read)
+
+
+def xtier_method(gpu_method, kt_config):
+    """XTier's method for a layer, or the checkpoint's own method when the CPU engine cannot read its format."""
+    from xtier.backend.method import XTierMoEMethod
+
+    try:
+        return XTierMoEMethod(gpu_method, kt_config)
+    except NotImplementedError as e:
+        # a layer XTier cannot run (a format its CPU engine cannot read: BF16 experts, a GGUF checkpoint) stays
+        # with SGLang
+        DELEGATED.append((kt_config.layer_id, str(e)))
+        logger.info('xtier: %sMoE layer %d stays with SGLang: %s',
+                    'draft ' if kt_config.draft else '', kt_config.layer_id, e)
+        return gpu_method
 
 
 def install(registry, hook_type):
     from sglang.srt.layers.moe import kt_ep_wrapper
 
-    from xtier.backend.method import LayerConfig, XTierMoEMethod
+    from xtier.backend.method import LayerConfig
 
     original = kt_ep_wrapper.KTEPWrapperMethod
 
@@ -28,14 +46,7 @@ def install(registry, hook_type):
                 if gpu_method is None:   # a layer its quantization config excludes: FusedMoE without KT takes this
                     from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
                     gpu_method = UnquantizedFusedMoEMethod()
-                try:
-                    return XTierMoEMethod(gpu_method, kt_config)
-                except NotImplementedError as e:
-                    if not kt_config.draft:
-                        raise
-                    # a draft layer XTier cannot run (e.g. BF16 experts) stays with SGLang
-                    logger.info('xtier: draft MoE layer %d stays with SGLang: %s', kt_config.layer_id, e)
-                    return gpu_method
+                return xtier_method(gpu_method, kt_config)
             return super().__new__(cls)
 
     # FusedMoE's loader recognizes the wrapper by class name.
@@ -82,6 +93,10 @@ def check(model_runner):
             raise RuntimeError(f'xtier: {len(ours)} draft MoE layers on XTier without XTIER_DRAFT=1')
         return
     if moe and not ours and not draft:   # a draft's layers may stay with SGLang (formats XTier cannot run)
+        if DELEGATED:
+            logger.warning('xtier: no MoE layer uses a format the CPU engine can read (%s); the model runs on '
+                           'SGLang alone', '; '.join(f'layer {i}: {why}' for i, why in DELEGATED[:4]))
+            return
         raise RuntimeError(f'xtier: XTIER=1 but none of the {len(moe)} MoE layers runs on XTier (hooks not applied)')
     unplanned = [m.quant_method.cfg.layer_id for m in ours if m.quant_method.plan is None]
     if unplanned:

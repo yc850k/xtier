@@ -111,6 +111,22 @@ class Fp8Fp4Experts(Format):
         return torch.ones((E, 2), dtype=torch.float32), torch.ones((E,), dtype=torch.float32)
 
 
+class GsqExperts(Format):
+    """The GSQ experts (a Maya GGUF pack): the routed experts are the IQ-quantized tensors of the mapped checkpoint
+    file (llama.cpp's IQ types, mixed per expert). The engine reads them where they are, so the GPU method's expert
+    parameters are not created at all (the loader skips the expert tensors)."""
+    name = 'gsq'
+    required = {}
+    bulk = ()
+    derived = ()
+
+    def engine_inputs(self, layer, up_first: bool):
+        raise NotImplementedError('the GSQ experts are read from the checkpoint file, not from the layer')
+
+    def globals(self, layer):
+        raise NotImplementedError('the GSQ experts have no global scales')
+
+
 E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)   # midpoints of the E2M1 magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6
 
 
@@ -170,6 +186,8 @@ def detect(gpu_method, draft=False) -> Format:
         return Fp8Fp4Experts()   # SGLang's SM90 / SM120 choice for these experts: Fp8MoEMethod's parameters, E8M0 scales
     if name == 'CompressedTensorsFusedMoEMethod':
         return CompressedTensorsNvFp4()   # the scheme sits on the layer: checked once the parameters exist
+    if name == 'GGUFMoEMethod':
+        return GsqExperts()   # the IQ-quantized experts of a Maya GGUF pack
     if name == 'UnquantizedFusedMoEMethod' and draft:
         return Bf16AsNvFp4()   # a target model's BF16 experts stay with SGLang: no precision change there
     raise NotImplementedError(f'xtier: no CPU engine format for the MoE method {name}')
