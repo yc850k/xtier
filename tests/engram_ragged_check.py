@@ -10,15 +10,36 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from xtier.packs.deepseek_v4.ragged_verify import forward, forced_budget, token_req_indices
+from xtier.packs.deepseek_v4.ragged_verify import forward, forced_budget, layout_of, token_req_indices
 
 
 class RaggedHashTests(unittest.TestCase):
+    def test_layout_wherever_the_sglang_keeps_it(self):
+        """The layout sits on the batch in the SGLang XTier follows and in the batch's spec_info in an older one;
+        the hook reads both, so it works on either (the Turing host runs an older SGLang)."""
+        layout = SimpleNamespace(extend_start_loc=torch.tensor([0, 2]))
+        on_batch = SimpleNamespace(ragged_verify_layout=layout)
+        in_spec_info = SimpleNamespace(spec_info=SimpleNamespace(ragged_verify_layout=layout))
+        self.assertIs(layout_of(on_batch), layout)
+        self.assertIs(layout_of(in_spec_info), layout)
+        self.assertIsNone(layout_of(SimpleNamespace()))
+
     def test_attention_mapping_uses_request_starts(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             req_pool_indices=torch.tensor([3, 1]),
             ragged_verify_layout=SimpleNamespace(extend_start_loc=torch.tensor([0, 2])),
+        )
+        actual = token_req_indices(None, batch, num_tokens=7)
+        torch.testing.assert_close(actual, torch.tensor([3, 3, 1, 1, 1, 1, 1]))
+
+    def test_attention_mapping_reads_the_older_sglangs_layout(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor([3, 1]),
+            spec_info=SimpleNamespace(
+                ragged_verify_layout=SimpleNamespace(extend_start_loc=torch.tensor([0, 2])),
+            ),
         )
         actual = token_req_indices(None, batch, num_tokens=7)
         torch.testing.assert_close(actual, torch.tensor([3, 3, 1, 1, 1, 1, 1]))

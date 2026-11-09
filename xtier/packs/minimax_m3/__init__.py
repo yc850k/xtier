@@ -169,7 +169,7 @@ def install(registry, hook_type):
     from xtier.packs import supported
     if not m31_branch():
         return
-    if not supported((10, 0), 'the MiniMax M3.1 pack'):   # the M3.1 kernels (tcgen05, MegaMoE, FMHA) are SM100 only
+    if not supported((10, 0), 'the MiniMax M3.1 pack', 'SGLang alone'):   # the M3.1 kernels (tcgen05, MegaMoE, FMHA) are SM100 only
         return
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(f'{MOE_SCHEME}.__init__', _moe_scheme_init, hook_type.AROUND)
@@ -196,7 +196,7 @@ def install_serving(registry, hook_type):
     from xtier.packs import supported
     if not m31_branch():
         return False
-    if not supported((10, 0), 'the MiniMax M3.1 pack'):
+    if not supported((10, 0), 'the MiniMax M3.1 pack', 'SGLang alone'):
         return False
     registry.register(NATIVE_STACK, _native_stack, hook_type.AROUND)
     registry.register(INVOKE_OVERRIDE, _invoke_override, hook_type.AROUND)

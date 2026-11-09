@@ -19,11 +19,16 @@
 | RTX PRO 5000 72 GB（SM120） | 整模型 | 整模型 | 整模型 | 开发和测速平台，每个版本都回归 |
 | RTX 4090 24 GB（SM89） | 整模型（含 MTP） | 前 8 层截层；整模型只模拟 | 第 20 层单层；整模型只模拟 | GLM 要关投机解码；DeepSeek 还没有 24 GB 卡的配置 |
 | RTX 3090 24 GB（SM86） | 整模型（含 MTP） | 前 8 层截层（BF16 KV）；整模型只模拟 | 第 20 层单层；整模型只模拟 | FP8 全部软件解码；GLM 要关投机解码；DeepSeek 同上 |
+| RTX 2080 Ti 22 GB（SM75） | 未验证 | 未验证 | 整模型（GGUF 检查点，TP=2，[文档](sm75.md)） | Turing 那一档：没有 BF16 张量核（模型跑 FP16），FP8/FP4/TMA 关闭，软件反量化 |
 | RTX 5090 32 GB（SM120） | 未验证 | 未验证 | 模拟（32 GB 显存 + 128 GB 内存，[报告](reports/2026-10-27-ds41-minimal.md)） | 和 RTX PRO 5000 同架构，真卡没跑过 |
-| 其他显卡 | 未验证 | 未验证 | 未验证 | 架构低于 SM86 不支持 |
+| 其他显卡 | 未验证 | 未验证 | 未验证 | 架构低于 SM75 不支持 |
 
 上表 DeepSeek 在 RTX 30 / 40 系的结果都早于 SGLang 6162b07。v0.1.0 在这两代卡上第一个请求会崩（[#10](https://github.com/a775828b-dot/xtier/pull/10)），v0.1.1 已修；
 修复后只在 RTX PRO 5000 上模拟 SM86 跑过整模型（照抄 0 错，NLL 1.197），真卡结果要等作者确认。
+
+Turing（SM75）那一档是独立的一条线（`docs/sm75.md`）：它把上游针对 30/40 系的做法整套搬过来，再补上这两代卡没有的
+BF16 张量核那一层。它在本机（2× RTX 2080 Ti）上跑通了 DeepSeek V4.1 的 GGUF 检查点（TP=2，一次请求有答案、40 层
+没有 NaN）；Qwen 与 GLM 在这张卡上没有跑过。
 
 MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 分支，2026-10-26 起暂停开发，新版本没有再测。
 
@@ -86,3 +91,16 @@ MiniMax-M3.1-Flash 只在 RTX PRO 5000 上跑过整模型，用 SGLang 的 M3.1 
 | DeepSeek V4.1 Flash 1017 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | `1bae0e108899` |
 | GLM-5.3 Flash | `LibertAIDAI/GLM-5.3-Flash-NVFP4` | `11d73216cd63` |
 | Qwen3.8 Flash Next | `lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4` | `f748827507ec` |
+
+### Turing（SM75）那一档的测试环境
+
+| 项目 | 版本 |
+|---|---|
+| SGLang | 0.5.22（发布版；`+sm75` 的 sm_75 构建也能用，见 [sm75.md](sm75.md)） |
+| sglang-kernel | 0.4.9（发行版即可：XTier 与 SGLang 在这张卡上要的内核由 FlashInfer 的 JIT 与 XTier 自己的 Triton 内核提供） |
+| Python | 3.12 |
+| PyTorch | 2.14.1+cu130（CUDA 13.0） |
+| FlashInfer | 0.7.1（JIT 按 `FLASHINFER_CUDA_ARCH_LIST=7.5` 编译） |
+| Triton | 3.8.0 |
+| 硬件 | 2× RTX 2080 Ti（22.5 GB，sm_75），2× Xeon E5-2680 v4（Broadwell：AVX2，无 AVX-512 BF16），141 GiB RAM，2 个 NUMA 节点 |
+| 模型 | DeepSeek V4.1 Flash 的 GGUF 检查点（IQ2_XXS 专家 + IQ4_NL 的 Engram 表），在傲腾盘上 |

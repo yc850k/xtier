@@ -339,13 +339,14 @@ def install(registry, hook_type):
                       ragged_verify.token_req_indices, hook_type.AROUND)
     registry.register('sglang.srt.speculative.dspark_components.dspark_planner.DSparkVerifyPlanner.set_forced_budget_frac',
                       ragged_verify.forced_budget, hook_type.AFTER)
-    if not supported((8, 0), 'the TileLang kernels of DeepSeek V4.1'):
+    if not supported((8, 0), 'the TileLang kernels of DeepSeek V4.1', 'SGLang\'s own torch and Triton paths'):
         tilelang.install()
         rope.install()
-    if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache'):
+    if not supported((8, 9), 'the hardware FP8 conversion of the DeepSeek V4.1 KV cache',
+                     'the software E4M3 decode'):
         kv_fp8.install()
         fp4_rope.install(registry, hook_type)
-    if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1'):
+    if not supported((9, 0), 'the FlashMLA attention kernel of DeepSeek V4.1', 'the Triton sparse MLA'):
         # the Triton sparse MLA over the packed FP8 pages (attention.py; the upstream's kernel below SM90, adapted
         # to this card) and the mHC pre-mix split-K for the 20480 hidden size (upstream's mhc_splitk.py)
         attention.install(registry, hook_type)
@@ -357,11 +358,11 @@ def install(registry, hook_type):
     dtypes.install(registry, hook_type)
     registry.register(INDEXER, _make_candidate_indexer, hook_type.AROUND)
     registry.register(REPLAY_TAIL, _replay_tail, hook_type.AROUND)
-    if supported((8, 0), 'the wo_a FP8 einsum (deepseek_v4)'):   # BF16 dot products
+    if supported((8, 0), 'the wo_a FP8 einsum (deepseek_v4)', 'the FP8 weights in software'):   # BF16 dot products
         wo_a.install(registry, hook_type)
     paged_indexer.install(registry, hook_type)
     if os.environ.get('XTIER_FP8_CONFIGS', '1') != '0' and supported((8, 9), 'the W8A8 FP8 configs '
-                                                                      '(deepseek_v4)'):
+                                                                      '(deepseek_v4)', 'the default FP8 configs'):
         registry.register(FP8_CONFIGS, _fp8_configs, hook_type.AROUND)
     registry.register(MXFP8_LINEAR, _mxfp8_linear, hook_type.AROUND)
     from xtier.arch import HW_FP8
@@ -378,6 +379,6 @@ def install(registry, hook_type):
             registry.register(f'{ENGRAM_LAYER}.__init__', _engram_layer_init, hook_type.AFTER)
             registry.register(f'{HASHER}.forward', _prefetch, hook_type.AFTER)
     if os.environ.get('XTIER_DRAFT_LMHEAD_FP8', '1') != '0' and supported((8, 9), 'the FP8 draft head '
-                                                                          '(deepseek_v4)'):
+                                                                          '(deepseek_v4)', 'the draft head in BF16'):
         registry.register(f'{DSPARK_DRAFT}.attach_shared_modules', _attach_shared, hook_type.AFTER)
         registry.register(DRAFT_PROJECT, _draft_project, hook_type.AROUND)

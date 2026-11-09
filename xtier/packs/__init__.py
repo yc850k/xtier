@@ -16,15 +16,22 @@ PACKS = ('qwen4_exp', 'glm5_next', 'deepseek_v4', 'minimax_m3', 'speculative')
 _unsupported = set()
 
 
-def supported(need, what):
+def supported(need, what, instead=None):
     """Whether this GPU can run a feature that needs the compute capability `need` (e.g. (8, 9) for the FP8 tensor
-    cores, (9, 0) for TMA, (10, 0) for the FP4 tensor cores). A feature the card cannot run stays off (the model's
-    own code runs instead) and is reported once."""
+    cores, (9, 0) for TMA, (10, 0) for the FP4 tensor cores). A feature the card cannot run is replaced (the model's
+    own code runs instead, or XTier's own kernel for the same thing) and is reported once.
+
+    `instead` names what takes its place (e.g. 'the Triton sparse MLA'); without it the message says the feature is
+    off, which is right when the model's own code takes over."""
     if need is None or arch.at_least(*need):
         return True
     if what not in _unsupported:
         _unsupported.add(what)
-        logger.warning('xtier: %s is off on %s: it needs sm_%d%d', what, arch.describe(), need[0], need[1])
+        if instead:
+            logger.warning('xtier: %s on %s needs sm_%d%d: %s instead', what, arch.describe(), need[0], need[1],
+                           instead)
+        else:
+            logger.warning('xtier: %s is off on %s: it needs sm_%d%d', what, arch.describe(), need[0], need[1])
     return False
 
 

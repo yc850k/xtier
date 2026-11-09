@@ -88,15 +88,15 @@ def _check_scheduler_entry() -> None:
 
 def _check_sglang() -> None:
     """A warning when the installed SGLang is not the main commit XTier is tested with."""
-    import re
     from importlib import metadata
+
+    from xtier import sglang_version_kind
 
     try:
         version = metadata.version('sglang')
     except metadata.PackageNotFoundError:
         return
-    m = re.search(r'\+g([0-9a-f]{7,})', version)
-    if not m or m.group(1)[:7] != SGLANG_COMMIT[:7]:
+    if sglang_version_kind(version) == 'other':
         logger.warning('xtier %s is tested with SGLang main %s; this SGLang is %s, so some hooks may not apply '
                        '(tools/check_sglang.py lists them)', __version__, SGLANG_COMMIT, version)
 

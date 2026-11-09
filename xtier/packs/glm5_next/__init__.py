@@ -114,7 +114,8 @@ def install(registry, hook_type):
         from xtier.packs.glm5_next import kpool_fp8
         for name in kpool_fp8.LAUNCHERS:
             registry.register(f'{kpool_fp8.MODULE}.{name}', kpool_fp8.launcher, hook_type.AROUND)
-    if os.environ.get('XTIER_FP8_WEIGHTS') == '1' and supported((8, 9), 'the FP8 weights (glm5_next)'):
+    if os.environ.get('XTIER_FP8_WEIGHTS') == '1' and supported((8, 9), 'the FP8 weights (glm5_next)',
+                                                             'the weights in the model\'s own dtype'):
         from xtier.packs.glm5_next import fp8_weights
         method = 'sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod'
         registry.register(f'{method}.apply', fp8_weights.apply, hook_type.AROUND)

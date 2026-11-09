@@ -287,6 +287,7 @@ DeepSeek V4.1 Flash 能出答案（一次请求 81 token 提示 + 64 token 输�
 
 ## 版本更新
 
+- 2026-11-09：**Turing（sm_75）这一档接上了当前的 main**：把分支 `feat/sm75-turing` 的 Turing 那一层（能力查询、软件反量化、dtype 层、各档的开关）合到 main 上，两边的冲突都解了（main 的尾部跳过与分支的 GSQ 路径现在都在引擎的 ABI 里）。另外补了上游 sm_75 补丁在 XTier 这边的对应（版本号没有 commit hash 时不再当成「未知」、sgl-kernel 在本机没有 sm_75 的代码所以只用发行版即可），以及合并后暴露的一个真问题（上游的变长验证钩子读的布局位置，本机的 SGLang 放在 `spec_info` 里，第一个请求会崩，现在两处都读）。详见[文档](docs/sm75.md)。
 - 2026-11-06（晚）：DeepSeek V4.1 的变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了（感谢 cyrus-xc，[#13](https://github.com/a775828b-dot/xtier/pull/13)）。在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上实测没有收益，所以默认仍是 static；其他机器请自行测试。详见[报告](docs/reports/2026-11-06-ds-compact-verify.md)。
 - 2026-11-06：两个选项，都默认关：冷存储按盘速分段（`XTIER_COLD_UNITS=3`，盘数不是 4 块或盘速不一样时用）；尾部跳过（`XTIER_TAIL_SKIP=5/6` 这种「保留/总共」写法，会改变输出），CPU 算的专家都能跳，不必开冷专家。来自已归档的 Kimi K3.1 实验分支，详见[分段](docs/reports/2026-11-06-cold-units-tail-skip.md)、[尾部跳过](docs/reports/2026-11-06-tail-skip-cpu.md)。
 - 2026-11-03：Turing（sm_75）这一档做成了从 main 出发的分支 `feat/sm75-turing`：上游针对 30/40 系的整套做法搬过来，

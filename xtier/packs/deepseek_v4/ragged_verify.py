@@ -3,6 +3,18 @@
 import torch
 
 
+def layout_of(forward_batch):
+    """The packed layout of this batch, or None when it has none.
+
+    Where the layout sits depends on the SGLang: the SGLang XTier follows carries it on the batch itself, an older
+    one keeps it in the batch's spec_info (SGLang's own resolver looks there). Both are read here, so the hook works
+    on either; without a layout the hook hands the call back to SGLang's own code."""
+    layout = getattr(forward_batch, 'ragged_verify_layout', None)
+    if layout is not None:
+        return layout
+    return getattr(getattr(forward_batch, 'spec_info', None), 'ragged_verify_layout', None)
+
+
 def request_rows(starts, num_tokens):
     """Map packed tokens to requests on device, including graph padding suffixes."""
     return torch.searchsorted(
@@ -11,7 +23,7 @@ def request_rows(starts, num_tokens):
 
 
 def token_req_indices(original, forward_batch, *, num_tokens=None):
-    layout = forward_batch.ragged_verify_layout
+    layout = layout_of(forward_batch)
     if layout is None or not forward_batch.forward_mode.is_target_verify():
         return original(forward_batch, num_tokens=num_tokens)
     if num_tokens is None:
@@ -32,7 +44,7 @@ def forced_budget(result, self, frac):
 
 def forward(original, self, input_ids, forward_batch):
     """Hash each packed request against its own committed history and token prefix."""
-    layout = forward_batch.ragged_verify_layout
+    layout = layout_of(forward_batch)
     if (layout is None or not forward_batch.forward_mode.is_target_verify()
             or input_ids.shape[0] == 0):
         return original(self, input_ids, forward_batch)

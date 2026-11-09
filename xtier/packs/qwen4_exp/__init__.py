@@ -58,10 +58,12 @@ def install(registry, hook_type):
         from xtier.packs.qwen4_exp import ple_blocks
         registry.register(f'{MODELS}.Qwen4ExpPLELayer.forward', ple_blocks.ple_forward, hook_type.AROUND)
     if os.environ.get('XTIER_QSA_KEYS_PER_CTA', '4096') != '0' and supported((8, 0), 'the QSA indexer prefill '
-                                                                            '(qwen4_exp)'):   # Ampere MMA path
+                                                                            '(qwen4_exp)',
+                                                                 'SGLang\'s own indexer'):
         from xtier.packs.qwen4_exp import qsa_prefill
         registry.register(QSA_PREFILL, qsa_prefill.qsa_mqa_prefill, hook_type.AROUND)
-    if os.environ.get('XTIER_QSA_FP4', '1') != '0' and supported((8, 9), 'the NVFP4 KV cache reader (qwen4_exp)'):
+    if os.environ.get('XTIER_QSA_FP4', '1') != '0' and supported((8, 9), 'the NVFP4 KV cache reader (qwen4_exp)',
+                                                             'SGLang\'s own KV cache'):
         from xtier.packs.qwen4_exp import qsa_fp4
         registry.register(f'{QSA_BACKEND}.forward_extend', qsa_fp4.forward_extend, hook_type.AROUND)
         registry.register(f'{QSA_BACKEND}._forward_paged_attention', qsa_fp4.paged_attention, hook_type.AROUND)

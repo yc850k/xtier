@@ -10,7 +10,6 @@ import ast
 import importlib
 import os
 import pathlib
-import re
 import sys
 from importlib import metadata
 
@@ -79,13 +78,13 @@ def main():
     for key, value in FEATURES.items():
         os.environ.setdefault(key, value)
     sys.path.insert(0, str(ROOT))
-    from xtier import SGLANG_COMMIT
+    from xtier import SGLANG_COMMIT, sglang_version_kind
 
     version = metadata.version('sglang')
-    m = re.search(r'\+g([0-9a-f]{7,})', version)
-    same = bool(m) and m.group(1)[:7] == SGLANG_COMMIT[:7]
+    kind = sglang_version_kind(version)
+    same = kind in ('commit', 'known')
     print(f'SGLang {version}; XTier is tested with SGLang main {SGLANG_COMMIT}: '
-          f'{"the same commit" if same else "a different or unknown commit"}')
+          f'{"the same commit" if kind == "commit" else "a known build" if same else "a different or unknown commit"}')
 
     targets = hook_targets()
     missing = [(t, fn) for t, fn in sorted(targets.items()) if resolve(t) is None]

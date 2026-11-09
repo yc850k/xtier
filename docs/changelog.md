@@ -2,6 +2,21 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-11-09：**Turing（sm_75）这一档接上了当前的 main**。把 `feat/sm75-turing` 的 Turing 那一层（能力查询、
+  软件反量化、dtype 层、各档的开关）合到 main 上，两边的冲突都解了：main 的尾部跳过（`xtier_forward_decode`、
+  `xtier_tail_stats`）与分支的 GSQ 路径（`xtier_create5`、`xtier_gsq_decode`）现在都在引擎的 ABI 里；DeepSeek 的
+  变长验证钩子（上游 #13）与分支的注意力替换也都在。另外补了几处：
+  1. **上游的 sm_75 补丁在 XTier 这边是什么意思**（[文档](sm75.md)）：那条补丁改的是 SGLang 与 sgl-kernel（内核只编
+     compute_75、FA3 的导入变成可选、FlashInfer 的 JIT 在 sm_80 以下改走 AOT 内核、mamba 的 conv state 按激活的
+     dtype 转）。XTier 是插件，不编 sgl-kernel、不导入 `sgl_kernel`、也没有 mamba 的路，所以它在这边对应的是三件事：
+     能力查询与软件反量化（分支已有的那一层）、注意力与 RoPE 由 XTier 自己的 Triton 内核或 SGLang 的 Triton 路径顶上、
+     以及版本号没有 commit hash 时（`0.5.10+sm75`）版本检查不再把它当成「未知」（`xtier.sglang_version_kind()`）；
+  2. **本机的 sgl-kernel 没有 sm_75 的代码**（发行版的 AOT 内核只编了 sm_80 以上），它的 AOT 算子在 Turing 卡上是
+     「no kernel image is available」；XTier 不调它们（norm 走 FlashInfer 的 JIT，注意力与 RoPE 走 XTier 的 Triton
+     内核），所以发行版就够用，`constraints-sm75.txt` 里只有这一行与 `constraints.txt` 不同；
+  3. **合并后暴露的一个真问题**：上游的变长验证钩子读 `forward_batch.ragged_verify_layout`，而本机的 SGLang
+     （0.5.22）把这个布局放在 `spec_info` 里，于是第一个请求就崩。现在两处都读（`ragged_verify.layout_of()`），
+     `tests/engram_ragged_check.py` 加了两条检查。
 - 2026-11-06（晚）：DeepSeek V4.1 的 DSpark 变长验证（`SGLANG_RAGGED_VERIFY_MODE=compact`）能跑对了：Engram 哈希按每个请求自己的历史算、低压缩比注意力
   按请求起点映射打包的 token（来自 [#13](https://github.com/a775828b-dot/xtier/pull/13)，感谢 cyrus-xc；控制台部分没有合并）。DS 启动脚本的验证模式可以通过环境变量指定。
   在我们的测试机（RTX PRO 5000 + 2× EPYC 9334）上照抄 0 错，但单请求 −8.6%、两请求 +2%，所以默认仍是 static；其他机器请自行测试。

@@ -95,9 +95,9 @@ def install(registry, hook_type):
     registry.register(C4_COMPUTE_WEIGHTS, _indexer_bf16, hook_type.AROUND)
     from xtier.packs import supported
 
-    if not supported((8, 0), 'the BF16 GEMM with an FP32 output (deepseek_v4)'):
+    if not supported((8, 0), 'the BF16 GEMM with an FP32 output (deepseek_v4)', 'a BF16 GEMM in FP32'):
         registry.register(LINEAR_BF16_FP32, _linear_bf16_fp32, hook_type.REPLACE)
-    if not supported((8, 0), 'the FP16 hyper-connection residual stream (deepseek_v4)'):
+    if not supported((8, 0), 'the FP16 hyper-connection residual stream (deepseek_v4)', 'an FP32 residual stream'):
         registry.register(MHC_POST, _post_fp32, hook_type.AROUND)
         registry.register(MHC_COMBINE, _combine_fp16, hook_type.AROUND)
         registry.register(RMS_NORM, _norm_fp32, hook_type.AROUND)
